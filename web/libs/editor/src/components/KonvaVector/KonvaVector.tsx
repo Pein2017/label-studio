@@ -750,13 +750,22 @@ export const KonvaVector = forwardRef<KonvaVectorRef, KonvaVectorProps>((props, 
   // Use external closed prop when provided, otherwise use computed value
   const finalIsPathClosed = allowClose && closed !== undefined ? closed : isPathClosed;
 
-  // Debug logging for path closure state
   useEffect(() => {
-    if (allowClose && initialPoints.length >= 2) {
-      const firstPoint = initialPoints[0];
-      const lastPoint = initialPoints[initialPoints.length - 1];
+    if (!allowClose || disabled || finalIsPathClosed || maxPoints == null) {
+      return;
     }
-  }, [allowClose, initialPoints, isPathClosed, finalIsPathClosed]);
+
+    if (initialPoints.length !== maxPoints) {
+      return;
+    }
+
+    if (typeof ref === "function" || !ref) {
+      return;
+    }
+
+    const vectorRef = ref as { current: KonvaVectorRef | null };
+    vectorRef.current?.close();
+  }, [allowClose, disabled, finalIsPathClosed, initialPoints.length, maxPoints, ref]);
 
   // Setter for path closed state - used when path is closed/opened programmatically
   const setIsPathClosed = useCallback(
@@ -3457,7 +3466,12 @@ export const KonvaVector = forwardRef<KonvaVectorRef, KonvaVectorProps>((props, 
       x={x}
       y={y}
       imageSmoothingEnabled={imageSmoothingEnabled}
-      onMouseDown={selected && !disabled ? eventHandlers.handleLayerMouseDown : undefined}
+      onMouseDown={(e) => {
+        onMouseDown?.(e);
+        if (selected && !disabled) {
+          eventHandlers.handleLayerMouseDown(e);
+        }
+      }}
       onMouseMove={selected && !disabled ? eventHandlers.handleLayerMouseMove : undefined}
       onMouseUp={selected && !disabled ? eventHandlers.handleLayerMouseUp : undefined}
       onClick={
@@ -3476,9 +3490,14 @@ export const KonvaVector = forwardRef<KonvaVectorRef, KonvaVectorProps>((props, 
 
               // When disabled, only allow selection clicks - skip all editing logic
               if (disabled) {
-                // Call handleClickWithDebouncing to trigger selection via onClick handler
-                // This allows the shape to be selected even when disabled
-                handleClickWithDebouncing(e, onClick, onDblClick);
+                // Handle selection here and stop bubbling so the stage-level
+                // hovered-region fallback doesn't toggle the same region twice.
+                if (!justFinishedShapeDrag.current && !e.evt.shiftKey) {
+                  e.evt.stopPropagation();
+                  e.evt.preventDefault();
+                  e.cancelBubble = true;
+                  handleClickWithDebouncing(e, onClick, onDblClick);
+                }
                 return;
               }
 
@@ -3611,9 +3630,12 @@ export const KonvaVector = forwardRef<KonvaVectorRef, KonvaVectorProps>((props, 
 
               // When disabled, only allow selection clicks - skip all editing logic
               if (disabled) {
-                // Allow the click to bubble for selection - don't prevent propagation
-                // Use debouncing for click/double-click detection for selection
+                // Handle selection here and stop bubbling so the stage-level
+                // hovered-region fallback doesn't toggle the same region twice.
                 if (!justFinishedShapeDrag.current && !e.evt.shiftKey) {
+                  e.evt.stopPropagation();
+                  e.evt.preventDefault();
+                  e.cancelBubble = true;
                   handleClickWithDebouncing(e, onClick, onDblClick);
                 }
                 return;
@@ -4025,9 +4047,12 @@ export const KonvaVector = forwardRef<KonvaVectorRef, KonvaVectorProps>((props, 
 
               // When disabled, only allow selection clicks - skip all editing logic
               if (disabled) {
-                // Allow the click to bubble for selection - don't prevent propagation
-                // Use debouncing for click/double-click detection for selection
+                // Handle selection here and stop bubbling so the stage-level
+                // hovered-region fallback doesn't toggle the same region twice.
                 if (!justFinishedShapeDrag.current && !e.evt.shiftKey) {
+                  e.evt.stopPropagation();
+                  e.evt.preventDefault();
+                  e.cancelBubble = true;
                   handleClickWithDebouncing(e, onClick, onDblClick);
                 }
                 return;

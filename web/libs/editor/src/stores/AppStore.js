@@ -10,7 +10,6 @@ import ToolsManager from "../tools/Manager";
 import Utils from "../utils";
 import { guidGenerator } from "../utils/unique";
 import { clamp, delay, isDefined } from "../utils/utilities";
-import { CREATE_RELATION_MODE } from "./Annotation/LinkingModes";
 import AnnotationStore from "./Annotation/store";
 import Project from "./ProjectStore";
 import Settings from "./SettingsStore";
@@ -213,6 +212,20 @@ export default types
     suggestionsRequest: null,
     // @todo should be removed along with the FF; it's used to detect FF in other parts
     simpleInit: isFF(FF_SIMPLE_INIT),
+    pairingDebug: {
+      seq: 0,
+      events: [],
+    },
+    recentCanvasModifiers: {
+      timestamp: 0,
+      ctrlKey: false,
+      metaKey: false,
+      shiftKey: false,
+      altKey: false,
+      source: null,
+      regionId: null,
+      regionIndex: null,
+    },
   }))
   .views((self) => ({
     get events() {
@@ -270,6 +283,61 @@ export default types
 
     function renderApp() {
       appControls?.render();
+    }
+
+    function getCurrentPairingSelection() {
+      const currentAnnotation = self.annotationStore?.selected;
+      const selectedRegions = currentAnnotation?.selectedRegions ?? [];
+
+      return {
+        selectionCount: selectedRegions.length,
+        selectionIds: selectedRegions.map((region) => region.id),
+        selectionIndexes: selectedRegions.map((region) => region.region_index ?? null),
+      };
+    }
+
+    function pushPairingDebugEvent(kind, payload = {}) {
+      const nextSeq = (self.pairingDebug?.seq ?? 0) + 1;
+      const nextEvent = {
+        id: nextSeq,
+        kind,
+        timestamp: Date.now(),
+        ...getCurrentPairingSelection(),
+        ...payload,
+      };
+
+      self.pairingDebug = {
+        seq: nextSeq,
+        events: [nextEvent, ...(self.pairingDebug?.events ?? [])].slice(0, 10),
+      };
+    }
+
+    function recordPairingDebugCanvasClick(payload = {}) {
+      pushPairingDebugEvent("canvas-click", payload);
+    }
+
+    function recordPairingDebugSelection(payload = {}) {
+      pushPairingDebugEvent("selection", payload);
+    }
+
+    function clearPairingDebug() {
+      self.pairingDebug = {
+        seq: self.pairingDebug?.seq ?? 0,
+        events: [],
+      };
+    }
+
+    function recordCanvasModifierState(payload = {}) {
+      self.recentCanvasModifiers = {
+        timestamp: Date.now(),
+        ctrlKey: !!payload.ctrlKey,
+        metaKey: !!payload.metaKey,
+        shiftKey: !!payload.shiftKey,
+        altKey: !!payload.altKey,
+        source: payload.source ?? null,
+        regionId: payload.regionId ?? null,
+        regionIndex: payload.regionIndex ?? null,
+      };
     }
     /**
      * Update settings display state
@@ -418,12 +486,15 @@ export default types
         }
       });
 
-      // create relation
+      // Create a group from the current selection
       hotkeys.addNamed("region:relation", () => {
         const c = self.annotationStore.selected;
+        const selection = c?.selectedRegions?.filter((node) => !node.classification) ?? [];
+        const validation = selection.length === 2 ? c?.relationStore?.canCreatePair(selection[0], selection[1]) : null;
 
-        if (c && c.highlightedNode && !c.isLinkingMode) {
-          c.startLinkingMode(CREATE_RELATION_MODE, c.highlightedNode);
+        if (c && validation?.ok) {
+          c.relationStore.addPair(selection[0], selection[1]);
+          c.unselectAll();
         }
       });
 
@@ -1119,6 +1190,10 @@ export default types
       setAppControls,
       clearApp,
       renderApp,
+      recordCanvasModifierState,
+      recordPairingDebugCanvasClick,
+      recordPairingDebugSelection,
+      clearPairingDebug,
       selfDestroy() {
         const children = [];
 

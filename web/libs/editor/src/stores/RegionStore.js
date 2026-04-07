@@ -1,4 +1,4 @@
-import { destroy, detach, getEnv, getParent, onPatch, types } from "mobx-state-tree";
+import { destroy, detach, getEnv, getParent, getRoot, onPatch, types } from "mobx-state-tree";
 
 import { Hotkey } from "../core/Hotkey";
 import { isDefined } from "../utils/utilities";
@@ -685,12 +685,25 @@ export default types
       });
     },
 
+    recordSelectionDebug(action, payload = {}) {
+      getRoot(self)?.recordPairingDebugSelection?.({
+        action,
+        ...payload,
+      });
+    },
+
     highlight(area) {
       self.selection.highlight(area);
+      self.recordSelectionDebug("highlight", {
+        regionId: area?.id ?? null,
+        regionIndex: area?.region_index ?? null,
+        regionType: area?.type ?? null,
+      });
     },
 
     clearSelection() {
       self.selection.clear();
+      self.recordSelectionDebug("clearSelection");
     },
 
     selectRegionsByIds(ids) {
@@ -707,5 +720,11 @@ export default types
       } else {
         self.selection.unselect(region);
       }
+
+      self.recordSelectionDebug(isSelected ? "toggleSelection:add" : "toggleSelection:remove", {
+        regionId: region?.id ?? null,
+        regionIndex: region?.region_index ?? null,
+        regionType: region?.type ?? null,
+      });
     },
   }));

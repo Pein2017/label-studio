@@ -9,6 +9,27 @@ const localStorageKeys = {
   order: "relations:order",
 };
 
+const PAIR_LABEL = "配对";
+const PAIR_LABELS = new Set([PAIR_LABEL, "pair"]);
+
+const getRegionPairKind = (region) => {
+  if (!region || region.incomplete) return null;
+  if (region.type === "rectangleregion") return "box";
+  if (region.type === "polygonregion") return "box";
+  if (region.type === "vectorregion") return region.closed ? "box" : "line";
+  return null;
+};
+
+const normalizePairNodes = (node1, node2) => {
+  const kind1 = getRegionPairKind(node1);
+  const kind2 = getRegionPairKind(node2);
+
+  if (kind1 === "box" && kind2 === "line") return [node1, node2];
+  if (kind1 === "line" && kind2 === "box") return [node2, node1];
+
+  return [node1, node2];
+};
+
 /**
  * Relation between two different nodes
  */
@@ -112,7 +133,7 @@ const RelationStore = types
     ),
   })
   .volatile(() => ({
-    showConnections: true,
+    showConnections: false,
     _highlighted: null,
     control: null,
   }))
@@ -135,6 +156,15 @@ const RelationStore = types
     },
     get values() {
       return self.control?.values ?? [];
+    },
+    isPairRelation(relation) {
+      return Array.isArray(relation?.labels) && relation.labels.some((label) => PAIR_LABELS.has(label));
+    },
+    get pairRelations() {
+      return self.orderedRelations.filter((relation) => self.isPairRelation(relation));
+    },
+    get unorderedRelations() {
+      return self.orderedRelations.filter((relation) => !self.isPairRelation(relation));
     },
   }))
   .actions((self) => ({
@@ -166,23 +196,81 @@ const RelationStore = types
       }
 
       return self.relations.filter((rl) => {
-        return rl.node1.id === id1 && rl.node2.id === id2;
+        return (rl.node1.id === id1 && rl.node2.id === id2) || (rl.node1.id === id2 && rl.node2.id === id1);
       });
     },
 
     nodesRelated(node1, node2) {
       return self.findRelations(node1, node2).length > 0;
     },
+    getPairRelationsForNode(node) {
+      return self.findRelations(node).filter((relation) => self.isPairRelation(relation));
+    },
+    hasPairForNode(node) {
+      return self.getPairRelationsForNode(node).length > 0;
+    },
+    canCreatePair(node1, node2) {
+      if (!node1 || !node2) {
+        return { ok: false, reason: "请选择两个标注" };
+      }
+
+      if (node1 === node2) {
+        return { ok: false, reason: "同一个标注不能和自己成组" };
+      }
+
+      const kind1 = getRegionPairKind(node1);
+      const kind2 = getRegionPairKind(node2);
+
+      if (!kind1 || !kind2) {
+        return { ok: false, reason: "只能对完整的端口和尾纤连接处成组" };
+      }
+
+      if (kind1 === kind2) {
+        return { ok: false, reason: "一组必须是一个端口加一个尾纤连接处" };
+      }
+
+      if (self.hasPairForNode(node1) || self.hasPairForNode(node2)) {
+        return { ok: false, reason: "已成组的标注不能重复成组" };
+      }
+
+      return { ok: true, reason: "" };
+    },
+    addPair(node1, node2) {
+      const validation = self.canCreatePair(node1, node2);
+
+      if (!validation.ok) return null;
+
+      const [boxNode, lineNode] = normalizePairNodes(node1, node2);
+      const relation = Relation.create({
+        node1: boxNode,
+        node2: lineNode,
+        direction: "bi",
+        labels: [PAIR_LABEL],
+      });
+      self.relations.push(relation);
+
+      return relation;
+    },
+    deletePairByNode(node) {
+      self.getPairRelationsForNode(node).forEach((relation) => self.deleteRelation(relation));
+    },
 
     addRelation(node1, node2) {
-      if (self.nodesRelated(node1, node2)) return;
+      const pairValidation = self.canCreatePair(node1, node2);
+      if (pairValidation.ok) {
+        return self.addPair(node1, node2);
+      }
 
-      const rl = Relation.create({ node1, node2 });
+      if (!node1 || !node2 || self.nodesRelated(node1, node2)) return null;
 
-      // self.relations.unshift(rl);
-      self.relations.push(rl);
+      const relation = Relation.create({
+        node1,
+        node2,
+      });
 
-      return rl;
+      self.relations.push(relation);
+
+      return relation;
     },
 
     deleteRelation(rl) {
@@ -218,7 +306,8 @@ const RelationStore = types
     },
 
     deserializeRelation(node1, node2, direction, labels) {
-      const rl = self.addRelation(node1, node2);
+      const isPair = Array.isArray(labels) && labels.some((label) => PAIR_LABELS.has(label));
+      const rl = isPair ? self.addPair(node1, node2) : self.addRelation(node1, node2);
 
       if (!rl) return; // duplicated relation
 

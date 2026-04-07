@@ -328,10 +328,30 @@ const VideoVectorPure = ({
 
   const handleRegionClick = useCallback(
     (e) => {
+      const store = reg.annotation?.store;
+      const recentModifiers = store?.recentCanvasModifiers;
+      const recentModifiersActive =
+        Date.now() - (recentModifiers?.timestamp ?? 0) < 1000 && (recentModifiers?.ctrlKey || recentModifiers?.metaKey);
+      const additiveSelectionShortcut = e.evt.ctrlKey || e.evt.metaKey || recentModifiersActive;
+      const selectionEvent =
+        additiveSelectionShortcut && !(e.evt.ctrlKey || e.evt.metaKey)
+          ? {
+              ...e,
+              evt: {
+                ...e.evt,
+                ctrlKey: !!recentModifiers?.ctrlKey,
+                metaKey: !!recentModifiers?.metaKey,
+              },
+            }
+          : e;
+
       if (e.evt.defaultPrevented) return;
       if (reg.isReadOnly()) return;
+      if (reg.parent.getSkipInteractions?.() && !additiveSelectionShortcut) return;
       if (reg.isDrawing) return;
-      if (e.evt.altKey || e.evt.ctrlKey || e.evt.shiftKey || e.evt.metaKey) return;
+      // Preserve Cmd/Ctrl additive selection on the canvas so video vectors
+      // behave the same way as image regions and the outliner on macOS/Windows.
+      if (e.evt.altKey || e.evt.shiftKey) return;
 
       e.cancelBubble = true;
 
@@ -344,10 +364,10 @@ const VideoVectorPure = ({
       }
 
       if (typeof onClickProp === "function") {
-        onClickProp(e);
+        onClickProp(selectionEvent);
       } else {
         reg.setHighlight(false);
-        reg.onClickRegion(e);
+        reg.onClickRegion(selectionEvent);
       }
     },
     [reg, frame, onClickProp],
@@ -393,6 +413,17 @@ const VideoVectorPure = ({
         onTransformStart={handleTransformStart}
         onTransformEnd={handleTransformEnd}
         onPathClosedChange={handlePathClosedChange}
+        onMouseDown={(e) => {
+          reg.annotation?.store?.recordCanvasModifierState?.({
+            source: "VideoVector",
+            regionId: reg.id,
+            regionIndex: reg.region_index ?? null,
+            ctrlKey: !!e.evt.ctrlKey,
+            metaKey: !!e.evt.metaKey,
+            shiftKey: !!e.evt.shiftKey,
+            altKey: !!e.evt.altKey,
+          });
+        }}
         onClick={handleRegionClick}
         onMouseEnter={() => {
           reg.setHighlight(true);

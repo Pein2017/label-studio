@@ -28,8 +28,10 @@ const RelationModeModel = types
         self.regionStore.unhighlightAll();
       },
       addLinkedRegion(secondRegion) {
-        self.relationStore.addRelation(self.region, secondRegion);
-        self.stop();
+        const relation = self.relationStore.addRelation(self.region, secondRegion);
+        if (relation) {
+          self.stop();
+        }
       },
     };
   });

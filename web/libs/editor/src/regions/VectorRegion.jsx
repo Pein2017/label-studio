@@ -71,6 +71,7 @@ const Model = types
     isDrawing: false,
     vectorRef: null,
     groupRef: null,
+    autoClosing: false,
   }))
   .views((self) => ({
     get store() {
@@ -355,7 +356,7 @@ const Model = types
           const selection = self.vectorRef.getSelectedPointIds();
           const result = selection.length > 1;
           return result;
-        } catch (error) {
+        } catch (_error) {
           return false;
         }
       },
@@ -405,7 +406,7 @@ const Model = types
         return self.parent.createSerializedResult(self, value);
       },
 
-      updateImageSize(wp, hp, sw, sh) {
+      updateImageSize(_wp, _hp, sw, sh) {
         if (self.coordstype === "px") {
           self.vertices.forEach((p) => {
             const x = (sw * (p.relativeX || 0)) / RELATIVE_STAGE_WIDTH;
@@ -434,6 +435,62 @@ const Model = types
 
       onPathClosedChange(isClosed) {
         self.closed = isClosed;
+      },
+
+      shouldAutoCloseOnMaxPoints(pointCount) {
+        return !!(self.closable && self.maxPoints && pointCount >= self.maxPoints && !self.closed);
+      },
+
+      closeWithPoints(points) {
+        if (!self.closable || !Array.isArray(points) || points.length < 2) return points;
+
+        const firstPoint = points[0];
+        const lastPoint = points[points.length - 1];
+
+        if (!firstPoint || !lastPoint || firstPoint.prevPointId === lastPoint.id) {
+          return points;
+        }
+
+        const closedPoints = [...points];
+        closedPoints[0] = {
+          ...firstPoint,
+          prevPointId: lastPoint.id,
+        };
+
+        self.updatePointsFromKonvaVector(closedPoints);
+        self.onPathClosedChange(true);
+
+        return closedPoints;
+      },
+
+      scheduleAutoCloseAndFinish() {
+        if (self.autoClosing) return;
+        self.autoClosing = true;
+
+        const run = () => {
+          if (!isAlive(self) || !self.isDrawing) {
+            self.autoClosing = false;
+            return;
+          }
+
+          let closed = self.closed;
+
+          if (!closed && self.vectorRef) {
+            closed = self.vectorRef.close();
+          }
+
+          if (closed || self.closed) {
+            self.handleFinish();
+          }
+
+          self.autoClosing = false;
+        };
+
+        if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+          window.requestAnimationFrame(run);
+        } else {
+          setTimeout(run, 0);
+        }
       },
 
       setKonvaVectorRef(ref) {
@@ -543,7 +600,7 @@ const Model = types
        * @param {Object} transform - Transform object with dx, dy, scaleX, scaleY, rotation
        * @param {Object} transformerCenter - Center point used by the ImageTransformer for scaling/rotation
        */
-      applyTransform(transform, transformerCenter) {
+      applyTransform(_transform, _transformerCenter) {
         if (!self.vectorRef) {
           return;
         }
@@ -624,7 +681,7 @@ const HtxVectorView = observer(({ item, suggestion }) => {
   const stageHeight = image?.naturalHeight ?? 0;
   const { x: offsetX, y: offsetY } = item.parent?.layerZoomScalePosition ?? { x: 0, y: 0 };
   const disabled = item.disabled || suggestion || store.annotationStore.selected.isLinkingMode;
-  const selected = !disabled; // Invert disabled to selected for KonvaVector
+  const selected = !disabled && (item.selected || item.isDrawing);
   // Completely disable all interactions when readonly (includes locked, e.g., in View All mode), or Pan tool is active
   const isDisabled = item.isReadOnly() || item.parent?.getSkipInteractions();
 
@@ -654,11 +711,19 @@ const HtxVectorView = observer(({ item, suggestion }) => {
           onTransformStart={() => {
             item.parent.annotation.history.freeze();
           }}
-          onTransformEnd={(e) => {
+          onTransformEnd={(_e) => {
             item.parent.annotation.history.unfreeze();
           }}
           onPointsChange={(points) => {
-            item.updatePointsFromKonvaVector(points);
+            let nextPoints = points;
+
+            if (item.shouldAutoCloseOnMaxPoints(points.length)) {
+              nextPoints = item.closeWithPoints(points);
+              item.scheduleAutoCloseAndFinish();
+              return;
+            }
+
+            item.updatePointsFromKonvaVector(nextPoints);
           }}
           onPathClosedChange={(isClosed) => {
             item.onPathClosedChange(isClosed);
@@ -677,16 +742,80 @@ const HtxVectorView = observer(({ item, suggestion }) => {
               }
             }
           }}
+          onMouseDown={(e) => {
+            store.recordCanvasModifierState?.({
+              source: "VectorRegion",
+              regionId: item.id,
+              regionIndex: item.region_index ?? null,
+              ctrlKey: !!e.evt.ctrlKey,
+              metaKey: !!e.evt.metaKey,
+              shiftKey: !!e.evt.shiftKey,
+              altKey: !!e.evt.altKey,
+            });
+          }}
           onClick={(e) => {
+            const recentModifiers = store.recentCanvasModifiers;
+            const recentModifiersActive =
+              Date.now() - (recentModifiers?.timestamp ?? 0) < 1000 &&
+              (recentModifiers?.ctrlKey || recentModifiers?.metaKey);
+            const additiveSelectionShortcut = e.evt.ctrlKey || e.evt.metaKey || recentModifiersActive;
+            const skipInteractions = item.parent.getSkipInteractions();
+            const selectionEvent =
+              additiveSelectionShortcut && !(e.evt.ctrlKey || e.evt.metaKey)
+                ? {
+                    ...e,
+                    evt: {
+                      ...e.evt,
+                      ctrlKey: !!recentModifiers?.ctrlKey,
+                      metaKey: !!recentModifiers?.metaKey,
+                    },
+                  }
+                : e;
+            let blockedReason = null;
+
             if (e.evt.defaultPrevented) {
-              return;
+              blockedReason = "defaultPrevented";
             }
 
-            // Handle region selection
-            if (item.isReadOnly()) return;
-            if (item.parent.getSkipInteractions()) return;
-            if (item.isDrawing) return;
-            if (e.evt.altKey || e.evt.ctrlKey || e.evt.shiftKey || e.evt.metaKey) return;
+            if (!blockedReason && item.isReadOnly()) {
+              blockedReason = "readOnly";
+            }
+            // Keep Cmd/Ctrl additive selection available directly on the canvas
+            // even when the active drawing tool would usually skip region clicks.
+            if (!blockedReason && skipInteractions && !additiveSelectionShortcut) {
+              blockedReason = "skipInteractions";
+            }
+            if (!blockedReason && item.isDrawing) {
+              blockedReason = "isDrawing";
+            }
+            // Keep Cmd/Ctrl clicks available for additive selection on canvas so
+            // vector regions match the native-feeling multiselect behavior of the
+            // regions list on macOS and Windows. Alt/Shift keep their existing
+            // special meanings and still shouldn't trigger region selection here.
+            if (!blockedReason && (e.evt.altKey || e.evt.shiftKey)) {
+              blockedReason = e.evt.altKey ? "altKey" : "shiftKey";
+            }
+
+            store.recordPairingDebugCanvasClick?.({
+              source: "VectorRegion",
+              regionId: item.id,
+              regionIndex: item.region_index ?? null,
+              regionType: item.type,
+              ctrlKey: !!e.evt.ctrlKey,
+              metaKey: !!e.evt.metaKey,
+              fallbackCtrlKey: !!recentModifiers?.ctrlKey,
+              fallbackMetaKey: !!recentModifiers?.metaKey,
+              fallbackUsed: recentModifiersActive && !(e.evt.ctrlKey || e.evt.metaKey),
+              shiftKey: !!e.evt.shiftKey,
+              altKey: !!e.evt.altKey,
+              defaultPrevented: !!e.evt.defaultPrevented,
+              skipInteractions,
+              isDrawing: item.isDrawing,
+              annotationIsDrawing: item.annotation?.isDrawing ?? false,
+              blockedReason,
+            });
+
+            if (blockedReason) return;
 
             e.cancelBubble = true;
 
@@ -704,7 +833,7 @@ const HtxVectorView = observer(({ item, suggestion }) => {
             }
 
             item.setHighlight(false);
-            item.onClickRegion(e);
+            item.onClickRegion(selectionEvent);
           }}
           onMouseEnter={() => {
             if (store.annotationStore.selected.isLinkingMode) {

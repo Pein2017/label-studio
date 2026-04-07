@@ -142,6 +142,17 @@ export const KonvaRegionMixin = types
 
         if (e) e.cancelBubble = true;
 
+        annotation.store.recordPairingDebugSelection?.({
+          action: "onClickRegion",
+          regionId: self.id,
+          regionIndex: self.region_index ?? null,
+          regionType: self.type,
+          additiveMode,
+          ctrlKey: !!ev?.ctrlKey,
+          metaKey: !!ev?.metaKey,
+          detail: ev?.detail ?? null,
+        });
+
         const isDoubleClick = ev.detail === 2;
 
         if (isDoubleClick) {

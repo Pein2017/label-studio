@@ -103,7 +103,7 @@
   },
   "region:relation": {
     "key": "alt+r",
-    "description": "Create relation between regions"
+    "description": "从选中对象创建组"
   },
   "region:visibility": {
     "key": "alt+h",

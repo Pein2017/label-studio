@@ -517,6 +517,17 @@ const HtxRectangleView = ({ item, setShapeRef }) => {
         draggable={!item.isReadOnly()}
         name={`${item.id} _transformable`}
         {...eventHandlers}
+        onMouseDown={(e) => {
+          store.recordCanvasModifierState?.({
+            source: "RectRegion",
+            regionId: item.id,
+            regionIndex: item.region_index ?? null,
+            ctrlKey: !!e.evt.ctrlKey,
+            metaKey: !!e.evt.metaKey,
+            shiftKey: !!e.evt.shiftKey,
+            altKey: !!e.evt.altKey,
+          });
+        }}
         onMouseOver={() => {
           if (store.annotationStore.selected.isLinkingMode) {
             item.setHighlight(true);
@@ -530,13 +541,49 @@ const HtxRectangleView = ({ item, setShapeRef }) => {
           item.updateCursor();
         }}
         onClick={(e) => {
-          if (item.parent.getSkipInteractions()) return;
+          const recentModifiers = store.recentCanvasModifiers;
+          const recentModifiersActive =
+            Date.now() - (recentModifiers?.timestamp ?? 0) < 1000 && (recentModifiers?.ctrlKey || recentModifiers?.metaKey);
+          const additiveSelectionShortcut = e.evt.ctrlKey || e.evt.metaKey || recentModifiersActive;
+          const skipInteractions = item.parent.getSkipInteractions();
+          const selectionEvent =
+            additiveSelectionShortcut && !(e.evt.ctrlKey || e.evt.metaKey)
+              ? {
+                  ...e,
+                  evt: {
+                    ...e.evt,
+                    ctrlKey: !!recentModifiers?.ctrlKey,
+                    metaKey: !!recentModifiers?.metaKey,
+                  },
+                }
+              : e;
+
+          store.recordPairingDebugCanvasClick?.({
+            source: "RectRegion",
+            regionId: item.id,
+            regionIndex: item.region_index ?? null,
+            regionType: item.type,
+            ctrlKey: !!e.evt.ctrlKey,
+            metaKey: !!e.evt.metaKey,
+            fallbackCtrlKey: !!recentModifiers?.ctrlKey,
+            fallbackMetaKey: !!recentModifiers?.metaKey,
+            fallbackUsed: recentModifiersActive && !(e.evt.ctrlKey || e.evt.metaKey),
+            shiftKey: !!e.evt.shiftKey,
+            altKey: !!e.evt.altKey,
+            defaultPrevented: !!e.evt.defaultPrevented,
+            skipInteractions,
+            blockedReason: skipInteractions && !additiveSelectionShortcut ? "skipInteractions" : null,
+          });
+
+          // Keep Cmd/Ctrl multi-select available directly on the canvas even when
+          // the current drawing tool would normally skip region interactions.
+          if (skipInteractions && !additiveSelectionShortcut) return;
           if (store.annotationStore.selected.isLinkingMode) {
             stage.container().style.cursor = Constants.DEFAULT_CURSOR;
           }
 
           item.setHighlight(false);
-          item.onClickRegion(e);
+          item.onClickRegion(selectionEvent);
         }}
         listening={!suggestion && !item.annotation?.isDrawing}
       />
