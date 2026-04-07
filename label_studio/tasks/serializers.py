@@ -26,6 +26,7 @@ from rest_framework.serializers import ModelSerializer
 from rest_framework.settings import api_settings
 from tasks.exceptions import AnnotationDuplicateError
 from tasks.models import Annotation, AnnotationDraft, Prediction, PredictionMeta, Task
+from tasks.result_normalization import build_normalized_annotation_payload
 from tasks.validation import TaskValidator
 from users.models import User
 from users.serializers import UserSerializer
@@ -145,6 +146,8 @@ class AnnotationSerializer(FlexFieldsModelSerializer):
     """"""
 
     result = AnnotationResultField(required=False)
+    normalized_regions = serializers.SerializerMethodField(read_only=True)
+    groups = serializers.SerializerMethodField(read_only=True)
     created_username = serializers.SerializerMethodField(default='', read_only=True, help_text='Username string')
     created_ago = serializers.CharField(default='', read_only=True, help_text='Time delta from creation time')
     completed_by = serializers.PrimaryKeyRelatedField(required=False, queryset=User.objects.all())
@@ -188,6 +191,14 @@ class AnnotationSerializer(FlexFieldsModelSerializer):
 
         name += f' {user.email}, {user.id}'
         return name
+
+    def get_normalized_regions(self, annotation):
+        normalized_regions, _, _ = build_normalized_annotation_payload(annotation.result or [])
+        return normalized_regions
+
+    def get_groups(self, annotation):
+        _, groups, _ = build_normalized_annotation_payload(annotation.result or [])
+        return groups
 
     def to_representation(self, obj):
         """Remove state field if feature flags are disabled"""

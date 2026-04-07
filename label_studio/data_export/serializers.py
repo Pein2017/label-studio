@@ -11,6 +11,7 @@ from ml.mixins import InteractiveMixin
 from rest_flex_fields import FlexFieldsModelSerializer
 from rest_framework import serializers
 from tasks.models import Annotation, Task
+from tasks.result_normalization import build_normalized_annotation_payload
 from tasks.serializers import AnnotationDraftSerializer, PredictionSerializer
 from users.models import User
 from users.serializers import UserSimpleSerializer
@@ -27,6 +28,8 @@ class CompletedBySerializer(serializers.ModelSerializer):
 class AnnotationSerializer(FlexFieldsModelSerializer):
     completed_by = serializers.PrimaryKeyRelatedField(read_only=True)
     result = serializers.SerializerMethodField()
+    normalized_regions = serializers.SerializerMethodField()
+    groups = serializers.SerializerMethodField()
     state = FSMStateField(read_only=True)  # FSM state for annotations
 
     class Meta:
@@ -51,15 +54,33 @@ class AnnotationSerializer(FlexFieldsModelSerializer):
 
         return ret
 
+    def _get_annotation_payload(self, obj):
+        cache_name = '_normalized_annotation_payload'
+        payload = getattr(obj, cache_name, None)
+        if payload is None:
+            payload = build_normalized_annotation_payload(obj.result or [])
+            setattr(obj, cache_name, payload)
+        return payload
+
+    def get_normalized_regions(self, obj):
+        normalized_regions, _, _ = self._get_annotation_payload(obj)
+        return normalized_regions
+
+    def get_groups(self, obj):
+        _, groups, _ = self._get_annotation_payload(obj)
+        return groups
+
     def get_result(self, obj):
+        _, _, results = self._get_annotation_payload(obj)
+
         # run frames extraction on param, result and result type
         if (
-            obj.result
+            results
             and self.context.get('interpolate_key_frames', False)
             and is_video_object_tracking(parsed_config=obj.project.get_parsed_config())
         ):
-            return extract_key_frames(obj.result)
-        return obj.result
+            return extract_key_frames(results)
+        return results
 
 
 class BaseExportDataSerializer(FlexFieldsModelSerializer):
