@@ -1,188 +1,188 @@
-import {
-  IconEyeClosed,
-  IconEyeOpened,
-  IconMenu,
-  IconRelationBi,
-  IconRelationLeft,
-  IconRelationRight,
-  IconTrash,
-} from "@humansignal/icons";
-import { Button, Select } from "@humansignal/ui";
+import { IconPlus, IconTrash } from "@humansignal/icons";
+import { Button } from "@humansignal/ui";
 import { observer } from "mobx-react";
-import { type FC, useCallback, useMemo, useState } from "react";
+import { type CSSProperties, type FC, useCallback, useMemo } from "react";
 import { cn } from "../../../utils/bem";
-import { wrapArray } from "../../../utils/utilities";
+import {
+  formatPairGroupLabel,
+  getPairGroupKind,
+  getPairRegionColor,
+  getPairGroupValidation,
+  PAIR_GROUP_KIND,
+} from "../../../utils/pairGroups";
+import { EmptyState } from "../Components/EmptyState";
 import { RegionItem } from "./RegionItem";
 import "./Relations.prefix.css";
 
-const RealtionsComponent: FC<any> = ({ relationStore }) => {
-  const relations = relationStore.orderedRelations;
+interface GroupsProps {
+  relationStore: any;
+  selection?: any;
+  regionStore?: any;
+  store?: any;
+}
+
+const getShortcutLabel = () => {
+  if (typeof navigator === "undefined") return "Ctrl";
+
+  const platform = navigator.userAgentData?.platform ?? navigator.platform ?? "";
+
+  return /mac|iphone|ipad|ipod/i.test(platform) ? "⌘" : "Ctrl";
+};
+
+const getSelectionStateCopy = (selectedRegions: any[], validation: any, shortcutLabel: string) => {
+  if (selectedRegions.length === 0) {
+    return `先点击一个端口，再按住 ${shortcutLabel} 点击一个尾纤连接处。`;
+  }
+
+  if (selectedRegions.length === 1) {
+    return `已选 1/2，再按住 ${shortcutLabel} 点击另一个对象。`;
+  }
+
+  if (selectedRegions.length > 2) {
+    return `当前已选 ${selectedRegions.length} 个对象，请只保留一个端口和一个尾纤连接处。`;
+  }
+
+  if (validation.ok && validation.members) {
+    return `已就绪：${formatPairGroupLabel(validation.members)}`;
+  }
+
+  return validation.reason;
+};
+
+const getSelectionChipLabel = (region: any) => {
+  const kind = getPairGroupKind(region);
+
+  if (kind === PAIR_GROUP_KIND.BOX) {
+    return "端口";
+  }
+
+  if (kind === PAIR_GROUP_KIND.LINE) {
+    return "尾纤连接处";
+  }
+
+  return "对象";
+};
+
+const GroupsComponent: FC<GroupsProps> = observer(function GroupsComponent({ relationStore, selection, regionStore }) {
+  const selectedRegions = selection?.list?.filter((region: any) => !region.classification) ?? [];
+  const validation = getPairGroupValidation(selectedRegions, relationStore);
+  const groups = relationStore?.pairRelations ?? [];
+  const shortcutLabel = useMemo(() => getShortcutLabel(), []);
+  const selectionStateCopy = getSelectionStateCopy(selectedRegions, validation, shortcutLabel);
+
+  const createGroup = useCallback(() => {
+    const members = validation.members ?? getPairGroupValidation(selectedRegions, relationStore).members;
+    if (!members) return;
+
+    relationStore.addPair(members[0], members[1]);
+    regionStore?.unselectAll?.();
+  }, [relationStore, regionStore, selectedRegions, validation.members]);
 
   return (
     <div className={cn("relations").toClassName()}>
-      <RelationsList relations={relations} />
+      <div className={cn("relations").elem("composer").toClassName()}>
+        <div className={cn("relations").elem("composer-copy").toClassName()}>
+          <div className={cn("relations").elem("composer-title").toClassName()}>成组</div>
+          <div className={cn("relations").elem("composer-description").toClassName()}>
+            先点一个端口，再按住 {shortcutLabel} 点击一个尾纤连接处，然后点击成组。
+          </div>
+          <div
+            className={cn("relations")
+              .elem("selection-state")
+              .mod({ ready: validation.ok, error: !!selectedRegions.length && !validation.ok })
+              .toClassName()}
+          >
+            {selectionStateCopy}
+          </div>
+          {!!selectedRegions.length && (
+            <div className={cn("relations").elem("selection-items").toClassName()}>
+              {selectedRegions.map((region: any) => (
+                <div
+                  key={region.id}
+                  className={cn("relations").elem("selection-chip").toClassName()}
+                  style={
+                    getPairRegionColor(region)
+                      ? ({
+                          "--chip-accent": getPairRegionColor(region),
+                        } as CSSProperties)
+                      : undefined
+                  }
+                >
+                  <span className={cn("relations").elem("selection-chip-kind").toClassName()}>
+                    {getSelectionChipLabel(region)}
+                  </span>
+                  <span className={cn("relations").elem("selection-chip-index").toClassName()}>
+                    #{region.region_index ?? "?"}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <Button
+          variant="primary"
+          look="filled"
+          size="small"
+          disabled={!validation.ok}
+          onClick={createGroup}
+          aria-label="成组"
+          tooltip={
+            validation.ok
+              ? `成组 ${formatPairGroupLabel(validation.members)}`
+              : validation.reason || "请选择一个端口和一个尾纤连接处"
+          }
+        >
+          成组
+        </Button>
+      </div>
+
+      {groups.length ? (
+        <div className={cn("relations").elem("group-list").toClassName()}>
+          {groups.map((relation: any) => (
+            <GroupItem key={relation.id} relation={relation} />
+          ))}
+        </div>
+      ) : (
+        <EmptyState
+          icon={<IconPlus width={24} height={24} />}
+          header="暂无组"
+          description="组会以 group=[1,2] 的形式保留在导出结果中。"
+        />
+      )}
     </div>
-  );
-};
-
-interface RelationsListProps {
-  relations: any[];
-}
-
-const RelationsList: FC<RelationsListProps> = observer(({ relations }) => {
-  return (
-    <>
-      {relations.map((rel) => {
-        return <RelationItem key={rel.id} relation={rel} />;
-      })}
-    </>
   );
 });
 
-const RelationItem: FC<{ relation: any }> = observer(({ relation }) => {
-  const [hovered, setHovered] = useState(false);
-
-  const onMouseEnter = useCallback(() => {
-    if (!!relation.node1 && !!relation.node2) {
-      setHovered(true);
-      relation.toggleHighlight();
-      relation.setSelfHighlight(true);
-    }
-  }, []);
-
-  const onMouseLeave = useCallback(() => {
-    if (!!relation.node1 && !!relation.node2) {
-      setHovered(false);
-      relation.toggleHighlight();
-      relation.setSelfHighlight(false);
-    }
-  }, []);
-
-  const directionIcon = useMemo(() => {
-    const { direction } = relation;
-
-    switch (direction) {
-      case "left":
-        return <IconRelationLeft data-direction={relation.direction} />;
-      case "right":
-        return <IconRelationRight data-direction={relation.direction} />;
-      case "bi":
-        return <IconRelationBi data-direction={relation.direction} />;
-      default:
-        return null;
-    }
-  }, [relation.direction]);
-
-  // const;
+const GroupItem: FC<{ relation: any }> = observer(({ relation }) => {
+  const label = formatPairGroupLabel([relation.node1, relation.node2]);
 
   return (
-    <div
-      className={cn("relations").elem("item").mod({ hidden: !relation.visible }).toClassName()}
-      onMouseEnter={onMouseEnter}
-      onMouseLeave={onMouseLeave}
-    >
-      <div className={cn("relations").elem("content").toClassName()}>
-        <div className={cn("relations").elem("icon").toClassName()} onClick={relation.rotateDirection}>
-          <div className={cn("relations").elem("direction").toClassName()}>{directionIcon}</div>
+    <div className={cn("relations").elem("group-item").toClassName()}>
+      <div className={cn("relations").elem("group-item-head").toClassName()}>
+        <div className={cn("relations").elem("group-label").toClassName()}>
+          <span>{label}</span>
         </div>
+        <Button
+          variant="negative"
+          look="string"
+          size="small"
+          aria-label="删除组"
+          tooltip="删除组"
+          onClick={() => relation.parent.deleteRelation(relation)}
+        >
+          <IconTrash />
+        </Button>
+      </div>
+
+      <div className={cn("relations").elem("content").toClassName()}>
         <div className={cn("relations").elem("nodes").toClassName()}>
           <RegionItem compact withActions={false} withIds={false} region={relation.node1} />
           <RegionItem compact withActions={false} withIds={false} region={relation.node2} />
         </div>
-        <div className={cn("relations").elem("actions").toClassName()}>
-          <div className={cn("relations").elem("action").toClassName()}>
-            {(hovered || relation.showMeta) && relation.hasRelations && (
-              <Button
-                primary={relation.showMeta}
-                aria-label={`${relation.showMeta ? "Hide" : "Show"} Relation Labels`}
-                type={relation.showMeta ? undefined : "text"}
-                onClick={relation.toggleMeta}
-                style={{ padding: 0 }}
-              >
-                <IconMenu />
-              </Button>
-            )}
-          </div>
-          <div className={cn("relations").elem("action").toClassName()}>
-            {(hovered || !relation.visible) && (
-              <Button
-                variant="neutral"
-                look="string"
-                size="small"
-                tooltip="Toggle Visibility"
-                onClick={relation.toggleVisibility}
-                aria-label={`${relation.visible ? "Hide" : "Show"} Relation`}
-              >
-                {relation.visible ? (
-                  <IconEyeOpened style={{ width: 20, height: 20 }} />
-                ) : (
-                  <IconEyeClosed style={{ width: 20, height: 20 }} />
-                )}
-              </Button>
-            )}
-          </div>
-          <div className={cn("relations").elem("action").toClassName()}>
-            {hovered && (
-              <Button
-                variant="negative"
-                look="string"
-                size="small"
-                aria-label="Delete Relation"
-                tooltip="Delete Relation"
-                onClick={() => {
-                  relation.node1.setHighlight(false);
-                  relation.node2.setHighlight(false);
-                  relation.parent.deleteRelation(relation);
-                }}
-              >
-                <IconTrash />
-              </Button>
-            )}
-          </div>
-        </div>
       </div>
-      {relation.showMeta && <RelationMeta relation={relation} />}
     </div>
   );
 });
 
-const RelationMeta: FC<any> = observer(({ relation }) => {
-  const { selectedValues, control } = relation;
-  const { children, choice } = control;
-
-  const selectionMode = useMemo(() => {
-    return choice === "multiple";
-  }, [choice]);
-
-  const onChange = useCallback(
-    (val: any) => {
-      const values: any[] = wrapArray(val);
-
-      relation.setRelations(values);
-    },
-    [relation],
-  );
-  const options = useMemo(
-    () =>
-      children.map((c: any) => ({
-        value: c.value,
-        style: { background: c.background },
-      })),
-    [children],
-  );
-
-  return (
-    <div className={cn("relation-meta").toClassName()}>
-      <Select
-        multiple={selectionMode}
-        style={{ width: "100%" }}
-        placeholder="Select labels"
-        value={selectedValues}
-        onChange={onChange}
-        options={options}
-      />
-    </div>
-  );
-});
-
-export const Relations = observer(RealtionsComponent);
+export const Groups = GroupsComponent;
+export const Relations = GroupsComponent;

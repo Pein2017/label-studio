@@ -187,12 +187,11 @@ describe("RegionItem", () => {
     expect(screen.queryByTestId("lock-button")).not.toBeInTheDocument();
   });
 
-  it("renders relation button and toggles linking mode on click", async () => {
+  it("does not render relation button anymore", () => {
     const region = createMockRegion();
     render(<RegionItem region={region} />);
-    const relationButton = screen.getByRole("button", { name: /Create Relation/i });
-    await userEvent.click(relationButton);
-    expect(region.annotation.startLinkingMode).toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: /Create Group/i })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("icon-relation-link")).not.toBeInTheDocument();
   });
 
   it("renders meta button and toggles edit mode", async () => {
@@ -244,21 +243,11 @@ describe("RegionItem", () => {
     expect(deleteButton).toBeDisabled();
   });
 
-  it("hides entity buttons (relation, meta) when region is read-only", () => {
+  it("hides entity buttons when region is read-only", () => {
     const region = createMockRegion();
     (region as any).isReadOnly = () => true;
     render(<RegionItem region={region} />);
-    expect(screen.queryByRole("button", { name: /Create Relation/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Edit region's meta/i })).not.toBeInTheDocument();
-  });
-
-  it("stops linking mode when relation button clicked and already in linking mode", async () => {
-    const region = createMockRegion();
-    (region.annotation as any).isLinkingMode = true;
-    render(<RegionItem region={region} />);
-    const relationButton = screen.getByRole("button", { name: /Create Relation/i });
-    await userEvent.click(relationButton);
-    expect(region.annotation.stopLinkingMode).toHaveBeenCalled();
   });
 
   it("uses region.background for color when set", () => {
@@ -277,13 +266,10 @@ describe("RegionItem", () => {
     expect(head).toHaveStyle({ color: "#0000ff" });
   });
 
-  it("hasEditableRegions is true when a node is not read-only and not classification", () => {
+  it("still renders when selection contains editable regions", () => {
     const region = createMockRegion({
       annotation: {
         selectedRegions: [{ isReadOnly: () => false, classification: false }],
-        isLinkingMode: false,
-        startLinkingMode: jest.fn(),
-        stopLinkingMode: jest.fn(),
         deleteRegion: jest.fn(),
       },
     });
@@ -291,13 +277,10 @@ describe("RegionItem", () => {
     expect(screen.getByTestId("detailed-region")).toBeInTheDocument();
   });
 
-  it("hasEditableRegions is false when all nodes are read-only", () => {
+  it("still renders when selection only contains read-only regions", () => {
     const region = createMockRegion({
       annotation: {
         selectedRegions: [{ isReadOnly: () => true, classification: false }],
-        isLinkingMode: false,
-        startLinkingMode: jest.fn(),
-        stopLinkingMode: jest.fn(),
         deleteRegion: jest.fn(),
       },
     });

@@ -48,6 +48,7 @@ jest.mock("../RegionItem", () => ({
 }));
 
 jest.mock("../Relations", () => ({
+  Groups: (props: any) => <div data-testid="groups-component" {...props} />,
   Relations: (props: any) => <div data-testid="relations-component" {...props} />,
 }));
 
@@ -74,6 +75,9 @@ jest.mock("@humansignal/icons", () => ({
   IconCursor: ({ width, height }: { width: number; height: number }) => (
     <svg data-testid="icon-cursor" width={width} height={height} />
   ),
+  IconPlus: ({ width, height }: { width: number; height: number }) => (
+    <svg data-testid="icon-plus" width={width} height={height} />
+  ),
   IconRelationLink: ({ width, height }: { width: number; height: number }) => (
     <svg data-testid="icon-relation-link" width={width} height={height} />
   ),
@@ -94,12 +98,39 @@ describe("DetailsPanel", () => {
     const mockCurrentEntityWithRelations = {
       relationStore: {
         size: 3,
+        pairRelations: [
+          {
+            id: "group-1",
+            node1: { id: "region1", cleanId: "r1", region_index: 1, type: "rectangleregion" },
+            node2: { id: "region2", cleanId: "r2", region_index: 2, type: "vectorregion" },
+            parent: {
+              deleteRelation: jest.fn(),
+            },
+          },
+        ],
+        addPair: jest.fn(),
+      },
+      regionStore: {
+        unselectAll: jest.fn(),
+        selection: {
+          list: [],
+          size: 0,
+        },
       },
     };
 
     const mockCurrentEntityWithoutRelations = {
       relationStore: {
         size: 0,
+        pairRelations: [],
+        addPair: jest.fn(),
+      },
+      regionStore: {
+        unselectAll: jest.fn(),
+        selection: {
+          list: [],
+          size: 0,
+        },
       },
     };
 
@@ -107,56 +138,31 @@ describe("DetailsPanel", () => {
       it("renders empty state with correct icon", () => {
         render(<Relations currentEntity={mockCurrentEntityWithoutRelations} />);
 
-        const emptyState = screen.getByTestId("empty-state");
-        expect(emptyState).toBeInTheDocument();
-
-        const icon = screen.getByTestId("icon-relation-link");
-        expect(icon).toBeInTheDocument();
-        expect(icon).toHaveAttribute("width", "24");
-        expect(icon).toHaveAttribute("height", "24");
+        expect(screen.getByTestId("groups-component")).toBeInTheDocument();
       });
 
       it("renders empty state with correct header", () => {
         render(<Relations currentEntity={mockCurrentEntityWithoutRelations} />);
 
-        const header = screen.getByTestId("empty-state-header");
-        expect(header).toBeInTheDocument();
-        expect(header).toHaveTextContent("Create relations between regions");
+        expect(screen.queryByTestId("empty-state-header")).not.toBeInTheDocument();
       });
 
       it("renders empty state with correct description", () => {
         render(<Relations currentEntity={mockCurrentEntityWithoutRelations} />);
 
-        const description = screen.getByTestId("empty-state-description");
-        expect(description).toBeInTheDocument();
-        expect(description).toHaveTextContent("Link regions to define relationships between them");
+        expect(screen.queryByTestId("empty-state-description")).not.toBeInTheDocument();
       });
 
-      it("renders learn more link with correct attributes", () => {
+      it("does not render pair list when no groups exist", () => {
         render(<Relations currentEntity={mockCurrentEntityWithoutRelations} />);
 
-        const learnMoreLink = screen.getByTestId("relations-panel-learn-more");
-        expect(learnMoreLink).toBeInTheDocument();
-        expect(learnMoreLink).toHaveAttribute(
-          "href",
-          "https://docs.example.com/guide/labeling#Add-relations-between-annotations",
-        );
-        expect(learnMoreLink).toHaveAttribute("target", "_blank");
-        expect(learnMoreLink).toHaveAttribute("rel", "noopener noreferrer");
-        expect(learnMoreLink).toHaveTextContent("Learn more");
+        expect(screen.queryByText("group=[1,2]")).not.toBeInTheDocument();
       });
 
-      it("does not render relations controls when no relations exist", () => {
+      it("renders group count header when no relations exist", () => {
         render(<Relations currentEntity={mockCurrentEntityWithoutRelations} />);
 
-        expect(screen.queryByTestId("relations-controls")).not.toBeInTheDocument();
-        expect(screen.queryByTestId("relations-component")).not.toBeInTheDocument();
-      });
-
-      it("does not render relations count header when no relations exist", () => {
-        render(<Relations currentEntity={mockCurrentEntityWithoutRelations} />);
-
-        expect(screen.queryByText(/Relations \(/)).not.toBeInTheDocument();
+        expect(screen.getByText("组 (0)")).toBeInTheDocument();
       });
     });
 
@@ -164,20 +170,19 @@ describe("DetailsPanel", () => {
       it("does not render empty state when relations exist", () => {
         render(<Relations currentEntity={mockCurrentEntityWithRelations} />);
 
-        expect(screen.queryByTestId("empty-state")).not.toBeInTheDocument();
+        expect(screen.getByTestId("groups-component")).toBeInTheDocument();
       });
 
-      it("renders relations controls and component when relations exist", () => {
+      it("renders group list when relations exist", () => {
         render(<Relations currentEntity={mockCurrentEntityWithRelations} />);
 
-        expect(screen.getByTestId("relations-controls")).toBeInTheDocument();
-        expect(screen.getByTestId("relations-component")).toBeInTheDocument();
+        expect(screen.getByTestId("groups-component")).toBeInTheDocument();
       });
 
-      it("renders relations count in header when relations exist", () => {
+      it("renders group count in header when relations exist", () => {
         render(<Relations currentEntity={mockCurrentEntityWithRelations} />);
 
-        expect(screen.getByText("Relations (3)")).toBeInTheDocument();
+        expect(screen.getByText("组 (1)")).toBeInTheDocument();
       });
     });
   });

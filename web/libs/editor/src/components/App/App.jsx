@@ -30,7 +30,6 @@ import { isStarterCloudPlan } from "@humansignal/core";
 import { cn } from "../../utils/bem";
 import { FF_BULK_ANNOTATION, FF_LSDV_4620_3_ML, FF_SIMPLE_INIT, isFF } from "../../utils/feature-flags";
 import { reactCleaner } from "../../utils/reactCleaner";
-import { guidGenerator } from "../../utils/unique";
 import { isDefined, sortAnnotations } from "../../utils/utilities";
 import { queryClient } from "@humansignal/core/lib/utils/query-client";
 import { ToastProvider, ToastViewport } from "@humansignal/ui/lib/toast/toast";
@@ -42,7 +41,6 @@ import { Annotation } from "./Annotation";
 import { BottomBar } from "../BottomBar/BottomBar";
 import Debug from "../Debug";
 import { InstructionsModal } from "../InstructionsModal/InstructionsModal";
-import { RelationsOverlay } from "../InteractiveOverlays/RelationsOverlay";
 import Settings from "../Settings/Settings";
 import { SideTabsPanels } from "../SidePanels/TabPanels/SideTabsPanels";
 import { TopBar } from "../TopBar/TopBar";
@@ -72,8 +70,6 @@ const hasTagInSidebar = (annotation) => {
  * App
  */
 class App extends Component {
-  relationsRef = React.createRef();
-
   componentDidMount() {
     // Hack to activate app hotkeys
     window.blur();
@@ -179,7 +175,6 @@ class App extends Component {
       >
         <div className={cn("main-view").elem("annotation").toClassName()}>
           {<Annotation root={root} annotation={as.selected} />}
-          {this.renderRelations(as.selected)}
           {this.renderCommentsOverlay(as.selected)}
         </div>
       </div>
@@ -208,21 +203,6 @@ class App extends Component {
     }
 
     return <ViewAll store={as} annotations={entities} root={as.root} />;
-  }
-
-  renderRelations(selectedStore) {
-    const store = selectedStore.relationStore;
-    const taskData = this.props.store.task?.data;
-
-    return (
-      <RelationsOverlay
-        key={guidGenerator()}
-        store={store}
-        ref={this.relationsRef}
-        tags={selectedStore.names}
-        taskData={taskData}
-      />
-    );
   }
 
   renderCommentsOverlay(selectedAnnotation) {
@@ -320,11 +300,6 @@ class App extends Component {
     );
   }
 
-  _notifyScroll = () => {
-    if (this.relationsRef.current) {
-      this.relationsRef.current.onResize();
-    }
-  };
 }
 
 export default observer(App);

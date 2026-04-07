@@ -20,6 +20,7 @@ import Registry from "../../../core/Registry";
 import { PER_REGION_MODES } from "../../../mixins/PerRegionModes";
 import { cn } from "../../../utils/bem";
 import { FF_DEV_2755, isFF } from "../../../utils/feature-flags";
+import { getPairRegionColor } from "../../../utils/pairGroups";
 import { flatten, isDefined, isMacOS } from "../../../utils/utilities";
 import { NodeIcon } from "../../Node/Node";
 import { LockButton } from "../Components/LockButton";
@@ -206,7 +207,7 @@ const titleRenderer = (nodeData: any) => {
 const useDataTree = ({ regions, rootClass, footer }: any) => {
   const processor = useCallback((item: any, idx, _false, _null, _onClick) => {
     const { id, type, hidden, locked } = item ?? {};
-    const style = item?.background ?? item?.getOneColor?.();
+    const style = getPairRegionColor(item) ?? item?.background ?? item?.getOneColor?.();
     const color = chroma(style ?? "#666").alpha(1);
     const mods: Record<string, any> = { hidden, type };
 

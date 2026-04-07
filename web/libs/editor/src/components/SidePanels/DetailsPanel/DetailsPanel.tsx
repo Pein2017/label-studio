@@ -7,13 +7,9 @@ import { PanelBase, type PanelProps } from "../PanelBase";
 import "./DetailsPanel.prefix.css";
 import { RegionDetailsMain, RegionDetailsMeta } from "./RegionDetails";
 import { RegionItem } from "./RegionItem";
-import { Relations as RelationsComponent } from "./Relations";
-// eslint-disable-next-line
-// @ts-ignore
-import { RelationsControls } from "./RelationsControls";
+import { Groups as GroupsComponent } from "./Relations";
 import { EmptyState } from "../Components/EmptyState";
-import { IconCursor, IconRelationLink } from "@humansignal/icons";
-import { getDocsUrl } from "../../../utils/docs";
+import { IconCursor } from "@humansignal/icons";
 
 interface DetailsPanelProps extends PanelProps {
   regions: any;
@@ -41,7 +37,15 @@ const DetailsComponent: FC<DetailsPanelProps> = ({ currentEntity, regions }) => 
 };
 
 const Content: FC<any> = observer(function Content({ selection, currentEntity }: any): JSX.Element {
-  return <>{selection.size ? <RegionsPanel regions={selection} /> : <GeneralPanel currentEntity={currentEntity} />}</>;
+  return (
+    <>
+      {selection.size ? (
+        <RegionsPanel regions={selection} currentEntity={currentEntity} />
+      ) : (
+        <GeneralPanel currentEntity={currentEntity} />
+      )}
+    </>
+  );
 });
 
 const CommentsTab: FC<any> = inject("store")(
@@ -69,36 +73,24 @@ const CommentsTab: FC<any> = inject("store")(
 const RelationsTab: FC<any> = inject("store")(
   observer(function RelationsTab({ currentEntity }: any): JSX.Element {
     const { relationStore } = currentEntity;
-    const hasRelations = relationStore.size > 0;
 
     return (
       <>
         <div className={cn("relations").toClassName()}>
           <div className={cn("relations").elem("section-tab").toClassName()}>
-            {hasRelations ? (
-              <>
-                <div className={cn("relations").elem("view-control").toClassName()}>
-                  <div className={cn("relations").elem("section-head").toClassName()}>
-                    Relations ({relationStore.size})
-                  </div>
-                  <RelationsControls relationStore={relationStore} />
-                </div>
-                <div className={cn("relations").elem("section-content").toClassName()}>
-                  <RelationsComponent relationStore={relationStore} />
-                </div>
-              </>
-            ) : (
-              <EmptyState
-                icon={<IconRelationLink width={24} height={24} />}
-                header="Create relations between regions"
-                description={<>Link regions to define relationships between them</>}
-                learnMore={{
-                  href: getDocsUrl("guide/labeling#Add-relations-between-annotations"),
-                  text: "Learn more",
-                  testId: "relations-panel-learn-more",
-                }}
+            <div className={cn("relations").elem("view-control").toClassName()}>
+              <div className={cn("relations").elem("section-head").toClassName()}>
+                组 ({relationStore.pairRelations.length})
+              </div>
+            </div>
+            <div className={cn("relations").elem("section-content").toClassName()}>
+              <GroupsComponent
+                relationStore={relationStore}
+                selection={currentEntity.regionStore.selection}
+                regionStore={currentEntity.regionStore}
+                store={currentEntity.store}
               />
-            )}
+            </div>
           </div>
         </div>
       </>
@@ -132,7 +124,7 @@ const HistoryTab: FC<any> = inject("store")(
 );
 
 const InfoTab: FC<any> = inject("store")(
-  observer(function InfoTab({ selection }: any): JSX.Element {
+  observer(function InfoTab({ selection, currentEntity }: any): JSX.Element {
     const nothingSelected = !selection || selection.size === 0;
     return (
       <>
@@ -146,7 +138,7 @@ const InfoTab: FC<any> = inject("store")(
               />
             ) : (
               <>
-                <RegionsPanel regions={selection} />
+                <RegionsPanel regions={selection} currentEntity={currentEntity} />
               </>
             )}
           </div>
@@ -188,11 +180,17 @@ const GeneralPanel: FC<any> = inject("store")(
         </div>
         <div className={cn("details").elem("section").toClassName()}>
           <div className={cn("details").elem("view-control").toClassName()}>
-            <div className={cn("details").elem("section-head").toClassName()}>Relations ({relationStore.size})</div>
-            <RelationsControls relationStore={relationStore} />
+            <div className={cn("details").elem("section-head").toClassName()}>
+              组 ({relationStore.pairRelations.length})
+            </div>
           </div>
           <div className={cn("details").elem("section-content").toClassName()}>
-            <RelationsComponent relationStore={relationStore} />
+            <GroupsComponent
+              relationStore={relationStore}
+              selection={currentEntity.regionStore.selection}
+              regionStore={currentEntity.regionStore}
+              store={store}
+            />
           </div>
         </div>
         {store.hasInterface("annotations:comments") && store.commentStore.isCommentable && (
@@ -214,12 +212,33 @@ const GeneralPanel: FC<any> = inject("store")(
 
 GeneralPanel.displayName = "GeneralPanel";
 
-const RegionsPanel: FC<{ regions: any }> = observer(function RegionsPanel({ regions }: { regions: any }): JSX.Element {
+const RegionsPanel: FC<{ regions: any; currentEntity: any }> = observer(function RegionsPanel({
+  regions,
+  currentEntity,
+}: {
+  regions: any;
+  currentEntity: any;
+}): JSX.Element {
   return (
     <div>
       {regions.list.map((reg: any) => {
         return <SelectedRegion key={reg.id} region={reg} />;
       })}
+      <div className={cn("details").elem("section").toClassName()}>
+        <div className={cn("details").elem("view-control").toClassName()}>
+          <div className={cn("details").elem("section-head").toClassName()}>
+            组 ({currentEntity.relationStore.pairRelations.length})
+          </div>
+        </div>
+        <div className={cn("details").elem("section-content").toClassName()}>
+          <GroupsComponent
+            relationStore={currentEntity.relationStore}
+            selection={regions}
+            regionStore={currentEntity.regionStore}
+            store={currentEntity.store}
+          />
+        </div>
+      </div>
     </div>
   );
 });

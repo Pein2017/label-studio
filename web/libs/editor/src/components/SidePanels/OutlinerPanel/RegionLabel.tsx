@@ -1,6 +1,7 @@
 import { observer } from "mobx-react";
 import { memo } from "react";
 import { cn } from "../../../utils/bem";
+import { getPairRegionColor, getPairRegionLabel } from "../../../utils/pairGroups";
 
 export type RegionLabelProps = {
   item: any;
@@ -32,6 +33,17 @@ export const RegionLabel = memo(
       const labelsInResults = item.labelings.map((result: any) => result.selectedLabels || []);
 
       const labels: any[] = [].concat(...labelsInResults);
+
+      if (!labels.length) {
+        const fallbackLabel = getPairRegionLabel(item) ?? item.noLabelView ?? "No label";
+        const fallbackColor = getPairRegionColor(item);
+
+        return (
+          <div className={cn("labels-list").toClassName()} style={fallbackColor ? { color: fallbackColor } : undefined}>
+            {fallbackLabel}
+          </div>
+        );
+      }
 
       return (
         <div className={cn("labels-list").toClassName()}>
