@@ -288,12 +288,14 @@
   },
 
   "tool:rotate-left": {
-    "key": "alt+left",
+    "key": "ctrl+left",
+    "mac": "command+left",
     "description": "Rotate the image 90° to the left"
   },
 
   "tool:rotate-right": {
-    "key": "alt+right",
+    "key": "ctrl+right",
+    "mac": "command+right",
     "description": "Rotate the image 90° to the right"
   },
 

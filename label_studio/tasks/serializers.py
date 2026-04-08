@@ -25,6 +25,7 @@ from rest_framework.fields import SkipField
 from rest_framework.serializers import ModelSerializer
 from rest_framework.settings import api_settings
 from tasks.exceptions import AnnotationDuplicateError
+from tasks.image_calibration import calibrate_annotation_result_for_local_files
 from tasks.models import Annotation, AnnotationDraft, Prediction, PredictionMeta, Task
 from tasks.result_normalization import build_normalized_annotation_payload
 from tasks.validation import TaskValidator
@@ -33,6 +34,11 @@ from users.serializers import UserSerializer
 
 logger = logging.getLogger(__name__)
 
+IMAGE_STATUS_TAG = 'image_status'
+IMAGE_SKIP_REASON_TAG = 'image_skip_reason'
+IMAGE_STATUS_NORMAL = '正常'
+IMAGE_STATUS_IRRELEVANT = '无关图片'
+
 
 def sanitize_prediction_import_payload(prediction):
     """Drop only FSM `state` from prediction import payloads."""
@@ -40,6 +46,76 @@ def sanitize_prediction_import_payload(prediction):
         return prediction
     prediction.pop('state', None)
     return prediction
+
+
+def _extract_single_choice(item):
+    if not isinstance(item, MutableMapping):
+        return None
+
+    if item.get('type') != 'choices':
+        return None
+
+    choices = item.get('value', {}).get('choices') or []
+    if not choices:
+        return None
+
+    return choices[0]
+
+
+def _build_single_choice_result(from_name, value):
+    return {
+        'type': 'choices',
+        'from_name': from_name,
+        'value': {
+            'choices': [value],
+        },
+    }
+
+
+def sanitize_image_status_result(result):
+    result = result or []
+    status = None
+
+    for item in result:
+        if isinstance(item, MutableMapping) and item.get('from_name') == IMAGE_STATUS_TAG:
+            status = _extract_single_choice(item)
+            if status:
+                break
+
+    cleaned = []
+    has_skip_reason = False
+
+    for item in result:
+        if not isinstance(item, MutableMapping):
+            cleaned.append(item)
+            continue
+
+        from_name = item.get('from_name')
+
+        if status == IMAGE_STATUS_IRRELEVANT:
+            if from_name == IMAGE_STATUS_TAG:
+                cleaned.append(item)
+                continue
+            if from_name == IMAGE_SKIP_REASON_TAG:
+                if _extract_single_choice(item):
+                    has_skip_reason = True
+                cleaned.append(item)
+                continue
+            continue
+
+        if from_name == IMAGE_SKIP_REASON_TAG:
+            continue
+
+        cleaned.append(item)
+
+    if not status:
+        status = IMAGE_STATUS_NORMAL
+        cleaned.insert(0, _build_single_choice_result(IMAGE_STATUS_TAG, IMAGE_STATUS_NORMAL))
+
+    if status == IMAGE_STATUS_IRRELEVANT and not has_skip_reason:
+        raise ValidationError({'result': '选择“无关图片”时，必须补充一个无关原因后才能提交。'})
+
+    return cleaned
 
 
 class PredictionQuerySerializer(serializers.Serializer):
@@ -155,6 +231,14 @@ class AnnotationSerializer(FlexFieldsModelSerializer):
 
     def create(self, *args, **kwargs):
         try:
+            validated_data = args[0] if args else kwargs.get('validated_data')
+            if validated_data is not None:
+                validated_data = self._apply_image_calibration(validated_data)
+                if args:
+                    args = (validated_data, *args[1:])
+                else:
+                    kwargs['validated_data'] = validated_data
+
             return super().create(*args, **kwargs)
         except IntegrityError as e:
             errors = [
@@ -164,6 +248,9 @@ class AnnotationSerializer(FlexFieldsModelSerializer):
             if any([error in str(e) for error in errors]):
                 raise AnnotationDuplicateError()
             raise
+
+    def update(self, instance, validated_data):
+        return super().update(instance, self._apply_image_calibration(validated_data, instance=instance))
 
     def validate_result(self, value):
         data = value
@@ -199,6 +286,26 @@ class AnnotationSerializer(FlexFieldsModelSerializer):
     def get_groups(self, annotation):
         _, groups, _ = build_normalized_annotation_payload(annotation.result or [])
         return groups
+
+    def _apply_image_calibration(self, validated_data, instance=None):
+        result = validated_data.get('result')
+        if result is None:
+            return validated_data
+
+        validated_data['result'] = sanitize_image_status_result(result)
+        result = validated_data['result']
+
+        task = validated_data.get('task')
+        if task is None and validated_data.get('task_id') is not None:
+            task = Task.objects.filter(id=validated_data['task_id']).first()
+        if task is None and instance is not None:
+            task = instance.task
+
+        if task is None:
+            return validated_data
+
+        validated_data['result'] = calibrate_annotation_result_for_local_files(task, result)
+        return validated_data
 
     def to_representation(self, obj):
         """Remove state field if feature flags are disabled"""

@@ -7,6 +7,7 @@ import {
   formatPairGroupLabel,
   getPairGroupKind,
   getPairRegionColor,
+  getPairRegionLabel,
   getPairGroupValidation,
   PAIR_GROUP_KIND,
 } from "../../../utils/pairGroups";
@@ -50,17 +51,7 @@ const getSelectionStateCopy = (selectedRegions: any[], validation: any, shortcut
 };
 
 const getSelectionChipLabel = (region: any) => {
-  const kind = getPairGroupKind(region);
-
-  if (kind === PAIR_GROUP_KIND.BOX) {
-    return "端口";
-  }
-
-  if (kind === PAIR_GROUP_KIND.LINE) {
-    return "尾纤连接处";
-  }
-
-  return "对象";
+  return getPairRegionLabel(region) ?? (getPairGroupKind(region) === PAIR_GROUP_KIND.LINE ? "尾纤连接处" : "对象");
 };
 
 const GroupsComponent: FC<GroupsProps> = observer(function GroupsComponent({ relationStore, selection, regionStore }) {
@@ -155,9 +146,19 @@ const GroupsComponent: FC<GroupsProps> = observer(function GroupsComponent({ rel
 
 const GroupItem: FC<{ relation: any }> = observer(({ relation }) => {
   const label = formatPairGroupLabel([relation.node1, relation.node2]);
+  const boxColor = getPairRegionColor(relation.node1);
+  const lineColor = getPairRegionColor(relation.node2);
 
   return (
-    <div className={cn("relations").elem("group-item").toClassName()}>
+    <div
+      className={cn("relations").elem("group-item").toClassName()}
+      style={
+        {
+          "--group-box-accent": boxColor ?? "var(--color-positive)",
+          "--group-line-accent": lineColor ?? "var(--color-warning)",
+        } as CSSProperties
+      }
+    >
       <div className={cn("relations").elem("group-item-head").toClassName()}>
         <div className={cn("relations").elem("group-label").toClassName()}>
           <span>{label}</span>
@@ -175,9 +176,27 @@ const GroupItem: FC<{ relation: any }> = observer(({ relation }) => {
       </div>
 
       <div className={cn("relations").elem("content").toClassName()}>
+        <div className={cn("relations").elem("group-badges").toClassName()}>
+          <div
+            className={cn("relations").elem("group-badge").mod({ kind: "box" }).toClassName()}
+            style={{ "--badge-accent": boxColor ?? "var(--color-positive)" } as CSSProperties}
+          >
+            {getPairRegionLabel(relation.node1) ?? "端口"} #{relation.node1?.region_index ?? "?"}
+          </div>
+          <div
+            className={cn("relations").elem("group-badge").mod({ kind: "line" }).toClassName()}
+            style={{ "--badge-accent": lineColor ?? "var(--color-warning)" } as CSSProperties}
+          >
+            {getPairRegionLabel(relation.node2) ?? "尾纤连接处"} #{relation.node2?.region_index ?? "?"}
+          </div>
+        </div>
         <div className={cn("relations").elem("nodes").toClassName()}>
-          <RegionItem compact withActions={false} withIds={false} region={relation.node1} />
-          <RegionItem compact withActions={false} withIds={false} region={relation.node2} />
+          <div className={cn("relations").elem("node-card").mod({ kind: "box" }).toClassName()}>
+            <RegionItem compact withActions={false} withIds={false} region={relation.node1} />
+          </div>
+          <div className={cn("relations").elem("node-card").mod({ kind: "line" }).toClassName()}>
+            <RegionItem compact withActions={false} withIds={false} region={relation.node2} />
+          </div>
         </div>
       </div>
     </div>

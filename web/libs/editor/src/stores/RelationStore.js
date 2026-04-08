@@ -1,4 +1,4 @@
-import { destroy, getParentOfType, getRoot, isAlive, types } from "mobx-state-tree";
+import { destroy, getParent, getParentOfType, getRoot, isAlive, types } from "mobx-state-tree";
 
 import { guidGenerator } from "../core/Helpers";
 import Tree, { TRAVERSE_SKIP } from "../core/Tree";
@@ -168,6 +168,16 @@ const RelationStore = types
     },
   }))
   .actions((self) => ({
+    resolveNode(nodeOrId) {
+      if (!nodeOrId) return null;
+      if (typeof nodeOrId !== "string") return nodeOrId;
+
+      try {
+        return getParent(self, 2)?.areas?.get?.(nodeOrId) ?? null;
+      } catch {
+        return null;
+      }
+    },
     afterAttach() {
       const appStore = getRoot(self);
 
@@ -210,16 +220,19 @@ const RelationStore = types
       return self.getPairRelationsForNode(node).length > 0;
     },
     canCreatePair(node1, node2) {
-      if (!node1 || !node2) {
+      const resolvedNode1 = self.resolveNode(node1);
+      const resolvedNode2 = self.resolveNode(node2);
+
+      if (!resolvedNode1 || !resolvedNode2) {
         return { ok: false, reason: "请选择两个标注" };
       }
 
-      if (node1 === node2) {
+      if (resolvedNode1 === resolvedNode2) {
         return { ok: false, reason: "同一个标注不能和自己成组" };
       }
 
-      const kind1 = getRegionPairKind(node1);
-      const kind2 = getRegionPairKind(node2);
+      const kind1 = getRegionPairKind(resolvedNode1);
+      const kind2 = getRegionPairKind(resolvedNode2);
 
       if (!kind1 || !kind2) {
         return { ok: false, reason: "只能对完整的端口和尾纤连接处成组" };
@@ -229,18 +242,20 @@ const RelationStore = types
         return { ok: false, reason: "一组必须是一个端口加一个尾纤连接处" };
       }
 
-      if (self.hasPairForNode(node1) || self.hasPairForNode(node2)) {
+      if (self.hasPairForNode(resolvedNode1) || self.hasPairForNode(resolvedNode2)) {
         return { ok: false, reason: "已成组的标注不能重复成组" };
       }
 
       return { ok: true, reason: "" };
     },
     addPair(node1, node2) {
+      const resolvedNode1 = self.resolveNode(node1);
+      const resolvedNode2 = self.resolveNode(node2);
       const validation = self.canCreatePair(node1, node2);
 
       if (!validation.ok) return null;
 
-      const [boxNode, lineNode] = normalizePairNodes(node1, node2);
+      const [boxNode, lineNode] = normalizePairNodes(resolvedNode1, resolvedNode2);
       const relation = Relation.create({
         node1: boxNode,
         node2: lineNode,
@@ -256,16 +271,18 @@ const RelationStore = types
     },
 
     addRelation(node1, node2) {
+      const resolvedNode1 = self.resolveNode(node1);
+      const resolvedNode2 = self.resolveNode(node2);
       const pairValidation = self.canCreatePair(node1, node2);
       if (pairValidation.ok) {
-        return self.addPair(node1, node2);
+        return self.addPair(resolvedNode1, resolvedNode2);
       }
 
-      if (!node1 || !node2 || self.nodesRelated(node1, node2)) return null;
+      if (!resolvedNode1 || !resolvedNode2 || self.nodesRelated(resolvedNode1, resolvedNode2)) return null;
 
       const relation = Relation.create({
-        node1,
-        node2,
+        node1: resolvedNode1,
+        node2: resolvedNode2,
       });
 
       self.relations.push(relation);
@@ -307,7 +324,9 @@ const RelationStore = types
 
     deserializeRelation(node1, node2, direction, labels) {
       const isPair = Array.isArray(labels) && labels.some((label) => PAIR_LABELS.has(label));
-      const rl = isPair ? self.addPair(node1, node2) : self.addRelation(node1, node2);
+      if (!isPair) return;
+
+      const rl = self.addPair(node1, node2);
 
       if (!rl) return; // duplicated relation
 

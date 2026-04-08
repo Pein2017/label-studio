@@ -225,6 +225,8 @@ const useDataTree = ({ regions, rootClass, footer }: any) => {
         "--icon-color": color.css(),
         "--text-color": color.css(),
         "--selection-color": color.alpha(0.1).css(),
+        "--selection-border-color": color.css(),
+        "--selection-shadow-color": color.alpha(0.18).css(),
       },
       className: rootClass.elem("node").mod(mods).toClassName(),
       title: titleRenderer,
