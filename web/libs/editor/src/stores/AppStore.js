@@ -28,6 +28,62 @@ import { CommentStore } from "./Comment/CommentStore";
 import { CustomButton } from "./CustomButton";
 
 const hotkeys = Hotkey("AppStore", "Global Hotkeys");
+const IMAGE_STATUS_TAG = "image_status";
+const IMAGE_STATUS_IRRELEVANT = "异常图片";
+const EXPECTED_PORT_COUNT = 9;
+
+const getSingleChoiceValue = (result) => {
+  if (result?.type !== "choices") return null;
+
+  const choices = result?.value?.choices;
+
+  return Array.isArray(choices) && choices.length > 0 ? choices[0] : null;
+};
+
+const getImageStatusValue = (serializedResults) => {
+  const statusResult = serializedResults.find((result) => result?.from_name === IMAGE_STATUS_TAG);
+
+  return getSingleChoiceValue(statusResult) ?? null;
+};
+
+const isPortResult = (result) => {
+  if (!result || typeof result !== "object") return false;
+
+  const value = result.value ?? {};
+
+  if (result.type === "rectangle" || result.type === "rectanglelabels") return true;
+
+  if (result.type !== "vector" && result.type !== "vectorlabels" && result.type !== "polygon" && result.type !== "polygonlabels") {
+    return false;
+  }
+
+  const vertices = Array.isArray(value.vertices) ? value.vertices : Array.isArray(value.points) ? value.points : null;
+
+  return value.closed === true && Array.isArray(vertices) && vertices.length === 4;
+};
+
+const countPortResults = (serializedResults) => {
+  const portIds = new Set();
+
+  serializedResults.forEach((result) => {
+    if (!isPortResult(result) || !result.id) return;
+    portIds.add(result.id);
+  });
+
+  return portIds.size;
+};
+
+const getPortCountValidationMessage = (serializedResults) => {
+  const imageStatus = getImageStatusValue(serializedResults);
+
+  if (imageStatus === IMAGE_STATUS_IRRELEVANT) return null;
+
+  const portCount = countPortResults(serializedResults);
+
+  if (portCount === EXPECTED_PORT_COUNT) return null;
+
+  return `当前端口标注数量为 ${portCount}，应为 ${EXPECTED_PORT_COUNT}。请补齐或检查“端口/多边形”和“端口/矩形”的总数后再提交。`;
+};
 
 export default types
   .model("AppStore", {
@@ -700,10 +756,16 @@ export default types
 
       const entity = self.annotationStore.selected;
       const event = entity.exists ? "updateAnnotation" : "submitAnnotation";
+      const serializedResults = entity.serializeAnnotation({ fast: true });
+      const portCountValidationMessage = getPortCountValidationMessage(serializedResults);
 
       entity.beforeSend();
 
       if (!entity.validate()) return;
+      if (portCountValidationMessage) {
+        window.alert(portCountValidationMessage);
+        return;
+      }
 
       if (!isFF(FF_CUSTOM_SCRIPT)) {
         entity.sendUserGenerate();
@@ -731,10 +793,16 @@ export default types
       if (self.isSubmitting) return;
 
       const entity = self.annotationStore.selected;
+      const serializedResults = entity.serializeAnnotation({ fast: true });
+      const portCountValidationMessage = getPortCountValidationMessage(serializedResults);
 
       entity.beforeSend();
 
       if (!entity.validate()) return;
+      if (portCountValidationMessage) {
+        window.alert(portCountValidationMessage);
+        return;
+      }
 
       handleSubmittingFlag(async () => {
         if (isFF(FF_CUSTOM_SCRIPT)) {

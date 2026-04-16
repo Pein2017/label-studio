@@ -208,7 +208,7 @@ def test_sanitize_image_status_result_keeps_only_global_flags_for_irrelevant_ima
             'id': 'status-1',
             'type': 'choices',
             'from_name': 'image_status',
-            'value': {'choices': ['无关图片']},
+            'value': {'choices': ['异常图片']},
         },
         {
             'id': 'reason-1',

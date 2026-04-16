@@ -37,7 +37,8 @@ logger = logging.getLogger(__name__)
 IMAGE_STATUS_TAG = 'image_status'
 IMAGE_SKIP_REASON_TAG = 'image_skip_reason'
 IMAGE_STATUS_NORMAL = '正常'
-IMAGE_STATUS_IRRELEVANT = '无关图片'
+IMAGE_STATUS_IRRELEVANT = '异常图片'
+EXPECTED_PORT_COUNT = 9
 
 
 def sanitize_prediction_import_payload(prediction):
@@ -49,17 +50,24 @@ def sanitize_prediction_import_payload(prediction):
 
 
 def _extract_single_choice(item):
-    if not isinstance(item, MutableMapping):
-        return None
+    choices = _extract_choices(item)
 
-    if item.get('type') != 'choices':
-        return None
-
-    choices = item.get('value', {}).get('choices') or []
     if not choices:
         return None
 
     return choices[0]
+
+
+def _extract_choices(item):
+    if not isinstance(item, MutableMapping):
+        return []
+
+    if item.get('type') != 'choices':
+        return []
+
+    choices = item.get('value', {}).get('choices') or []
+
+    return list(choices)
 
 
 def _build_single_choice_result(from_name, value):
@@ -70,6 +78,66 @@ def _build_single_choice_result(from_name, value):
             'choices': [value],
         },
     }
+
+
+def _is_port_result_item(item):
+    if not isinstance(item, MutableMapping):
+        return False
+
+    item_type = item.get('type')
+    value = item.get('value') or {}
+
+    if item_type in {'rectangle', 'rectanglelabels'}:
+        return True
+
+    if item_type not in {'vector', 'vectorlabels', 'polygon', 'polygonlabels'}:
+        return False
+
+    vertices = value.get('vertices')
+    if not isinstance(vertices, list):
+        vertices = value.get('points')
+
+    return value.get('closed') is True and isinstance(vertices, list) and len(vertices) == 4
+
+
+def _count_port_results(result):
+    region_ids = set()
+
+    for item in result or []:
+        if not _is_port_result_item(item):
+            continue
+
+        region_id = item.get('id')
+        if not region_id:
+            continue
+
+        region_ids.add(region_id)
+
+    return len(region_ids)
+
+
+def _validate_expected_port_count(result):
+    status = None
+
+    for item in result or []:
+        if isinstance(item, MutableMapping) and item.get('from_name') == IMAGE_STATUS_TAG:
+            status = _extract_single_choice(item)
+            if status:
+                break
+
+    if status == IMAGE_STATUS_IRRELEVANT:
+        return
+
+    port_count = _count_port_results(result)
+    if port_count != EXPECTED_PORT_COUNT:
+        raise ValidationError(
+            {
+                'result': (
+                    f'当前端口标注数量为 {port_count}，应为 {EXPECTED_PORT_COUNT}。'
+                    '请检查“端口/多边形”和“端口/矩形”的总数后再提交。'
+                )
+            }
+        )
 
 
 def sanitize_image_status_result(result):
@@ -97,7 +165,7 @@ def sanitize_image_status_result(result):
                 cleaned.append(item)
                 continue
             if from_name == IMAGE_SKIP_REASON_TAG:
-                if _extract_single_choice(item):
+                if _extract_choices(item):
                     has_skip_reason = True
                 cleaned.append(item)
                 continue
@@ -113,7 +181,7 @@ def sanitize_image_status_result(result):
         cleaned.insert(0, _build_single_choice_result(IMAGE_STATUS_TAG, IMAGE_STATUS_NORMAL))
 
     if status == IMAGE_STATUS_IRRELEVANT and not has_skip_reason:
-        raise ValidationError({'result': '选择“无关图片”时，必须补充一个无关原因后才能提交。'})
+        raise ValidationError({'result': '选择“异常图片”时，必须补充一个异常原因后才能提交。'})
 
     return cleaned
 
@@ -264,6 +332,8 @@ class AnnotationSerializer(FlexFieldsModelSerializer):
         # check result is list
         if not isinstance(data, list):
             raise ValidationError('annotation "result" field in annotation must be list')
+
+        _validate_expected_port_count(data)
 
         return data
 
