@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import lru_cache
 import logging
 import os
 import posixpath
@@ -12,12 +13,18 @@ from django.conf import settings
 from django.utils._os import safe_join
 from PIL import Image
 from rest_framework.exceptions import ValidationError
-from tasks.result_normalization import calibrate_result_payload, get_result_item_rotation
+from tasks.result_normalization import calibrate_result_item, get_result_item_rotation
 
 logger = logging.getLogger(__name__)
 
 LOCAL_FILES_ROUTE = '/data/local-files'
 SUPPORTED_ROTATIONS = {0, 90, 180, 270}
+EXIF_ORIENTATION_TAG = 274
+EXIF_ORIENTATION_TO_DISPLAY_ROTATION = {
+    3: 180,
+    6: 90,
+    8: 270,
+}
 TRANSPOSE_BY_ROTATION = {
     90: Image.Transpose.ROTATE_270,
     180: Image.Transpose.ROTATE_180,
@@ -33,7 +40,7 @@ def calibrate_annotation_result_for_local_files(task, result):
     if not rotations_by_item:
         return result
 
-    calibrated_result = calibrate_result_payload(result, strict=True)
+    calibrated_result = _calibrate_result_to_final_rotations(result, rotations_by_item)
 
     for item_index, rotation in rotations_by_item.items():
         image_path = _resolve_task_local_image_path(task, item_index)
@@ -50,11 +57,93 @@ def calibrate_annotation_result_for_local_files(task, result):
     return calibrated_result
 
 
+def calibrate_exported_annotation_result_for_local_files(task, result):
+    """Normalize exported annotations back into the raw local-file pixel space.
+
+    Label Studio's frontend renders JPEG EXIF orientation automatically. When the
+    underlying file keeps its original pixel matrix plus EXIF metadata, exported
+    coordinates can otherwise remain in the display-oriented coordinate system.
+    """
+    result = result or []
+    rotations_by_item = _collect_export_rotations_by_item(task, result)
+
+    if not rotations_by_item:
+        return result
+
+    calibrated_result = []
+
+    for item in result:
+        if not isinstance(item, dict) or item.get('type') == 'relation':
+            calibrated_result.append(item)
+            continue
+
+        item_index = int(item.get('item_index') or 0)
+        target_rotation = rotations_by_item.get(item_index, 0)
+
+        if not _is_spatial_result_item(item):
+            calibrated_item = dict(item)
+            calibrated_item['image_rotation'] = 0
+            calibrated_result.append(calibrated_item)
+            continue
+
+        if target_rotation == 0:
+            calibrated_item = dict(item)
+            calibrated_item['image_rotation'] = 0
+            calibrated_result.append(calibrated_item)
+            continue
+
+        rotated_item = dict(item)
+        existing_rotation = get_result_item_rotation(rotated_item)
+        rotated_item['image_rotation'] = (existing_rotation + target_rotation) % 360
+        calibrated_result.append(calibrate_result_item(rotated_item, strict=True))
+
+    return calibrated_result
+
+
+def _is_spatial_result_item(item: Dict[str, Any]) -> bool:
+    if not isinstance(item, dict) or item.get('type') == 'relation':
+        return False
+
+    value = item.get('value')
+
+    if not isinstance(value, dict):
+        return False
+
+    return (
+        isinstance(value.get('vertices'), list)
+        or isinstance(value.get('points'), list)
+        or ('width' in value and 'height' in value)
+        or ('x' in value and 'y' in value)
+    )
+
+
+def _collect_export_rotations_by_item(task, result: Iterable[Dict[str, Any]]) -> Dict[int, int]:
+    item_indexes = set()
+
+    for item in result:
+        if not _is_spatial_result_item(item):
+            continue
+        item_indexes.add(int(item.get('item_index') or 0))
+
+    rotations_by_item: Dict[int, int] = {}
+
+    for item_index in item_indexes:
+        image_path = _resolve_task_local_image_path(task, item_index)
+        if image_path is None:
+            continue
+
+        rotation = _get_export_rotation_from_exif(image_path)
+        if rotation:
+            rotations_by_item[item_index] = rotation
+
+    return rotations_by_item
+
+
 def _collect_item_rotations(result: Iterable[Dict[str, Any]]) -> Dict[int, int]:
     rotations_by_item: Dict[int, set[int]] = {}
 
     for item in result:
-        if not isinstance(item, dict) or item.get('type') == 'relation':
+        if not _is_spatial_result_item(item):
             continue
 
         item_index = int(item.get('item_index') or 0)
@@ -70,17 +159,49 @@ def _collect_item_rotations(result: Iterable[Dict[str, Any]]) -> Dict[int, int]:
     normalized_rotations: Dict[int, int] = {}
 
     for item_index, rotations in rotations_by_item.items():
-        if len(rotations) > 1:
+        non_zero_rotations = {rotation for rotation in rotations if rotation}
+
+        if len(non_zero_rotations) > 1:
             raise ValidationError(
                 'Please rotate the image to its final orientation before annotating. '
                 f'Found mixed image_rotation values for item_index={item_index}: {sorted(rotations)}.'
             )
 
-        rotation = next(iter(rotations))
+        rotation = next(iter(non_zero_rotations), 0)
         if rotation:
             normalized_rotations[item_index] = rotation
 
     return normalized_rotations
+
+
+def _calibrate_result_to_final_rotations(result: Iterable[Dict[str, Any]], rotations_by_item: Dict[int, int]):
+    calibrated_result = []
+
+    for item in result:
+        if not isinstance(item, dict) or item.get('type') == 'relation':
+            calibrated_result.append(item)
+            continue
+
+        item_index = int(item.get('item_index') or 0)
+        target_rotation = rotations_by_item.get(item_index, 0)
+
+        if not _is_spatial_result_item(item):
+            calibrated_item = dict(item)
+            calibrated_item['image_rotation'] = 0
+            calibrated_result.append(calibrated_item)
+            continue
+
+        if target_rotation == 0:
+            calibrated_item = dict(item)
+            calibrated_item['image_rotation'] = 0
+            calibrated_result.append(calibrated_item)
+            continue
+
+        rotated_item = dict(item)
+        rotated_item['image_rotation'] = target_rotation
+        calibrated_result.append(calibrate_result_item(rotated_item, strict=True))
+
+    return calibrated_result
 
 
 def _resolve_task_local_image_path(task, item_index: int) -> Optional[Path]:
@@ -221,6 +342,25 @@ def _extract_local_files_relative_path(url: str) -> Optional[str]:
         return None
 
     return posixpath.normpath(unquote(relative_path)).lstrip('/')
+
+
+def _get_export_rotation_from_exif(path: Path) -> int:
+    try:
+        orientation = _read_exif_orientation(str(path), path.stat().st_mtime_ns)
+    except OSError:
+        logger.warning('Failed to read EXIF orientation for %s', path)
+        return 0
+
+    display_rotation = EXIF_ORIENTATION_TO_DISPLAY_ROTATION.get(orientation, 0)
+    return (-display_rotation) % 360 if display_rotation else 0
+
+
+@lru_cache(maxsize=2048)
+def _read_exif_orientation(path_str: str, mtime_ns: int) -> Optional[int]:
+    del mtime_ns
+
+    with Image.open(path_str) as image:
+        return image.getexif().get(EXIF_ORIENTATION_TAG)
 
 
 def _refresh_task_image_url(task, item_index: int, image_path: Path) -> None:

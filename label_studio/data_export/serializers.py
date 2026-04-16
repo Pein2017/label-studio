@@ -10,6 +10,7 @@ from label_studio_sdk._extensions.label_studio_tools.postprocessing.video import
 from ml.mixins import InteractiveMixin
 from rest_flex_fields import FlexFieldsModelSerializer
 from rest_framework import serializers
+from tasks.image_calibration import calibrate_exported_annotation_result_for_local_files
 from tasks.models import Annotation, Task
 from tasks.result_normalization import build_normalized_annotation_payload
 from tasks.serializers import AnnotationDraftSerializer, PredictionSerializer
@@ -55,10 +56,18 @@ class AnnotationSerializer(FlexFieldsModelSerializer):
         return ret
 
     def _get_annotation_payload(self, obj):
-        cache_name = '_normalized_annotation_payload'
+        calibrate_local_file_exif = self.context.get('calibrate_local_file_exif', False)
+        cache_name = (
+            '_normalized_annotation_payload_export'
+            if calibrate_local_file_exif
+            else '_normalized_annotation_payload'
+        )
         payload = getattr(obj, cache_name, None)
         if payload is None:
-            payload = build_normalized_annotation_payload(obj.result or [])
+            result = obj.result or []
+            if calibrate_local_file_exif and getattr(obj, 'task', None) is not None:
+                result = calibrate_exported_annotation_result_for_local_files(obj.task, result)
+            payload = build_normalized_annotation_payload(result)
             setattr(obj, cache_name, payload)
         return payload
 
@@ -107,6 +116,7 @@ class BaseExportDataSerializer(FlexFieldsModelSerializer):
             self.fields['annotations'].context['interpolate_key_frames'] = self.context.get(
                 'interpolate_key_frames', False
             )
+            self.fields['annotations'].context['calibrate_local_file_exif'] = True
         replace_task_data_undefined_with_config_field(data, project)
 
         ret = super().to_representation(task)

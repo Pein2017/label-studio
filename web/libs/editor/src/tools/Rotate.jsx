@@ -44,6 +44,13 @@ const _Tool = types
   }))
   .actions((self) => ({
     rotate(degree) {
+      const regionCount = self.obj?.annotation?.areas?.size ?? 0;
+
+      if (regionCount > 0) {
+        window.alert("当前图片已存在标注对象。请先清空当前标注，再进行图片旋转。");
+        return;
+      }
+
       self.obj.rotate(degree);
     },
   }));

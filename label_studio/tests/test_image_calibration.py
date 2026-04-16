@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 from rest_framework.exceptions import ValidationError
-from tasks.image_calibration import calibrate_annotation_result_for_local_files
+from tasks.image_calibration import calibrate_annotation_result_for_local_files, calibrate_exported_annotation_result_for_local_files
 from tasks.result_normalization import build_normalized_annotation_payload, calibrate_result_payload
 from tasks.serializers import sanitize_image_status_result
 
@@ -163,6 +163,43 @@ def test_calibrate_annotation_result_for_local_files_refreshes_local_image_url(t
     assert task.data['image'].startswith('/data/local-files/?d=pigtail-images%2Fportrait.png')
     assert '&v=' in task.data['image']
     assert task.saved_update_fields == ['data', 'updated_at']
+
+
+def test_calibrate_exported_annotation_result_for_local_files_uses_exif_orientation(tmp_path, monkeypatch):
+    image_path = tmp_path / 'portrait.jpg'
+    image = Image.new('RGB', (422, 1000), 'red')
+    exif = image.getexif()
+    exif[274] = 6
+    image.save(image_path, exif=exif)
+
+    result = [
+        {
+            'id': 'rect-1',
+            'type': 'rectanglelabels',
+            'original_width': 1000,
+            'original_height': 422,
+            'image_rotation': 0,
+            'value': {
+                'x': 10,
+                'y': 20,
+                'width': 30,
+                'height': 10,
+                'rectanglelabels': ['端口/矩形'],
+            },
+        }
+    ]
+
+    monkeypatch.setattr('tasks.image_calibration._resolve_task_local_image_path', lambda task, item_index: image_path)
+
+    calibrated = calibrate_exported_annotation_result_for_local_files(SimpleNamespace(project_id=1, data={}), result)
+
+    assert calibrated[0]['original_width'] == 422.0
+    assert calibrated[0]['original_height'] == 1000.0
+    assert calibrated[0]['image_rotation'] == 0
+    assert calibrated[0]['value']['x'] == pytest.approx(20.0)
+    assert calibrated[0]['value']['y'] == pytest.approx(60.0)
+    assert calibrated[0]['value']['width'] == pytest.approx(10.0)
+    assert calibrated[0]['value']['height'] == pytest.approx(30.0)
 
 
 def test_sanitize_image_status_result_keeps_only_global_flags_for_irrelevant_image():
