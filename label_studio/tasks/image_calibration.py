@@ -159,15 +159,13 @@ def _collect_item_rotations(result: Iterable[Dict[str, Any]]) -> Dict[int, int]:
     normalized_rotations: Dict[int, int] = {}
 
     for item_index, rotations in rotations_by_item.items():
-        non_zero_rotations = {rotation for rotation in rotations if rotation}
-
-        if len(non_zero_rotations) > 1:
+        if len(rotations) > 1:
             raise ValidationError(
                 'Please rotate the image to its final orientation before annotating. '
                 f'Found mixed image_rotation values for item_index={item_index}: {sorted(rotations)}.'
             )
 
-        rotation = next(iter(non_zero_rotations), 0)
+        rotation = next(iter(rotations), 0)
         if rotation:
             normalized_rotations[item_index] = rotation
 
