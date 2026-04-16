@@ -51,6 +51,18 @@ from webhooks.utils import (
 logger = logging.getLogger(__name__)
 
 
+def delete_annotation_draft_by_id(draft_id):
+    """Delete a single draft row so draft summary side effects still run."""
+    try:
+        draft = AnnotationDraft.objects.get(id=draft_id)
+        # Call delete on the instance because AnnotationDraft.delete()
+        # updates project draft summary counters.
+        draft.delete()
+        return True
+    except AnnotationDraft.DoesNotExist:
+        return False
+
+
 # TODO: fix after switch to api/tasks from api/dm/tasks
 @method_decorator(
     name='post',
@@ -650,6 +662,28 @@ class AnnotationAPI(generics.RetrieveUpdateDestroyAPIView):
     def update(self, request, *args, **kwargs):
         # save user history with annotator_id, time & annotation result
         annotation = self.get_object()
+        user = request.user
+        draft = None
+
+        raw_draft_id = request.data.get('draft_id')
+        try:
+            draft_id = int(raw_draft_id)
+        except (TypeError, ValueError):
+            draft_id = None
+
+        if draft_id is not None and draft_id <= 0:
+            draft_id = None
+
+        if draft_id is not None:
+            draft = AnnotationDraft.objects.filter(id=draft_id).first()
+            if draft and (
+                draft.task_id != annotation.task_id
+                or draft.annotation_id != annotation.id
+                or not draft.has_permission(user)
+                or draft.user_id != user.id
+            ):
+                raise PermissionDenied(f'You have no permission to draft id:{draft_id}')
+
         # use updated instead of save to avoid duplicated signals
         Annotation.objects.filter(id=annotation.id).update(updated_by=request.user)
 
@@ -660,6 +694,10 @@ class AnnotationAPI(generics.RetrieveUpdateDestroyAPIView):
         task.save()  # refresh task metrics
 
         result = super(AnnotationAPI, self).update(request, *args, **kwargs)
+
+        if draft is not None and result.status_code < 400:
+            logger.debug(f'Remove draft {draft_id} after updating annotation {annotation.id}')
+            delete_annotation_draft_by_id(draft_id)
 
         task.update_is_labeled()
         task.save(update_fields=['updated_at'])  # refresh task metrics
@@ -773,15 +811,7 @@ class AnnotationsListAPI(GetParentObjectMixin, generics.ListCreateAPIView):
         return Annotation.objects.filter(Q(task=task) & Q(was_cancelled=False)).order_by('pk')
 
     def delete_draft(self, draft_id, annotation_id):
-        try:
-            draft = AnnotationDraft.objects.get(id=draft_id)
-            # We call delete on the individual draft object because
-            # AnnotationDraft#delete has special behavior (updating created_labels_drafts).
-            # This special behavior won't be triggered if we call delete on the queryset.
-            # Only for drafts with empty annotation_id, other ones deleted by signal
-            draft.delete()
-        except AnnotationDraft.DoesNotExist:
-            pass
+        delete_annotation_draft_by_id(draft_id)
 
     def perform_create(self, ser):
         task = self.parent_object

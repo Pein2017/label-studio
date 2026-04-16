@@ -6,7 +6,7 @@ from organizations.tests.factories import OrganizationFactory
 from projects.models import Project
 from projects.tests.factories import ProjectFactory
 from rest_framework.test import APITestCase
-from tasks.tests.factories import AnnotationFactory, PredictionFactory, TaskFactory
+from tasks.tests.factories import AnnotationDraftFactory, AnnotationFactory, PredictionFactory, TaskFactory
 from tests.utils import mock_feature_flag
 
 
@@ -129,6 +129,53 @@ class TestTaskAPI(APITestCase):
         response_data = response.json()
         assert response_data['project'] == self.project.id
         assert response_data['data'] == {'text': 'test task'}
+
+    def test_patch_annotation_deletes_linked_draft(self):
+        task = TaskFactory(project=self.project, data={'text': 'test'})
+        annotation = AnnotationFactory(
+            task=task,
+            project=self.project,
+            completed_by=self.user,
+            result=[
+                {
+                    'value': {'choices': ['class_A']},
+                    'id': 'nJS76J03pi',
+                    'from_name': 'text_class',
+                    'to_name': 'text',
+                    'type': 'choices',
+                    'origin': 'manual',
+                }
+            ],
+        )
+        draft = AnnotationDraftFactory(
+            task=task,
+            annotation=annotation,
+            user=self.user,
+            result=[
+                {
+                    'value': {'choices': ['class_B']},
+                    'id': 'nJS76J03pi',
+                    'from_name': 'text_class',
+                    'to_name': 'text',
+                    'type': 'choices',
+                    'origin': 'manual',
+                }
+            ],
+        )
+
+        self.client.force_authenticate(user=self.user)
+        with patch('tasks.serializers._validate_expected_port_count'):
+            response = self.client.patch(
+                f'/api/annotations/{annotation.id}?project={self.project.id}&taskId={task.id}',
+                data={
+                    'result': draft.result,
+                    'draft_id': draft.id,
+                },
+                format='json',
+        )
+
+        assert response.status_code == 200
+        assert not annotation.drafts.filter(id=draft.id).exists()
 
 
 class TestTaskAPIResolveUri(APITestCase):
