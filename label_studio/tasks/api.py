@@ -9,6 +9,9 @@ from coordexp_refinement.guards import (
     reject_managed_prediction_entity_write,
     reject_managed_project_write,
 )
+from coordexp_refinement.roi_finalization import DjangoRoiFinalizationError
+from coordexp_refinement.roi_targets import parse_canonical_revision
+from coordexp_refinement.transition_fence import project_mutation_bindings
 from core.feature_flags import flag_set
 from core.mixins import GetParentObjectMixin
 from core.permissions import ViewClassPermission, all_permissions
@@ -28,7 +31,7 @@ from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiRespo
 from projects.functions.stream_history import fill_history_annotation
 from projects.models import Project
 from rest_framework import generics, viewsets
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import APIException, PermissionDenied, ValidationError
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from tasks.models import Annotation, AnnotationDraft, Prediction, Task
@@ -56,6 +59,18 @@ from webhooks.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _ManagedDraftTransitionConflict(APIException):
+    status_code = 409
+    default_detail = 'Managed Draft transition rejected.'
+    default_code = 'coordexp_draft_transition_conflict'
+
+
+class _ManagedDraftTransitionUnavailable(APIException):
+    status_code = 503
+    default_detail = 'Managed Draft finalization is temporarily unavailable.'
+    default_code = 'coordexp_draft_finalization_unavailable'
 
 
 # TODO: fix after switch to api/tasks from api/dm/tasks
@@ -940,6 +955,14 @@ class AnnotationDraftListAPI(generics.ListCreateAPIView):
     )
     queryset = AnnotationDraft.objects.all()
 
+    def create(self, request, *args, **kwargs):
+        try:
+            return super().create(request, *args, **kwargs)
+        except _ManagedDraftTransitionConflict:
+            return _managed_draft_error_response(status_code=409, code='coordexp_draft_transition_conflict')
+        except _ManagedDraftTransitionUnavailable:
+            return _managed_draft_error_response(status_code=503, code='coordexp_draft_finalization_unavailable')
+
     def filter_queryset(self, queryset):
         task_id = self.kwargs['pk']
         return queryset.filter(task_id=task_id)
@@ -949,7 +972,34 @@ class AnnotationDraftListAPI(generics.ListCreateAPIView):
         annotation_id = self.kwargs.get('annotation_id')
         user = self.request.user
         logger.debug(f'User {user} is going to create draft for task={task_id}, annotation={annotation_id}')
-        serializer.save(task_id=self.kwargs['pk'], annotation_id=annotation_id, user=self.request.user)
+        task = generics.get_object_or_404(Task.objects.select_related('project'), pk=task_id)
+        binding = project_mutation_bindings.get(task.project_id)
+        if binding is None:
+            serializer.save(task_id=self.kwargs['pk'], annotation_id=annotation_id, user=self.request.user)
+            return
+
+        task_key, user_id = _managed_draft_fence_authority(task=task, user=user)
+        try:
+            with binding.fence.hold(project_id=task.project_id, user_id=user_id, task_key=task_key):
+                with transaction.atomic():
+                    try:
+                        plan = binding.finalizer.preflight_draft_result(
+                            user=user,
+                            project_id=task.project_id,
+                            task_key=task_key,
+                            draft_id=None,
+                            annotation_id=annotation_id,
+                            result=serializer.validated_data.get('result'),
+                        )
+                    except DjangoRoiFinalizationError as exc:
+                        raise _ManagedDraftTransitionConflict() from exc
+                    if plan.produced_receipt_ids or plan.reconcile_draft_revision is not None:
+                        raise _ManagedDraftTransitionConflict()
+                    serializer.save(task=task, annotation_id=annotation_id, user=user)
+        except _ManagedDraftTransitionConflict:
+            raise
+        except Exception as exc:
+            raise _ManagedDraftTransitionUnavailable() from exc
 
 
 @extend_schema(exclude=True)
@@ -963,6 +1013,125 @@ class AnnotationDraftAPI(generics.RetrieveUpdateDestroyAPIView):
         PATCH=all_permissions.annotations_change,
         DELETE=all_permissions.annotations_delete,
     )
+
+    def update(self, request, *args, **kwargs):
+        try:
+            return super().update(request, *args, **kwargs)
+        except _ManagedDraftTransitionConflict:
+            return _managed_draft_error_response(status_code=409, code='coordexp_draft_transition_conflict')
+        except _ManagedDraftTransitionUnavailable:
+            return _managed_draft_error_response(status_code=503, code='coordexp_draft_finalization_unavailable')
+
+    def destroy(self, request, *args, **kwargs):
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except _ManagedDraftTransitionConflict:
+            return _managed_draft_error_response(status_code=409, code='coordexp_draft_transition_conflict')
+        except _ManagedDraftTransitionUnavailable:
+            return _managed_draft_error_response(status_code=503, code='coordexp_draft_finalization_unavailable')
+
+    def perform_update(self, serializer):
+        draft = serializer.instance
+        task = draft.task
+        binding = project_mutation_bindings.get(task.project_id)
+        if binding is None:
+            return super().perform_update(serializer)
+
+        task_key, user_id = _managed_draft_fence_authority(task=task, user=self.request.user)
+        if draft.user_id != user_id:
+            raise _ManagedDraftTransitionConflict()
+        result = serializer.validated_data.get('result', draft.result)
+        try:
+            with binding.fence.hold(project_id=task.project_id, user_id=user_id, task_key=task_key):
+                with transaction.atomic():
+                    try:
+                        plan = binding.finalizer.preflight_draft_result(
+                            user=self.request.user,
+                            project_id=task.project_id,
+                            task_key=task_key,
+                            draft_id=draft.pk,
+                            annotation_id=draft.annotation_id,
+                            result=result,
+                        )
+                    except DjangoRoiFinalizationError as exc:
+                        raise _ManagedDraftTransitionConflict() from exc
+                    saved = serializer.save(task=task, annotation=draft.annotation, user=self.request.user)
+                    if plan.reconcile_draft_revision is not None:
+                        reconciled_revision = parse_canonical_revision(
+                            plan.reconcile_draft_revision,
+                            field='reconciled Draft revision',
+                        )
+                        AnnotationDraft.objects.filter(pk=saved.pk).update(updated_at=reconciled_revision)
+                        saved.refresh_from_db()
+                    # Every proof is recomputed from the exact persisted row while
+                    # both the per-task fence and outer DB transaction remain held.
+                    for receipt_id in plan.produced_receipt_ids:
+                        binding.finalizer.finalize_inserted(
+                            user=self.request.user,
+                            receipt_id_or_request_id=receipt_id,
+                        )
+        except _ManagedDraftTransitionConflict:
+            raise
+        except _ManagedDraftTransitionUnavailable:
+            raise
+        except Exception as exc:
+            raise _ManagedDraftTransitionUnavailable() from exc
+
+    def perform_destroy(self, instance):
+        task = instance.task
+        binding = project_mutation_bindings.get(task.project_id)
+        if binding is None:
+            return super().perform_destroy(instance)
+
+        task_key, user_id = _managed_draft_fence_authority(task=task, user=self.request.user)
+        if instance.user_id != user_id:
+            raise _ManagedDraftTransitionConflict()
+        try:
+            with binding.fence.hold(project_id=task.project_id, user_id=user_id, task_key=task_key):
+                with transaction.atomic():
+                    try:
+                        plan = binding.finalizer.preflight_draft_result(
+                            user=self.request.user,
+                            project_id=task.project_id,
+                            task_key=task_key,
+                            draft_id=instance.pk,
+                            annotation_id=instance.annotation_id,
+                            result=instance.result,
+                        )
+                    except DjangoRoiFinalizationError as exc:
+                        raise _ManagedDraftTransitionConflict() from exc
+                    if plan.produced_receipt_ids or plan.reconcile_draft_revision is not None:
+                        raise _ManagedDraftTransitionConflict()
+                    return super().perform_destroy(instance)
+        except _ManagedDraftTransitionConflict:
+            raise
+        except Exception as exc:
+            raise _ManagedDraftTransitionUnavailable() from exc
+
+
+def _managed_draft_fence_authority(*, task, user):
+    task_data = task.data
+    task_key = task_data.get('coordexp_task_key') if isinstance(task_data, dict) else None
+    user_id = getattr(user, 'pk', None)
+    if (
+        not isinstance(task_key, str)
+        or not task_key
+        or task_key != task_key.strip()
+        or isinstance(user_id, bool)
+        or not isinstance(user_id, int)
+        or user_id <= 0
+    ):
+        raise _ManagedDraftTransitionConflict()
+    return task_key, user_id
+
+
+def _managed_draft_error_response(*, status_code, code):
+    detail = (
+        'Managed Draft transition rejected.'
+        if status_code == 409
+        else 'Managed Draft finalization is temporarily unavailable.'
+    )
+    return Response({'error': {'code': code, 'detail': detail}}, status=status_code)
 
 
 @method_decorator(
