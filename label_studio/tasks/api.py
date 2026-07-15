@@ -2,6 +2,13 @@
 
 import logging
 
+from coordexp_refinement.guards import (
+    ManagedAnnotationWriteGuardMixin,
+    reject_managed_annotation_entity_write,
+    reject_managed_annotation_write,
+    reject_managed_prediction_entity_write,
+    reject_managed_project_write,
+)
 from core.feature_flags import flag_set
 from core.mixins import GetParentObjectMixin
 from core.permissions import ViewClassPermission, all_permissions
@@ -175,7 +182,7 @@ logger = logging.getLogger(__name__)
     if is_community()
     else lambda f: f,
 )
-class TaskListAPI(DMTaskListAPI):
+class TaskListAPI(ManagedAnnotationWriteGuardMixin, DMTaskListAPI):
     serializer_class = TaskSerializer
     permission_required = ViewClassPermission(
         GET=all_permissions.tasks_view,
@@ -198,6 +205,7 @@ class TaskListAPI(DMTaskListAPI):
     def perform_create(self, serializer):
         project_id = self.request.data.get('project')
         project = generics.get_object_or_404(Project, pk=project_id)
+        reject_managed_project_write(project)
         instance = serializer.save(project=project)
         emit_webhooks_for_instance(
             self.request.user.active_organization, project, WebhookAction.TASKS_CREATED, [instance]
@@ -275,7 +283,7 @@ class TaskListAPI(DMTaskListAPI):
         },
     ),
 )
-class TaskAPI(generics.RetrieveUpdateDestroyAPIView):
+class TaskAPI(ManagedAnnotationWriteGuardMixin, generics.RetrieveUpdateDestroyAPIView):
     parser_classes = (JSONParser, FormParser, MultiPartParser)
     permission_required = ViewClassPermission(
         GET=all_permissions.tasks_view,
@@ -363,7 +371,7 @@ class TaskAPI(generics.RetrieveUpdateDestroyAPIView):
                 'all_fields': True,
                 'excluded_fields_for_evaluation': self.get_excluded_fields_for_evaluation(),
             }
-        project = self.request.query_params.get('project') or self.request.data.get('project')
+        project = self.request.query_params.get('project')
         if not project:
             project = task.project.id
         return self.prefetch(
@@ -403,14 +411,38 @@ class TaskAPI(generics.RetrieveUpdateDestroyAPIView):
             return TaskSimpleSerializer
 
     def patch(self, request, *args, **kwargs):
+        reject_managed_project_write(self.task.project)
+        self._reject_requested_project_target()
         return super(TaskAPI, self).patch(request, *args, **kwargs)
+
+    def _reject_requested_project_target(self) -> None:
+        project_id = self.request.data.get('project')
+        if project_id is None:
+            return
+        project = generics.get_object_or_404(
+            Project.objects.filter(
+                organization=self.request.user.active_organization
+            ),
+            pk=project_id,
+        )
+        reject_managed_project_write(project)
+
+    def perform_update(self, serializer):
+        reject_managed_project_write(self.task.project)
+        project = serializer.validated_data.get('project')
+        if project is not None:
+            reject_managed_project_write(project)
+        serializer.save()
 
     @api_webhook_for_delete(WebhookAction.TASKS_DELETED)
     def delete(self, request, *args, **kwargs):
+        reject_managed_project_write(self.task.project)
         return super(TaskAPI, self).delete(request, *args, **kwargs)
 
     @extend_schema(exclude=True)
     def put(self, request, *args, **kwargs):
+        reject_managed_project_write(self.task.project)
+        self._reject_requested_project_target()
         return super(TaskAPI, self).put(request, *args, **kwargs)
 
 
@@ -632,7 +664,10 @@ class TaskAgreementAPI(generics.RetrieveAPIView):
         },
     ),
 )
-class AnnotationAPI(generics.RetrieveUpdateDestroyAPIView):
+class AnnotationAPI(
+    ManagedAnnotationWriteGuardMixin,
+    generics.RetrieveUpdateDestroyAPIView,
+):
     parser_classes = (JSONParser, FormParser, MultiPartParser)
     permission_required = ViewClassPermission(
         GET=all_permissions.annotations_view,
@@ -646,6 +681,36 @@ class AnnotationAPI(generics.RetrieveUpdateDestroyAPIView):
 
     def perform_destroy(self, annotation):
         annotation.delete()
+
+    def _reject_requested_binding_targets(self) -> None:
+        project_id = self.request.data.get('project')
+        if project_id is not None:
+            project = generics.get_object_or_404(
+                Project.objects.filter(
+                    organization=self.request.user.active_organization
+                ),
+                pk=project_id,
+            )
+            reject_managed_project_write(project)
+        task_id = self.request.data.get('task')
+        if task_id is not None:
+            task = generics.get_object_or_404(
+                Task.objects.filter(
+                    project__organization=self.request.user.active_organization
+                ).select_related('project'),
+                pk=task_id,
+            )
+            reject_managed_project_write(task.project)
+
+    def perform_update(self, serializer):
+        reject_managed_annotation_entity_write(self.get_object())
+        task = serializer.validated_data.get('task')
+        if task is not None:
+            reject_managed_project_write(task.project)
+        project = serializer.validated_data.get('project')
+        if project is not None:
+            reject_managed_project_write(project)
+        serializer.save()
 
     def update(self, request, *args, **kwargs):
         # save user history with annotator_id, time & annotation result
@@ -671,14 +736,19 @@ class AnnotationAPI(generics.RetrieveUpdateDestroyAPIView):
     @api_webhook(WebhookAction.ANNOTATION_UPDATED)
     @extend_schema(exclude=True)
     def put(self, request, *args, **kwargs):
+        reject_managed_annotation_entity_write(self.get_object())
+        self._reject_requested_binding_targets()
         return super(AnnotationAPI, self).put(request, *args, **kwargs)
 
     @api_webhook(WebhookAction.ANNOTATION_UPDATED)
     def patch(self, request, *args, **kwargs):
+        reject_managed_annotation_entity_write(self.get_object())
+        self._reject_requested_binding_targets()
         return super(AnnotationAPI, self).patch(request, *args, **kwargs)
 
     @api_webhook_for_delete(WebhookAction.ANNOTATIONS_DELETED)
     def delete(self, request, *args, **kwargs):
+        reject_managed_annotation_entity_write(self.get_object())
         return super(AnnotationAPI, self).delete(request, *args, **kwargs)
 
 
@@ -751,7 +821,11 @@ class AnnotationAPI(generics.RetrieveUpdateDestroyAPIView):
         },
     ),
 )
-class AnnotationsListAPI(GetParentObjectMixin, generics.ListCreateAPIView):
+class AnnotationsListAPI(
+    ManagedAnnotationWriteGuardMixin,
+    GetParentObjectMixin,
+    generics.ListCreateAPIView,
+):
     parser_classes = (JSONParser, FormParser, MultiPartParser)
     permission_required = ViewClassPermission(
         GET=all_permissions.annotations_view,
@@ -766,6 +840,7 @@ class AnnotationsListAPI(GetParentObjectMixin, generics.ListCreateAPIView):
 
     @api_webhook(WebhookAction.ANNOTATION_CREATED)
     def post(self, request, *args, **kwargs):
+        reject_managed_annotation_write(self.parent_object.project)
         return super(AnnotationsListAPI, self).post(request, *args, **kwargs)
 
     def get_queryset(self):
@@ -1049,7 +1124,7 @@ class AnnotationDraftAPI(generics.RetrieveUpdateDestroyAPIView):
         },
     ),
 )
-class PredictionAPI(viewsets.ModelViewSet):
+class PredictionAPI(ManagedAnnotationWriteGuardMixin, viewsets.ModelViewSet):
     serializer_class = PredictionSerializer
     permission_required = all_permissions.predictions_any
     filter_backends = [DjangoFilterBackend]
@@ -1057,6 +1132,28 @@ class PredictionAPI(viewsets.ModelViewSet):
 
     def get_queryset(self):
         return Prediction.objects.filter(project__organization=self.request.user.active_organization)
+
+    def perform_create(self, serializer):
+        task = serializer.validated_data['task']
+        reject_managed_project_write(task.project)
+        project = serializer.validated_data.get('project')
+        if project is not None:
+            reject_managed_project_write(project)
+        serializer.save()
+
+    def perform_update(self, serializer):
+        reject_managed_prediction_entity_write(self.get_object())
+        task = serializer.validated_data.get('task')
+        if task is not None:
+            reject_managed_project_write(task.project)
+        project = serializer.validated_data.get('project')
+        if project is not None:
+            reject_managed_project_write(project)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        reject_managed_prediction_entity_write(instance)
+        instance.delete()
 
 
 @method_decorator(name='get', decorator=extend_schema(exclude=True))
@@ -1071,7 +1168,10 @@ class PredictionAPI(viewsets.ModelViewSet):
         },
     ),
 )
-class AnnotationConvertAPI(generics.RetrieveAPIView):
+class AnnotationConvertAPI(
+    ManagedAnnotationWriteGuardMixin,
+    generics.RetrieveAPIView,
+):
     permission_required = ViewClassPermission(POST=all_permissions.annotations_change)
     queryset = Annotation.objects.all()
 
@@ -1080,6 +1180,7 @@ class AnnotationConvertAPI(generics.RetrieveAPIView):
 
     def post(self, request, *args, **kwargs):
         annotation = self.get_object()
+        reject_managed_annotation_entity_write(annotation)
         organization = annotation.project.organization
         project = annotation.project
 

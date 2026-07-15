@@ -5,6 +5,10 @@ import logging
 import os
 import time
 
+from coordexp_refinement.guards import (
+    ManagedAnnotationWriteGuardMixin,
+    reject_managed_project_write,
+)
 from core.permissions import ViewClassPermission, all_permissions
 from core.utils.io import read_yaml
 from django.conf import settings
@@ -19,7 +23,7 @@ from rest_framework.response import Response
 logger = logging.getLogger(__name__)
 
 
-class ImportStorageListAPI(generics.ListCreateAPIView):
+class ImportStorageListAPI(ManagedAnnotationWriteGuardMixin, generics.ListCreateAPIView):
     permission_required = ViewClassPermission(
         GET=all_permissions.storages_view,
         POST=all_permissions.storages_change,
@@ -27,6 +31,14 @@ class ImportStorageListAPI(generics.ListCreateAPIView):
     parser_classes = (JSONParser, FormParser, MultiPartParser)
 
     serializer_class = ImportStorageSerializer
+
+    def post(self, request, *args, **kwargs):
+        project_pk = request.data.get('project')
+        if project_pk is not None:
+            project = generics.get_object_or_404(Project, pk=project_pk)
+            self.check_object_permissions(request, project)
+            reject_managed_project_write(project)
+        return super().post(request, *args, **kwargs)
 
     def get_queryset(self):
         project_pk = self.request.query_params.get('project')
@@ -43,7 +55,7 @@ class ImportStorageListAPI(generics.ListCreateAPIView):
         return storages
 
 
-class ImportStorageDetailAPI(generics.RetrieveUpdateDestroyAPIView):
+class ImportStorageDetailAPI(ManagedAnnotationWriteGuardMixin, generics.RetrieveUpdateDestroyAPIView):
     """RUD storage by pk specified in URL"""
 
     permission_required = ViewClassPermission(
@@ -55,18 +67,52 @@ class ImportStorageDetailAPI(generics.RetrieveUpdateDestroyAPIView):
     parser_classes = (JSONParser, FormParser, MultiPartParser)
     serializer_class = ImportStorageSerializer
 
+    def perform_update(self, serializer):
+        reject_managed_project_write(self.get_object().project)
+        project = serializer.validated_data.get('project')
+        if project is not None:
+            reject_managed_project_write(project)
+        serializer.save()
+
+    def patch(self, request, *args, **kwargs):
+        reject_managed_project_write(self.get_object().project)
+        self._reject_requested_project_target(request)
+        return super().patch(request, *args, **kwargs)
+
+    def _reject_requested_project_target(self, request):
+        project_pk = request.data.get('project')
+        if project_pk is None:
+            return
+        project = generics.get_object_or_404(Project, pk=project_pk)
+        self.check_object_permissions(request, project)
+        reject_managed_project_write(project)
+
     @extend_schema(exclude=True)
     def put(self, request, *args, **kwargs):
+        reject_managed_project_write(self.get_object().project)
+        self._reject_requested_project_target(request)
         return super(ImportStorageDetailAPI, self).put(request, *args, **kwargs)
 
+    def delete(self, request, *args, **kwargs):
+        reject_managed_project_write(self.get_object().project)
+        return super().delete(request, *args, **kwargs)
 
-class ExportStorageListAPI(generics.ListCreateAPIView):
+
+class ExportStorageListAPI(ManagedAnnotationWriteGuardMixin, generics.ListCreateAPIView):
     permission_required = ViewClassPermission(
         GET=all_permissions.storages_view,
         POST=all_permissions.storages_change,
     )
     parser_classes = (JSONParser, FormParser, MultiPartParser)
     serializer_class = ExportStorageSerializer
+
+    def post(self, request, *args, **kwargs):
+        project_pk = request.data.get('project')
+        if project_pk is not None:
+            project = generics.get_object_or_404(Project, pk=project_pk)
+            self.check_object_permissions(request, project)
+            reject_managed_project_write(project)
+        return super().post(request, *args, **kwargs)
 
     def get_queryset(self):
         project_pk = self.request.query_params.get('project')
@@ -83,6 +129,7 @@ class ExportStorageListAPI(generics.ListCreateAPIView):
         return storages
 
     def perform_create(self, serializer):
+        reject_managed_project_write(serializer.validated_data['project'])
         # double check: not export storages don't validate connection in serializer,
         # just make another explicit check here, note: in this create API we have credentials in request.data
         instance = serializer.Meta.model(**serializer.validated_data)
@@ -96,7 +143,7 @@ class ExportStorageListAPI(generics.ListCreateAPIView):
             storage.sync()
 
 
-class ExportStorageDetailAPI(generics.RetrieveUpdateDestroyAPIView):
+class ExportStorageDetailAPI(ManagedAnnotationWriteGuardMixin, generics.RetrieveUpdateDestroyAPIView):
     """RUD storage by pk specified in URL"""
 
     permission_required = ViewClassPermission(
@@ -108,12 +155,38 @@ class ExportStorageDetailAPI(generics.RetrieveUpdateDestroyAPIView):
     parser_classes = (JSONParser, FormParser, MultiPartParser)
     serializer_class = ExportStorageSerializer
 
+    def perform_update(self, serializer):
+        reject_managed_project_write(self.get_object().project)
+        project = serializer.validated_data.get('project')
+        if project is not None:
+            reject_managed_project_write(project)
+        serializer.save()
+
+    def patch(self, request, *args, **kwargs):
+        reject_managed_project_write(self.get_object().project)
+        self._reject_requested_project_target(request)
+        return super().patch(request, *args, **kwargs)
+
+    def _reject_requested_project_target(self, request):
+        project_pk = request.data.get('project')
+        if project_pk is None:
+            return
+        project = generics.get_object_or_404(Project, pk=project_pk)
+        self.check_object_permissions(request, project)
+        reject_managed_project_write(project)
+
     @extend_schema(exclude=True)
     def put(self, request, *args, **kwargs):
+        reject_managed_project_write(self.get_object().project)
+        self._reject_requested_project_target(request)
         return super(ExportStorageDetailAPI, self).put(request, *args, **kwargs)
 
+    def delete(self, request, *args, **kwargs):
+        reject_managed_project_write(self.get_object().project)
+        return super().delete(request, *args, **kwargs)
 
-class ImportStorageSyncAPI(generics.GenericAPIView):
+
+class ImportStorageSyncAPI(ManagedAnnotationWriteGuardMixin, generics.GenericAPIView):
     permission_required = ViewClassPermission(
         POST=all_permissions.storages_sync,
     )
@@ -126,6 +199,7 @@ class ImportStorageSyncAPI(generics.GenericAPIView):
 
     def post(self, request, *args, **kwargs):
         storage = self.get_object()
+        reject_managed_project_write(storage.project)
         # check connectivity & access, raise an exception if not satisfied
         if not storage.synchronizable:
             response_data = {'message': f'Storage {str(storage.id)} is not synchronizable'}
@@ -136,7 +210,7 @@ class ImportStorageSyncAPI(generics.GenericAPIView):
         return Response(self.serializer_class(storage).data)
 
 
-class ExportStorageSyncAPI(generics.GenericAPIView):
+class ExportStorageSyncAPI(ManagedAnnotationWriteGuardMixin, generics.GenericAPIView):
     permission_required = ViewClassPermission(
         POST=all_permissions.storages_sync,
     )
@@ -149,6 +223,7 @@ class ExportStorageSyncAPI(generics.GenericAPIView):
 
     def post(self, request, *args, **kwargs):
         storage = self.get_object()
+        reject_managed_project_write(storage.project)
         # check connectivity & access, raise an exception if not satisfied
         if not storage.synchronizable:
             response_data = {'message': f'Storage {str(storage.id)} is not synchronizable'}

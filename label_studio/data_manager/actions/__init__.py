@@ -12,6 +12,11 @@ import traceback as tb
 from importlib import import_module
 from typing import Callable, Optional, TypedDict, Union
 
+from coordexp_refinement.guards import (
+    MANAGED_READ_ONLY_ACTIONS,
+    is_managed_refinement_project,
+    reject_managed_data_manager_action,
+)
 from core.feature_flags import flag_set
 from core.utils.common import load_func
 from data_manager.functions import DataManagerException
@@ -59,6 +64,9 @@ def get_all_actions(user, project):
     actions = list(settings.DATA_MANAGER_ACTIONS.values())
     actions = copy.deepcopy(actions)
     actions: list[DataManagerAction] = sorted(actions, key=lambda x: x['order'])
+
+    if is_managed_refinement_project(project):
+        actions = [action for action in actions if action['id'] in MANAGED_READ_ONLY_ACTIONS]
 
     check_permission = load_func(settings.DATA_MANAGER_CHECK_ACTION_PERMISSION)
     actions = [
@@ -136,6 +144,7 @@ def perform_action(action_id, project, queryset, user, **kwargs):
         raise DataManagerException("Can't find '" + action_id + "' in registered actions")
 
     action = settings.DATA_MANAGER_ACTIONS[action_id]
+    reject_managed_data_manager_action(action_id, project, queryset)
     check_permission = load_func(settings.DATA_MANAGER_CHECK_ACTION_PERMISSION)
 
     # check user permissions for this action

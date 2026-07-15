@@ -414,6 +414,8 @@ def get_next_task(
     project: Project,
     dm_queue: Union[bool, None],
     assigned_flag: Union[bool, None] = None,
+    *,
+    acquire_lock: bool = True,
 ) -> Tuple[Union[Task, None], str]:
     logger.debug(f'get_next_task called. user: {user}, project: {project}, dm_queue: {dm_queue}')
 
@@ -457,7 +459,7 @@ def get_next_task(
 
         next_task, queue_info = skipped_queue(next_task, prepared_tasks, project, user, assigned_flag, queue_info)
 
-        if next_task and use_task_lock:
+        if next_task and use_task_lock and acquire_lock:
             # set lock for the task with TTL 3x time more then current average lead time (or 1 hour by default)
             next_task.set_lock(user)
 

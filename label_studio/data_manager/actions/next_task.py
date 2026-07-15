@@ -2,6 +2,7 @@
 
 import logging
 
+from coordexp_refinement.guards import is_managed_refinement_project
 from core.permissions import all_permissions
 from data_manager.actions import DataManagerAction
 from data_manager.functions import filters_ordering_selected_items_exist
@@ -22,7 +23,13 @@ def next_task(project, queryset, **kwargs):
 
     request = kwargs['request']
     dm_queue = filters_ordering_selected_items_exist(request.data)
-    next_task, queue_info = get_next_task(request.user, queryset, project, dm_queue)
+    next_task, queue_info = get_next_task(
+        request.user,
+        queryset,
+        project,
+        dm_queue,
+        acquire_lock=not is_managed_refinement_project(project),
+    )
 
     if next_task is None:
         raise NotFound(f'There are no tasks for {request.user}')

@@ -4,6 +4,12 @@ import logging
 import os
 import pathlib
 
+from coordexp_refinement.guards import (
+    ManagedAnnotationWriteGuardMixin,
+    is_managed_refinement_project,
+    reject_managed_project_write,
+    reject_reserved_managed_project_identity,
+)
 from core.feature_flags import flag_set
 from core.filters import ListFilter
 from core.label_config import config_essential_data_has_changed
@@ -160,7 +166,7 @@ class ProjectFilterSet(FilterSet):
         },
     ),
 )
-class ProjectListAPI(generics.ListCreateAPIView):
+class ProjectListAPI(ManagedAnnotationWriteGuardMixin, generics.ListCreateAPIView):
     parser_classes = (JSONParser, FormParser, MultiPartParser)
     serializer_class = ProjectSerializer
     filter_backends = [filters.OrderingFilter, DjangoFilterBackend]
@@ -197,6 +203,9 @@ class ProjectListAPI(generics.ListCreateAPIView):
         return context
 
     def perform_create(self, ser):
+        reject_reserved_managed_project_identity(
+            ser.validated_data.get('description')
+        )
         try:
             ser.save(organization=self.request.user.active_organization)
         except IntegrityError as e:
@@ -358,7 +367,7 @@ class ProjectCountsListAPI(generics.ListAPIView):
         },
     ),
 )
-class ProjectAPI(generics.RetrieveUpdateDestroyAPIView):
+class ProjectAPI(ManagedAnnotationWriteGuardMixin, generics.RetrieveUpdateDestroyAPIView):
     parser_classes = (JSONParser, FormParser, MultiPartParser)
     queryset = Project.objects.with_counts()
     permission_required = ViewClassPermission(
@@ -394,11 +403,16 @@ class ProjectAPI(generics.RetrieveUpdateDestroyAPIView):
 
     @api_webhook_for_delete(WebhookAction.PROJECT_DELETED)
     def delete(self, request, *args, **kwargs):
+        reject_managed_project_write(self.get_object())
         return super(ProjectAPI, self).delete(request, *args, **kwargs)
 
     @api_webhook(WebhookAction.PROJECT_UPDATED)
     def patch(self, request, *args, **kwargs):
         project = self.get_object()
+        reject_managed_project_write(project)
+        reject_reserved_managed_project_identity(
+            self.request.data.get('description')
+        )
         label_config = self.request.data.get('label_config')
 
         # config changes can break view, so we need to reset them
@@ -418,6 +432,10 @@ class ProjectAPI(generics.RetrieveUpdateDestroyAPIView):
     @extend_schema(exclude=True)
     @api_webhook(WebhookAction.PROJECT_UPDATED)
     def put(self, request, *args, **kwargs):
+        reject_managed_project_write(self.get_object())
+        reject_reserved_managed_project_identity(
+            self.request.data.get('description')
+        )
         return super(ProjectAPI, self).put(request, *args, **kwargs)
 
 
@@ -447,7 +465,13 @@ class ProjectNextTaskAPI(generics.RetrieveAPIView):
         dm_queue = filters_ordering_selected_items_exist(request.data)
         prepared_tasks = get_prepared_queryset(request, project)
 
-        next_task, queue_info = get_next_task(request.user, prepared_tasks, project, dm_queue)
+        next_task, queue_info = get_next_task(
+            request.user,
+            prepared_tasks,
+            project,
+            dm_queue,
+            acquire_lock=not is_managed_refinement_project(project),
+        )
 
         if next_task is None:
             raise NotFound(f'There are no tasks for {request.user}')
@@ -569,7 +593,11 @@ class ProjectSummaryAPI(generics.RetrieveAPIView):
         return super(ProjectSummaryAPI, self).get(*args, **kwargs)
 
 
-class ProjectSummaryResetAPI(GetParentObjectMixin, generics.CreateAPIView):
+class ProjectSummaryResetAPI(
+    ManagedAnnotationWriteGuardMixin,
+    GetParentObjectMixin,
+    generics.CreateAPIView,
+):
     """This API is useful when we need to reset project.summary.created_labels and created_labels_drafts
     and recalculate them from scratch. It's hard to correctly follow all changes in annotation region
     labels and these fields aren't calculated properly after some time. Label config changes are not allowed
@@ -585,6 +613,7 @@ class ProjectSummaryResetAPI(GetParentObjectMixin, generics.CreateAPIView):
     @extend_schema(exclude=True)
     def post(self, *args, **kwargs):
         project = self.parent_object
+        reject_managed_project_write(project)
         summary = project.summary
         start_job_async_or_sync(
             recalculate_created_annotations_and_labels_from_scratch,
@@ -719,7 +748,12 @@ class ProjectReimportAPI(generics.RetrieveAPIView):
         },
     ),
 )
-class ProjectTaskListAPI(GetParentObjectMixin, generics.ListCreateAPIView, generics.DestroyAPIView):
+class ProjectTaskListAPI(
+    ManagedAnnotationWriteGuardMixin,
+    GetParentObjectMixin,
+    generics.ListCreateAPIView,
+    generics.DestroyAPIView,
+):
     parser_classes = (JSONParser, FormParser)
     queryset = Task.objects.all()
     parent_queryset = Project.objects.all()
@@ -750,6 +784,7 @@ class ProjectTaskListAPI(GetParentObjectMixin, generics.ListCreateAPIView, gener
 
     def delete(self, request, *args, **kwargs):
         project = generics.get_object_or_404(Project.objects.for_user(self.request.user), pk=self.kwargs['pk'])
+        reject_managed_project_write(project)
         task_ids = list(Task.objects.filter(project=project).values('id'))
         Task.delete_tasks_without_signals(Task.objects.filter(project=project))
         logger.info(f'calling reset project_id={project.id} ProjectTaskListAPI.delete()')
@@ -771,6 +806,7 @@ class ProjectTaskListAPI(GetParentObjectMixin, generics.ListCreateAPIView, gener
 
     def perform_create(self, serializer):
         project = self.parent_object
+        reject_managed_project_write(project)
         instance = serializer.save(project=project)
         emit_webhooks_for_instance(
             self.request.user.active_organization, project, WebhookAction.TASKS_CREATED, [instance]
@@ -851,7 +887,7 @@ class ProjectSampleTask(generics.RetrieveAPIView):
 
 
 @extend_schema(exclude=True)
-class ProjectModelVersions(generics.RetrieveAPIView):
+class ProjectModelVersions(ManagedAnnotationWriteGuardMixin, generics.RetrieveAPIView):
     parser_classes = (JSONParser,)
     permission_required = all_permissions.projects_view
 
@@ -881,6 +917,7 @@ class ProjectModelVersions(generics.RetrieveAPIView):
 
     def delete(self, request, *args, **kwargs):
         project = self.get_object()
+        reject_managed_project_write(project)
         model_version = request.data.get('model_version', None)
 
         if not model_version:

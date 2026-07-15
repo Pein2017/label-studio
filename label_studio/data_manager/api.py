@@ -3,6 +3,7 @@
 import logging
 
 from asgiref.sync import async_to_sync, sync_to_async
+from coordexp_refinement.guards import ManagedAnnotationWriteGuardMixin
 from core.feature_flags import flag_set
 from core.permissions import ViewClassPermission, all_permissions
 from core.utils.common import int_from_request, load_func
@@ -675,7 +676,7 @@ class ProjectStateAPI(APIView):
         },
     ),
 )
-class ProjectActionsAPI(APIView):
+class ProjectActionsAPI(ManagedAnnotationWriteGuardMixin, APIView):
     permission_required = ViewClassPermission(
         GET=all_permissions.projects_view,
         POST=all_permissions.projects_view,

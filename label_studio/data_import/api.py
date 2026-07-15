@@ -6,6 +6,10 @@ import mimetypes
 import time
 from urllib.parse import unquote, urlparse
 
+from coordexp_refinement.guards import (
+    ManagedAnnotationWriteGuardMixin,
+    reject_managed_project_write,
+)
 from core.decorators import override_report_only_csp
 from core.feature_flags import flag_set
 from core.permissions import ViewClassPermission, all_permissions
@@ -250,7 +254,7 @@ task_create_response_scheme = {
     ),
 )
 # Import
-class ImportAPI(generics.CreateAPIView):
+class ImportAPI(ManagedAnnotationWriteGuardMixin, generics.CreateAPIView):
     permission_required = all_permissions.projects_change
     permission_classes = api_settings.DEFAULT_PERMISSION_CLASSES + [ProjectImportPermission]
     parser_classes = (JSONParser, MultiPartParser, FormParser)
@@ -426,6 +430,7 @@ class ImportAPI(generics.CreateAPIView):
 
         # check project permissions
         project = generics.get_object_or_404(Project.objects.for_user(self.request.user), pk=self.kwargs['pk'])
+        reject_managed_project_write(project)
 
         if settings.VERSION_EDITION != 'Community':
             return self.async_import(request, project, preannotated_from_fields, commit_to_project, return_task_ids)
@@ -476,7 +481,7 @@ class ImportAPI(generics.CreateAPIView):
         },
     ),
 )
-class ImportPredictionsAPI(generics.CreateAPIView):
+class ImportPredictionsAPI(ManagedAnnotationWriteGuardMixin, generics.CreateAPIView):
     """
     API for importing predictions to a project.
 
@@ -495,6 +500,7 @@ class ImportPredictionsAPI(generics.CreateAPIView):
     def create(self, request, *args, **kwargs):
         # check project permissions
         project = self.get_object()
+        reject_managed_project_write(project)
 
         # Use feature flag to control memory-efficient implementation rollout
         if flag_set('fflag_fix_back_4620_memory_efficient_predictions_import_08012025_short', user=self.request.user):
@@ -722,6 +728,7 @@ class ReImportAPI(ImportAPI):
 
         # check project permissions
         project = generics.get_object_or_404(Project.objects.for_user(self.request.user), pk=self.kwargs['pk'])
+        reject_managed_project_write(project)
 
         if not file_upload_ids:
             return Response(
@@ -799,7 +806,12 @@ class ReImportAPI(ImportAPI):
         },
     ),
 )
-class FileUploadListAPI(generics.mixins.ListModelMixin, generics.mixins.DestroyModelMixin, generics.GenericAPIView):
+class FileUploadListAPI(
+    ManagedAnnotationWriteGuardMixin,
+    generics.mixins.ListModelMixin,
+    generics.mixins.DestroyModelMixin,
+    generics.GenericAPIView,
+):
     parser_classes = (JSONParser, MultiPartParser, FormParser)
     serializer_class = FileUploadSerializer
     permission_required = ViewClassPermission(
@@ -825,6 +837,7 @@ class FileUploadListAPI(generics.mixins.ListModelMixin, generics.mixins.DestroyM
 
     def delete(self, request, *args, **kwargs):
         project = generics.get_object_or_404(Project.objects.for_user(self.request.user), pk=self.kwargs['pk'])
+        reject_managed_project_write(project)
         ids = self.request.data.get('file_upload_ids')
         if ids is None:
             deleted, _ = FileUpload.objects.filter(project=project).delete()
@@ -875,7 +888,7 @@ class FileUploadListAPI(generics.mixins.ListModelMixin, generics.mixins.DestroyM
         },
     ),
 )
-class FileUploadAPI(generics.RetrieveUpdateDestroyAPIView):
+class FileUploadAPI(ManagedAnnotationWriteGuardMixin, generics.RetrieveUpdateDestroyAPIView):
     parser_classes = (JSONParser, MultiPartParser, FormParser)
     permission_classes = (IsAuthenticated,)
     serializer_class = FileUploadSerializer
@@ -885,13 +898,16 @@ class FileUploadAPI(generics.RetrieveUpdateDestroyAPIView):
         return super(FileUploadAPI, self).get(*args, **kwargs)
 
     def patch(self, *args, **kwargs):
+        reject_managed_project_write(self.get_object().project)
         return super(FileUploadAPI, self).patch(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
+        reject_managed_project_write(self.get_object().project)
         return super(FileUploadAPI, self).delete(*args, **kwargs)
 
     @extend_schema(exclude=True)
     def put(self, *args, **kwargs):
+        reject_managed_project_write(self.get_object().project)
         return super(FileUploadAPI, self).put(*args, **kwargs)
 
 
