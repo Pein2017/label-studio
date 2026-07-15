@@ -18,6 +18,204 @@ import { ActivityObserver } from "../utils/ActivityObserver";
 let networkActivity = null;
 
 const PROJECTS_FETCH_PERIOD = 20 * 1000; // interaction timer for 20 sec fetch period for project api
+const COORDEXP_MANAGED_PROJECT_PREFIX = "coordexp-refinement-project-identity:";
+const COORDEXP_HISTORY_STATE_KEY = "__coordexp_refinement_history_v1";
+const MANAGED_HISTORY_TRAVERSAL_TIMEOUT_MS = 1000;
+const STRUCTURED_HISTORY_COMPARISON_BUDGET = 10_000;
+let managedHistorySessionSequence = 0;
+
+const isPlainHistoryState = (state) => {
+  if (state === null || typeof state !== "object" || Array.isArray(state)) return false;
+  const prototype = Object.getPrototypeOf(state);
+
+  return prototype === Object.prototype || prototype === null;
+};
+
+const managedHistoryStateMarker = (state) => {
+  const marker = isPlainHistoryState(state) ? state[COORDEXP_HISTORY_STATE_KEY] : null;
+
+  return typeof marker?.session_id === "string" && Number.isSafeInteger(marker?.position) ? marker : null;
+};
+
+const managedHistoryMarker = (state, sessionId) => {
+  const marker = managedHistoryStateMarker(state);
+
+  return marker?.session_id === sessionId ? marker : null;
+};
+
+const structuredHistoryKind = (value) => {
+  if (Array.isArray(value)) return "array";
+  if (isPlainHistoryState(value)) return "object";
+  if (ArrayBuffer.isView(value)) {
+    return Object.prototype.toString.call(value) === "[object DataView]" ? "data-view" : "typed-array";
+  }
+
+  switch (Object.prototype.toString.call(value)) {
+    case "[object ArrayBuffer]":
+      return "array-buffer";
+    case "[object Date]":
+      return "date";
+    case "[object Map]":
+      return "map";
+    case "[object RegExp]":
+      return "regexp";
+    case "[object Set]":
+      return "set";
+    default:
+      return null;
+  }
+};
+
+const withStructuredHistoryPair = (context, left, right) => ({
+  budget: context.budget,
+  leftToRight: new Map(context.leftToRight).set(left, right),
+  rightToLeft: new Map(context.rightToLeft).set(right, left),
+});
+
+const structuredHistoryBytesEqual = (left, right) => {
+  if (left.byteLength !== right.byteLength) return false;
+  const leftBytes = new Uint8Array(left);
+  const rightBytes = new Uint8Array(right);
+
+  return leftBytes.every((byte, index) => byte === rightBytes[index]);
+};
+
+const compareStructuredHistoryUnordered = (
+  leftItems,
+  rightItems,
+  context,
+  compareItem,
+  index = 0,
+  used = new Set(),
+) => {
+  if (index === leftItems.length) return context;
+
+  for (let rightIndex = 0; rightIndex < rightItems.length; rightIndex++) {
+    if (used.has(rightIndex)) continue;
+    const compared = compareItem(leftItems[index], rightItems[rightIndex], context);
+
+    if (!compared) continue;
+    const nextUsed = new Set(used).add(rightIndex);
+    const complete = compareStructuredHistoryUnordered(
+      leftItems,
+      rightItems,
+      compared,
+      compareItem,
+      index + 1,
+      nextUsed,
+    );
+
+    if (complete) return complete;
+  }
+  return null;
+};
+
+const compareStructuredHistoryValue = (left, right, context) => {
+  if (context.budget.remaining <= 0) return null;
+  context.budget.remaining -= 1;
+  const leftIsObject = left !== null && (typeof left === "object" || typeof left === "function");
+  const rightIsObject = right !== null && (typeof right === "object" || typeof right === "function");
+
+  if (!leftIsObject || !rightIsObject)
+    return !leftIsObject && !rightIsObject && Object.is(left, right) ? context : null;
+
+  const leftKind = structuredHistoryKind(left);
+  const rightKind = structuredHistoryKind(right);
+
+  // History state is structured-cloned by the browser. Unknown class
+  // instances and opaque platform objects fail closed instead of comparing as
+  // empty JSON objects.
+  if (!leftKind || leftKind !== rightKind) return null;
+  if (context.leftToRight.has(left)) return context.leftToRight.get(left) === right ? context : null;
+  if (context.rightToLeft.has(right)) return null;
+
+  let compared = withStructuredHistoryPair(context, left, right);
+
+  if (leftKind === "array-buffer") return structuredHistoryBytesEqual(left, right) ? compared : null;
+  if (leftKind === "date") return Object.is(left.getTime(), right.getTime()) ? compared : null;
+  if (leftKind === "regexp") {
+    return left.source === right.source && left.flags === right.flags && left.lastIndex === right.lastIndex
+      ? compared
+      : null;
+  }
+  if (leftKind === "data-view") {
+    if (left.byteOffset !== right.byteOffset || left.byteLength !== right.byteLength) return null;
+    return compareStructuredHistoryValue(left.buffer, right.buffer, compared);
+  }
+  if (leftKind === "typed-array") {
+    if (
+      Object.prototype.toString.call(left) !== Object.prototype.toString.call(right) ||
+      left.byteOffset !== right.byteOffset ||
+      left.byteLength !== right.byteLength ||
+      left.length !== right.length
+    ) {
+      return null;
+    }
+    return compareStructuredHistoryValue(left.buffer, right.buffer, compared);
+  }
+  if (leftKind === "map") {
+    if (left.size !== right.size) return null;
+    return compareStructuredHistoryUnordered(
+      Array.from(left.entries()),
+      Array.from(right.entries()),
+      compared,
+      ([leftKey, leftValue], [rightKey, rightValue], branch) => {
+        const keyCompared = compareStructuredHistoryValue(leftKey, rightKey, branch);
+
+        return keyCompared ? compareStructuredHistoryValue(leftValue, rightValue, keyCompared) : null;
+      },
+    );
+  }
+  if (leftKind === "set") {
+    if (left.size !== right.size) return null;
+    return compareStructuredHistoryUnordered(
+      Array.from(left.values()),
+      Array.from(right.values()),
+      compared,
+      compareStructuredHistoryValue,
+    );
+  }
+
+  if (leftKind === "array" && left.length !== right.length) return null;
+  const leftKeys = Object.keys(left).sort();
+  const rightKeys = Object.keys(right).sort();
+
+  if (leftKeys.length !== rightKeys.length || leftKeys.some((key, index) => key !== rightKeys[index])) return null;
+  for (const key of leftKeys) {
+    compared = compareStructuredHistoryValue(left[key], right[key], compared);
+    if (!compared) return null;
+  }
+  return compared;
+};
+
+const historyStatesEqual = (left, right) => {
+  try {
+    return Boolean(
+      compareStructuredHistoryValue(left, right, {
+        budget: { remaining: STRUCTURED_HISTORY_COMPARISON_BUDGET },
+        leftToRight: new Map(),
+        rightToLeft: new Map(),
+      }),
+    );
+  } catch {
+    return false;
+  }
+};
+
+const managedHistoryBrowserIndex = () => {
+  try {
+    const index = window.navigation?.currentEntry?.index;
+
+    return Number.isSafeInteger(index) ? index : null;
+  } catch {
+    return null;
+  }
+};
+
+const historyEntryMatches = (entry, href = window.location.href, state = window.history.state) =>
+  entry?.href === href &&
+  historyStatesEqual(entry.state, state) &&
+  (!Number.isSafeInteger(entry.browserIndex) || entry.browserIndex === managedHistoryBrowserIndex());
 
 export const AppStore = types
   .model("AppStore", {
@@ -124,6 +322,18 @@ export const AppStore = types
     needsDataFetch: false,
     projectFetch: false,
     requestsInFlight: new Map(),
+    managedPopstateTransition: null,
+    managedHistoryCurrentEntry: null,
+    managedHistoryEntries: new Map(),
+    managedHistoryInstalled: false,
+    managedHistoryOriginalPushState: null,
+    managedHistoryOriginalReplaceState: null,
+    managedHistoryPosition: 0,
+    managedHistoryPushStateWrapper: null,
+    managedHistoryReplaceStateWrapper: null,
+    managedHistorySessionId: null,
+    managedHistoryTraversalQuarantined: false,
+    managedPopstateTimer: null,
   }))
   .actions((self) => ({
     startPolling() {
@@ -145,8 +355,139 @@ export const AppStore = types
 
     beforeDestroy() {
       clearTimeout(self._poll);
+      self.cancelManagedPopstateTransition();
       window.removeEventListener("popstate", self.handlePopState);
+      self.uninstallManagedHistoryTracking();
       networkActivity.destroy();
+    },
+
+    isManagedHistoryProject() {
+      return (
+        typeof self.project?.description === "string" &&
+        self.project.description.startsWith(COORDEXP_MANAGED_PROJECT_PREFIX)
+      );
+    },
+
+    setManagedHistoryCurrentEntry(entry) {
+      self.managedHistoryCurrentEntry = entry;
+      if (Number.isSafeInteger(entry?.position)) {
+        self.managedHistoryPosition = entry.position;
+        self.managedHistoryEntries.set(entry.position, entry);
+      }
+    },
+
+    resetManagedHistoryTraversalQuarantine() {
+      self.managedHistoryTraversalQuarantined = false;
+    },
+
+    quarantineManagedHistoryTraversal() {
+      self.managedHistoryTraversalQuarantined = true;
+    },
+
+    resolveManagedHistoryPosition(href, state) {
+      const candidates = Array.from(self.managedHistoryEntries.entries()).filter(
+        ([, entry]) => entry.href === href && historyStatesEqual(entry.state, state),
+      );
+
+      return candidates.length === 1 ? candidates[0][0] : null;
+    },
+
+    truncateManagedHistoryAfter(position) {
+      for (const knownPosition of self.managedHistoryEntries.keys()) {
+        if (knownPosition > position) self.managedHistoryEntries.delete(knownPosition);
+      }
+    },
+
+    recordManagedHistoryCurrentEntry(position = null) {
+      const marker = managedHistoryMarker(window.history.state, self.managedHistorySessionId);
+      const resolvedPosition = Number.isSafeInteger(position)
+        ? position
+        : (marker?.position ?? self.managedHistoryPosition);
+
+      self.setManagedHistoryCurrentEntry({
+        browserIndex: managedHistoryBrowserIndex(),
+        href: window.location.href,
+        position: resolvedPosition,
+        state: window.history.state,
+      });
+      return self.managedHistoryCurrentEntry;
+    },
+
+    installManagedHistoryTracking() {
+      if (self.managedHistoryInstalled || !self.isManagedHistoryProject()) return;
+
+      const history = window.history;
+      const originalPushState = history.pushState;
+      const originalReplaceState = history.replaceState;
+      const existingMarker = managedHistoryStateMarker(history.state);
+
+      self.managedHistorySessionId =
+        existingMarker?.session_id ?? `coordexp-${Date.now()}-${++managedHistorySessionSequence}`;
+      self.managedHistoryTraversalQuarantined = false;
+      self.managedHistoryPosition = existingMarker?.position ?? 0;
+      self.managedHistoryOriginalPushState = originalPushState;
+      self.managedHistoryOriginalReplaceState = originalReplaceState;
+
+      const withMarker = (state, position) => {
+        if (!isPlainHistoryState(state)) return state;
+        return {
+          ...state,
+          [COORDEXP_HISTORY_STATE_KEY]: {
+            position,
+            session_id: self.managedHistorySessionId,
+          },
+        };
+      };
+
+      self.managedHistoryPushStateWrapper = function (state, title, url) {
+        if (!self.isManagedHistoryProject()) return originalPushState.call(history, state, title, url);
+
+        const position = self.managedHistoryPosition + 1;
+        const result = originalPushState.call(history, withMarker(state, position), title, url);
+
+        // Only a successful application-owned write is an explicit generation
+        // reset. A throwing native write must leave both quarantine and the
+        // forward side-index untouched.
+        self.truncateManagedHistoryAfter(self.managedHistoryPosition);
+        self.resetManagedHistoryTraversalQuarantine();
+        self.recordManagedHistoryCurrentEntry(position);
+        return result;
+      };
+      self.managedHistoryReplaceStateWrapper = function (state, title, url) {
+        if (!self.isManagedHistoryProject()) return originalReplaceState.call(history, state, title, url);
+
+        const result = originalReplaceState.call(history, withMarker(state, self.managedHistoryPosition), title, url);
+
+        self.resetManagedHistoryTraversalQuarantine();
+        self.recordManagedHistoryCurrentEntry(self.managedHistoryPosition);
+        return result;
+      };
+
+      history.pushState = self.managedHistoryPushStateWrapper;
+      history.replaceState = self.managedHistoryReplaceStateWrapper;
+      self.managedHistoryInstalled = true;
+
+      if (isPlainHistoryState(history.state)) {
+        history.replaceState(history.state, document.title, window.location.href);
+      } else {
+        self.recordManagedHistoryCurrentEntry(0);
+      }
+    },
+
+    uninstallManagedHistoryTracking() {
+      if (!self.managedHistoryInstalled) return;
+
+      self.clearManagedPopstateTimer();
+      const history = window.history;
+
+      history.pushState = self.managedHistoryOriginalPushState;
+      history.replaceState = self.managedHistoryOriginalReplaceState;
+      self.managedHistoryInstalled = false;
+      self.managedHistoryOriginalPushState = null;
+      self.managedHistoryOriginalReplaceState = null;
+      self.managedHistoryPushStateWrapper = null;
+      self.managedHistoryReplaceStateWrapper = null;
+      self.managedHistoryTraversalQuarantined = false;
     },
 
     setMode(mode) {
@@ -330,20 +671,30 @@ export const AppStore = types
           History.navigate({ labeling: 1 });
         }
       };
+      const runNextAction = () => {
+        if (self.LSF?.isManagedRefinementProject && options.managedCoordinated !== true) {
+          return self.LSF.coordinateManagedNavigation(nextAction, {
+            intentKey: "start-label-stream",
+            reason: "start-label-stream",
+          });
+        }
+
+        return nextAction();
+      };
 
       if (isFF(FF_DEV_2887) && self.LSF?.lsf?.annotationStore?.selected?.commentStore?.hasUnsaved) {
         Modal.confirm({
           title: "You have unsaved changes",
           body: "There are comments which are not persisted. Please submit the annotation. Continuing will discard these comments.",
           onOk() {
-            nextAction();
+            runNextAction();
           },
           okText: "Discard and continue",
         });
         return;
       }
 
-      nextAction();
+      return runNextAction();
     },
 
     startLabeling(item, options = {}) {
@@ -371,10 +722,23 @@ export const AppStore = types
             });
           }
 
-          self.setTask(labelingParams);
-        } else {
-          self.closeLabeling();
+          return self.setTask(labelingParams);
         }
+
+        return self.closeLabeling({ managedCoordinated: true });
+      };
+      const runNextAction = () => {
+        if (self.LSF?.isManagedRefinementProject && options.managedCoordinated !== true) {
+          const taskId = item?.task_id ?? item?.id ?? "close";
+          const annotationId = isDefined(item?.task_id) ? item.id : "auto";
+
+          return self.LSF.coordinateManagedNavigation(nextAction, {
+            intentKey: `row:${taskId}:annotation:${annotationId}`,
+            reason: "row-click",
+          });
+        }
+
+        return nextAction();
       };
 
       if (isFF(FF_DEV_2887) && self.LSF?.lsf?.annotationStore?.selected?.commentStore?.hasUnsaved) {
@@ -382,14 +746,14 @@ export const AppStore = types
           title: "You have unsaved changes",
           body: "There are comments which are not persisted. Please submit the annotation. Continuing will discard these comments.",
           onOk() {
-            nextAction();
+            runNextAction();
           },
           okText: "Discard and continue",
         });
         return;
       }
 
-      nextAction();
+      return runNextAction();
     },
 
     confirmLabelingConfigured() {
@@ -410,6 +774,13 @@ export const AppStore = types
     closeLabeling(options) {
       const { SDK } = self;
 
+      if (self.LSF?.isManagedRefinementProject && options?.managedCoordinated !== true) {
+        return self.LSF.coordinateManagedNavigation(
+          () => self.closeLabeling({ ...options, managedCoordinated: true }),
+          { intentKey: "close-labeling", reason: "close-labeling" },
+        );
+      }
+
       self.unsetTask(options);
 
       let viewId;
@@ -423,7 +794,7 @@ export const AppStore = types
         viewId = self.viewsStore.views[0]?.tabKey;
       }
 
-      if (isDefined(viewId)) {
+      if (isDefined(viewId) && options?.preserveHistoryEntry !== true) {
         History.forceNavigate({ tab: viewId });
       }
 
@@ -431,42 +802,316 @@ export const AppStore = types
       SDK.destroyLSF();
     },
 
-    handlePopState: (({ state }) => {
-      const { tab, task, annotation, labeling, region } = state ?? {};
+    setManagedPopstateTransition(transition) {
+      self.managedPopstateTransition = transition;
+    },
 
-      if (tab) {
-        const tabId = Number.parseInt(tab);
-
-        self.viewsStore.setSelected(Number.isNaN(tabId) ? tab : tabId, {
-          pushState: false,
-          createDefault: false,
-        });
+    clearManagedPopstateTimer() {
+      if (self.managedPopstateTimer !== null) {
+        clearTimeout(self.managedPopstateTimer);
+        self.managedPopstateTimer = null;
       }
+    },
 
-      if (task) {
-        const params = {};
+    takeManagedPopstateTransition() {
+      const transition = self.managedPopstateTransition;
 
-        if (annotation) {
-          params.task_id = Number.parseInt(task);
-          params.id = Number.parseInt(annotation);
-        } else {
-          params.id = Number.parseInt(task);
-        }
-        if (region) {
-          params.region = region;
-        } else {
-          delete params.region;
-        }
+      self.clearManagedPopstateTimer();
+      self.managedPopstateTransition = null;
+      return transition;
+    },
 
-        self.startLabeling(params, { pushState: false });
-      } else if (labeling) {
-        self.startLabelStream({ pushState: false });
+    cancelManagedPopstateTransition() {
+      const transition = self.takeManagedPopstateTransition();
+
+      if (!transition) return;
+      transition.resolveReplay?.(false);
+      transition.resolve?.(false);
+    },
+
+    failManagedPopstateTransition(transition) {
+      if (self.managedPopstateTransition?.promise !== transition.promise) return false;
+
+      const failedTransition = self.takeManagedPopstateTransition();
+
+      self.quarantineManagedHistoryTraversal();
+      if (failedTransition.phase === "replay-target") {
+        failedTransition.resolveReplay(false);
       } else {
-        self.closeLabeling({ pushState: false });
+        failedTransition.resolve(false);
       }
+      Modal.info({
+        title: "Browser navigation was paused",
+        body: "The previous page could not be restored safely. Your unsaved annotation is still open; save it before trying browser navigation again.",
+      });
+      return false;
+    },
+
+    coordinateManagedPopstateTransition(transition, sourceEntry, replayMethod = transition.replayMethod) {
+      self.clearManagedPopstateTimer();
+      self.setManagedHistoryCurrentEntry(sourceEntry);
+      const coordinatingTransition = {
+        ...transition,
+        phase: "coordinating",
+        replayMethod,
+        sourceEntry,
+      };
+
+      self.setManagedPopstateTransition(coordinatingTransition);
+      let navigation;
+
+      try {
+        navigation = self.LSF.coordinateManagedNavigation(
+          () => {
+            if (self.managedPopstateTransition?.promise !== transition.promise) return false;
+            return new Promise((resolveReplay, rejectReplay) => {
+              self.startManagedHistoryTraversal(
+                {
+                  ...coordinatingTransition,
+                  phase: "replay-target",
+                  rejectReplay,
+                  resolveReplay,
+                },
+                replayMethod,
+              );
+            });
+          },
+          { intentKey: `popstate:${transition.targetEntry.href}`, reason: "popstate" },
+        );
+      } catch {
+        self.failManagedPopstateTransition(coordinatingTransition);
+        return transition.promise;
+      }
+
+      Promise.resolve(navigation)
+        .then(transition.resolve, transition.reject)
+        .finally(() => {
+          if (self.managedPopstateTransition?.promise === transition.promise) {
+            self.takeManagedPopstateTransition();
+          }
+        });
+      return transition.promise;
+    },
+
+    handleManagedHistoryTraversalTimeout(expectedTransition) {
+      const transition = self.managedPopstateTransition;
+
+      if (
+        transition?.promise !== expectedTransition.promise ||
+        transition.phase !== expectedTransition.phase ||
+        transition.recoveryStep !== expectedTransition.recoveryStep
+      ) {
+        return;
+      }
+
+      self.managedPopstateTimer = null;
+      if (transition.phase === "restore-source" && historyEntryMatches(transition.sourceEntry)) {
+        return self.coordinateManagedPopstateTransition(transition, transition.sourceEntry);
+      }
+      return self.failManagedPopstateTransition(transition);
+    },
+
+    startManagedHistoryTraversal(transition, method) {
+      self.clearManagedPopstateTimer();
+      self.setManagedPopstateTransition(transition);
+      self.managedPopstateTimer = setTimeout(
+        () => self.handleManagedHistoryTraversalTimeout(transition),
+        MANAGED_HISTORY_TRAVERSAL_TIMEOUT_MS,
+      );
+      try {
+        window.history[method]();
+      } catch {
+        self.failManagedPopstateTransition(transition);
+      }
+      return transition.promise;
+    },
+
+    handlePopState: (({ state }) => {
+      const lsf = self.LSF;
+
+      // Keep the upstream branch byte-for-byte in behavior for ordinary
+      // projects. Managed replay must not make a null history state consult URL
+      // parameters or change the native close/start routing semantics.
+      if (!lsf?.isManagedRefinementProject) {
+        const { tab, task, annotation, labeling, region } = state ?? {};
+
+        if (tab) {
+          const tabId = Number.parseInt(tab);
+
+          self.viewsStore.setSelected(Number.isNaN(tabId) ? tab : tabId, {
+            pushState: false,
+            createDefault: false,
+          });
+        }
+
+        if (task) {
+          const params = {};
+
+          if (annotation) {
+            params.task_id = Number.parseInt(task);
+            params.id = Number.parseInt(annotation);
+          } else {
+            params.id = Number.parseInt(task);
+          }
+          if (region) {
+            params.region = region;
+          } else {
+            delete params.region;
+          }
+
+          self.startLabeling(params, { pushState: false });
+        } else if (labeling) {
+          self.startLabelStream({ pushState: false });
+        } else {
+          self.closeLabeling({ pushState: false });
+        }
+        return;
+      }
+
+      const targetHref = window.location.href;
+      const targetState = state ?? null;
+      const applyPopState = (resolvedState = targetState) => {
+        const { tab, task, annotation, labeling, region } = resolvedState ?? {};
+
+        if (tab) {
+          const tabId = Number.parseInt(tab);
+
+          self.viewsStore.setSelected(Number.isNaN(tabId) ? tab : tabId, {
+            pushState: false,
+            createDefault: false,
+          });
+        }
+
+        if (task) {
+          const params = {};
+
+          if (annotation) {
+            params.task_id = Number.parseInt(task);
+            params.id = Number.parseInt(annotation);
+          } else {
+            params.id = Number.parseInt(task);
+          }
+          if (region) {
+            params.region = region;
+          } else {
+            delete params.region;
+          }
+
+          return self.startLabeling(params, { pushState: false, managedCoordinated: true });
+        }
+        if (labeling) {
+          return self.startLabelStream({ pushState: false, managedCoordinated: true });
+        }
+        return self.closeLabeling({
+          pushState: false,
+          managedCoordinated: true,
+          preserveHistoryEntry: true,
+        });
+      };
+
+      const navigationWasBlocked = lsf.requiresManagedNavigationSave();
+      const transition = self.managedPopstateTransition;
+
+      if (self.managedHistoryTraversalQuarantined) return false;
+
+      if (transition?.phase === "restore-source") {
+        self.clearManagedPopstateTimer();
+        if (!historyEntryMatches(transition.sourceEntry, targetHref, targetState)) {
+          return self.failManagedPopstateTransition(transition);
+        }
+        const sourceEntry = {
+          browserIndex: managedHistoryBrowserIndex(),
+          href: targetHref,
+          position: transition.sourceEntry.position,
+          state: targetState,
+        };
+
+        return self.coordinateManagedPopstateTransition(transition, sourceEntry);
+      }
+
+      if (transition?.phase === "replay-target") {
+        self.clearManagedPopstateTimer();
+        if (!historyEntryMatches(transition.targetEntry, targetHref, targetState)) {
+          return self.failManagedPopstateTransition(transition);
+        }
+        self.takeManagedPopstateTransition();
+        self.setManagedHistoryCurrentEntry(transition.targetEntry);
+        try {
+          const result = applyPopState(transition.targetEntry.state);
+
+          Promise.resolve(result).then(transition.resolveReplay, transition.rejectReplay);
+          return result;
+        } catch (error) {
+          transition.rejectReplay(error);
+          throw error;
+        }
+      }
+
+      if (transition) return transition.promise;
+      const targetMarker = managedHistoryMarker(state, self.managedHistorySessionId);
+      const targetPosition = targetMarker?.position ?? self.resolveManagedHistoryPosition(targetHref, targetState);
+      const targetEntry = {
+        browserIndex: managedHistoryBrowserIndex(),
+        href: targetHref,
+        position: targetPosition,
+        state: targetState,
+      };
+
+      if (!navigationWasBlocked) {
+        self.setManagedHistoryCurrentEntry(targetEntry);
+        return applyPopState();
+      }
+
+      const sourceEntry = self.managedHistoryCurrentEntry;
+      const positionsKnown = Number.isSafeInteger(sourceEntry?.position) && Number.isSafeInteger(targetEntry.position);
+      const browserIndexesKnown =
+        Number.isSafeInteger(sourceEntry?.browserIndex) && Number.isSafeInteger(targetEntry.browserIndex);
+
+      let resolve;
+      let reject;
+      const promise = new Promise((promiseResolve, promiseReject) => {
+        resolve = promiseResolve;
+        reject = promiseReject;
+      });
+
+      const baseTransition = {
+        promise,
+        reject,
+        resolve,
+        sourceEntry,
+        targetEntry,
+      };
+
+      let popDirection = null;
+
+      if (positionsKnown && targetEntry.position !== sourceEntry.position) {
+        popDirection = targetEntry.position > sourceEntry.position ? "forward" : "back";
+      } else if (browserIndexesKnown && targetEntry.browserIndex !== sourceEntry.browserIndex) {
+        popDirection = targetEntry.browserIndex > sourceEntry.browserIndex ? "forward" : "back";
+      }
+      if (!popDirection) {
+        const unsupportedTransition = { ...baseTransition, phase: "unsupported-direction" };
+
+        self.setManagedPopstateTransition(unsupportedTransition);
+        self.failManagedPopstateTransition(unsupportedTransition);
+        return promise;
+      }
+      const restoreMethod = popDirection === "forward" ? "back" : "forward";
+      const replayMethod = popDirection === "forward" ? "forward" : "back";
+
+      return self.startManagedHistoryTraversal(
+        {
+          ...baseTransition,
+          phase: "restore-source",
+          replayMethod,
+          restoreMethod,
+        },
+        restoreMethod,
+      );
     }).bind(self),
 
     resolveURLParams() {
+      self.installManagedHistoryTracking();
       window.addEventListener("popstate", self.handlePopState);
     },
 

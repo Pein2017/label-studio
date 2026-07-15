@@ -450,6 +450,36 @@ export class DataManager {
     }
   }
 
+  ensureDurableDraft() {
+    if (!this.lsf) return Promise.reject(new Error("Label Studio is not initialized"));
+    return this.lsf.ensureDurableDraft();
+  }
+
+  setManagedRoiRunning(running) {
+    return this.lsf?.setManagedRoiRunning(running);
+  }
+
+  beginManagedProjectStatePoll() {
+    return this.lsf?.beginManagedProjectStatePoll();
+  }
+
+  updateManagedProjectState(state, pollToken) {
+    return this.lsf?.updateManagedProjectState(state, pollToken);
+  }
+
+  getManagedStatusState() {
+    return this.lsf?.getManagedStatusState();
+  }
+
+  clearManagedStatusError() {
+    return this.lsf?.clearManagedStatusError();
+  }
+
+  coordinateManagedNavigation(action, options) {
+    if (!this.lsf) return Promise.resolve().then(action);
+    return this.lsf.coordinateManagedNavigation(action, options);
+  }
+
   destroyLSF() {
     this.invoke("beforeLsfDestroy", this, this.lsf?.lsfInstance);
     this.lsf?.destroy();

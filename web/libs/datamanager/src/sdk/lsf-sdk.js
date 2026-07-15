@@ -80,6 +80,82 @@ export const SUPPORT_URL_REQUEST_ID_PARAM = "tf_37934448633869"; // request_id f
 // without affecting other toasts like "Annotation Saved"
 const OVERLAP_TOAST_ID = "overlap-reached-toast";
 
+export const COORDEXP_MANAGED_PROJECT_PREFIX = "coordexp-refinement-project-identity:";
+
+const MANAGED_DRAFT_MAX_SAVE_ATTEMPTS = 4;
+const MANAGED_DRAFT_DETACHED_RESULT = Object.freeze({ detached: true, reason: "destroyed", status: "cancelled" });
+
+// These fields are deliberately persisted with a Draft so inference colors can
+// be reconstructed after reload, but they are presentation-only.  Excluding
+// them from the browser dirtiness projection prevents focus/color changes from
+// masquerading as an unsaved object edit.  This projection is only a local
+// navigation guard; authoritative semantic hashes always come from the managed
+// status endpoint.
+const MANAGED_PRESENTATION_META_FIELDS = new Set([
+  "coordexp_visual_presentation",
+  "visual_policy_presentation",
+  "visual_policy_v1",
+]);
+
+const stableSerialize = (value) => {
+  if (value === null) return "null";
+
+  switch (typeof value) {
+    case "boolean":
+    case "string":
+      return JSON.stringify(value);
+    case "number":
+      return Number.isFinite(value) ? JSON.stringify(value) : "null";
+    case "object": {
+      if (Array.isArray(value)) {
+        return `[${value.map((item) => stableSerialize(item ?? null)).join(",")}]`;
+      }
+
+      const entries = Object.keys(value)
+        .filter((key) => value[key] !== undefined && typeof value[key] !== "function")
+        .sort()
+        .map((key) => `${JSON.stringify(key)}:${stableSerialize(value[key])}`);
+
+      return `{${entries.join(",")}}`;
+    }
+    default:
+      return "null";
+  }
+};
+
+const stableHash = (value) => {
+  const serialized = stableSerialize(value);
+  let hash = 0x811c9dc5;
+
+  for (let index = 0; index < serialized.length; index++) {
+    hash ^= serialized.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+
+  return `fnv1a32:${(hash >>> 0).toString(16).padStart(8, "0")}`;
+};
+
+const managedSemanticProjection = (value, parentKey = null) => {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((item) => managedSemanticProjection(item, parentKey));
+
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => parentKey !== "meta" || !MANAGED_PRESENTATION_META_FIELDS.has(key))
+      .map(([key, item]) => [key, managedSemanticProjection(item, key)]),
+  );
+};
+
+const identitiesEqual = (left, right) => (left == null && right == null) || String(left) === String(right);
+
+export class CoordExpDraftSaveError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "CoordExpDraftSaveError";
+    this.code = code;
+  }
+}
+
 export class LSFWrapper {
   /** @type {HTMLElement} */
   root = null;
@@ -138,6 +214,29 @@ export class LSFWrapper {
     this.initialAnnotation = annotation;
     this.interfacesModifier = interfacesModifier;
     this.isInteractivePreannotations = isInteractivePreannotations ?? false;
+
+    this._managedDraftSaves = new Map();
+    this._managedDraftBaselines = new Map();
+    this._managedLocalPendingDrafts = new Map();
+    this._managedLocalSaveVersion = 0;
+    this._managedPollSequence = 0;
+    this._managedAcceptedPollSequence = 0;
+    this._managedAuthoritativeObservedLocalSaveVersion = -1;
+    this._managedNavigationSequence = 0;
+    this._managedNavigationCurrent = null;
+    this._managedNavigationQueue = [];
+    this._managedCoordinatorDestroyed = false;
+    this._managedSelectionReplay = false;
+    this._managedRoiRunning = false;
+    this._managedAuthoritativeState = null;
+    this._managedPersistentError = null;
+    this.managedStatusState = null;
+    this.lastPersistedDraftResult = null;
+
+    if (this.isManagedRefinementProject) {
+      this._managedBeforeUnloadHandler = this._handleManagedBeforeUnload;
+      window.addEventListener("beforeunload", this._managedBeforeUnloadHandler);
+    }
 
     // Listen for overlap error modal events (only when feature flag is enabled)
     if (isFF(FF_FIT_1304_STRICT_OVERLAP)) {
@@ -284,6 +383,809 @@ export class LSFWrapper {
     }
   }
 
+  _managedAnnotationIdentity(annotation, task = this.task) {
+    if (!annotation || !task?.id) return null;
+
+    const annotationId = annotation.pk ?? annotation.id;
+
+    if (!isDefined(annotationId)) return null;
+    return `${task.id}:${annotationId}`;
+  }
+
+  _serializeManagedAnnotation(annotation) {
+    const result = annotation?.serializeAnnotation?.({ fast: true });
+
+    if (Array.isArray(result)) return result;
+    if (Array.isArray(annotation?.versions?.draft)) return annotation.versions.draft;
+    return [];
+  }
+
+  _managedSemanticProjection(annotation) {
+    return managedSemanticProjection(this._serializeManagedAnnotation(annotation));
+  }
+
+  _managedHistoryEpoch(annotation) {
+    const history = annotation?.history;
+
+    return `${history?.undoIdx ?? 0}:${history?.lastAdditionTime ?? ""}`;
+  }
+
+  _initializeManagedDraftBaseline(annotation) {
+    if (!this.isManagedRefinementProject || !annotation) return;
+
+    const identity = this._managedAnnotationIdentity(annotation);
+
+    if (!identity || this._managedDraftBaselines.has(identity)) return;
+
+    const projection = this._managedSemanticProjection(annotation);
+    const serialized = stableSerialize(projection);
+
+    this._managedDraftBaselines.set(identity, {
+      browserSemanticHash: stableHash(projection),
+      serialized,
+      hydrated: true,
+      receipt: null,
+    });
+  }
+
+  _initializeManagedDraftBaselines() {
+    if (!this.isManagedRefinementProject) return;
+
+    for (const annotation of this.annotations ?? []) {
+      this._initializeManagedDraftBaseline(annotation);
+    }
+
+    // The editor treats every resolved submitDraft callback as success. Managed
+    // projects save through the strict wrapper coordinator instead.
+    this.currentAnnotation?.pauseAutosave?.();
+    this._publishManagedStatus();
+  }
+
+  _isManagedAnnotationDirty(annotation = this.currentAnnotation) {
+    if (!this.isManagedRefinementProject || !annotation) return false;
+
+    const identity = this._managedAnnotationIdentity(annotation);
+    const baseline = identity ? this._managedDraftBaselines.get(identity) : null;
+
+    if (!baseline) return this.needsDraftSave(annotation);
+    return stableSerialize(this._managedSemanticProjection(annotation)) !== baseline.serialized;
+  }
+
+  _isManagedDraftSaving(annotation = this.currentAnnotation) {
+    const identity = this._managedAnnotationIdentity(annotation);
+
+    return Boolean(identity && this._managedDraftSaves.has(identity));
+  }
+
+  hasManagedUnsavedWork = () => {
+    if (!this.isManagedRefinementProject) return false;
+    return this._isManagedAnnotationDirty(this.currentAnnotation);
+  };
+
+  requiresManagedNavigationSave = () => {
+    return (
+      this.isManagedRefinementProject &&
+      (this._managedRoiRunning ||
+        this._isManagedDraftSaving(this.currentAnnotation) ||
+        this._isManagedAnnotationDirty(this.currentAnnotation))
+    );
+  };
+
+  _handleManagedBeforeUnload = (event) => {
+    if (!this.hasManagedUnsavedWork()) return;
+
+    event.preventDefault();
+    event.returnValue = "";
+    return "";
+  };
+
+  setManagedRoiRunning = (running) => {
+    if (typeof running !== "boolean") throw new TypeError("running must be a boolean");
+    this._managedRoiRunning = running;
+    this._publishManagedStatus();
+    this.datamanager.invoke("managedRoiStateChanged", { running: this._managedRoiRunning });
+  };
+
+  beginManagedProjectStatePoll = () => {
+    return Object.freeze({
+      pollSequence: ++this._managedPollSequence,
+      localSaveVersion: this._managedLocalSaveVersion,
+    });
+  };
+
+  _managedStatusError(error, domain) {
+    const normalized =
+      error instanceof CoordExpDraftSaveError
+        ? error
+        : this._managedDraftError("MANAGED_STATUS_ERROR", "Managed refinement status could not be verified.");
+
+    return Object.freeze({
+      code: normalized.code,
+      message: normalized.message,
+      domain,
+      at: new Date().toISOString(),
+    });
+  }
+
+  _setManagedPersistentError(error, domain) {
+    this._managedPersistentError = this._managedStatusError(error, domain);
+    this._publishManagedStatus();
+  }
+
+  _clearManagedPersistentError(domain = null) {
+    if (!this._managedPersistentError) return;
+    if (domain && this._managedPersistentError.domain !== domain) return;
+    this._managedPersistentError = null;
+  }
+
+  clearManagedStatusError = () => {
+    this._managedPersistentError = null;
+    return this._publishManagedStatus();
+  };
+
+  _managedServerMembers(state = this._managedAuthoritativeState) {
+    const members = state?.members ?? state?.task_states ?? state?.tasks;
+
+    if (Array.isArray(members)) return members;
+    if (members && typeof members === "object") return Object.values(members);
+    return [];
+  }
+
+  _managedAuthoritativeMember(taskId) {
+    return this._managedServerMembers().find((member) => identitiesEqual(member?.task_id ?? member?.taskId, taskId));
+  }
+
+  _managedMemberDraftTokenMatches(member, local) {
+    if (!member || !local?.receipt) return false;
+
+    const draftId = member.draft_id ?? member.draftId;
+    const draftUpdatedAt = member.draft_updated_at ?? member.draftUpdatedAt;
+
+    return (
+      identitiesEqual(draftId, local.receipt.draft_id) &&
+      typeof draftUpdatedAt === "string" &&
+      draftUpdatedAt === local.receipt.revision
+    );
+  }
+
+  _managedMemberProvesCommitted(member) {
+    const draftHash = member?.draft_semantic_hash ?? member?.draftSemanticHash;
+    const committedHash = member?.committed_semantic_hash ?? member?.committedSemanticHash;
+
+    return (
+      typeof draftHash === "string" &&
+      Boolean(draftHash) &&
+      typeof committedHash === "string" &&
+      Boolean(committedHash) &&
+      draftHash === committedHash
+    );
+  }
+
+  _managedTaskSemanticState(taskId = this.task?.id) {
+    if (!isDefined(taskId)) return "Unknown";
+    if (this._managedLocalPendingDrafts.has(String(taskId))) return "Draft";
+    if (identitiesEqual(taskId, this.task?.id) && this._isManagedAnnotationDirty(this.currentAnnotation))
+      return "Draft";
+
+    const member = this._managedAuthoritativeMember(taskId);
+    if (this._managedMemberProvesCommitted(member)) return "Committed";
+
+    const draftHash = member?.draft_semantic_hash ?? member?.draftSemanticHash;
+    const committedHash = member?.committed_semantic_hash ?? member?.committedSemanticHash;
+
+    return typeof draftHash === "string" && draftHash && typeof committedHash === "string" && committedHash
+      ? "Draft"
+      : "Unknown";
+  }
+
+  _buildManagedStatusState() {
+    const authoritative = this._managedAuthoritativeState;
+    const pending = this._managedPendingDraftPayload();
+    const annotation = this.currentAnnotation;
+    const browserProjection = annotation ? this._managedSemanticProjection(annotation) : null;
+
+    return Object.freeze({
+      authority: authoritative,
+      generation: authoritative?.generation ?? null,
+      version: authoritative?.version ?? null,
+      taskSemanticState: this._managedTaskSemanticState(),
+      batchState: pending.batchState,
+      activeBatchId: pending.activeBatchId,
+      pendingDraftCount: pending.pendingDraftCount,
+      local: Object.freeze({
+        dirty: this._isManagedAnnotationDirty(annotation),
+        roiRunning: this._managedRoiRunning,
+        saveInFlight: this._isManagedDraftSaving(annotation),
+        pendingTaskCount: this._managedLocalPendingDrafts.size,
+        browserSemanticProjectionHash: browserProjection ? stableHash(browserProjection) : null,
+        authority: false,
+      }),
+      error: this._managedPersistentError,
+    });
+  }
+
+  _publishManagedStatus() {
+    if (!this.isManagedRefinementProject) return null;
+    this.managedStatusState = this._buildManagedStatusState();
+    this.datamanager.invoke("managedStatusChanged", this.managedStatusState);
+    return this.managedStatusState;
+  }
+
+  getManagedStatusState = () => {
+    return this._publishManagedStatus();
+  };
+
+  updateManagedProjectState = (state = {}, pollToken = {}) => {
+    const generation = state.generation ?? state.project_generation ?? state.projectGeneration;
+    const version = state.version ?? state.status_version ?? state.statusVersion;
+
+    if (!Number.isInteger(generation) || generation < 0 || !Number.isInteger(version) || version < 0) {
+      const error = this._managedDraftError(
+        "INVALID_STATUS_VERSION",
+        "Managed status is missing a valid generation/version and was ignored.",
+      );
+
+      this._setManagedPersistentError(error, "status");
+      return this.managedStatusState;
+    }
+
+    const pollSequence = pollToken?.pollSequence;
+
+    if (pollSequence !== undefined && (!Number.isInteger(pollSequence) || pollSequence <= 0)) {
+      const error = this._managedDraftError(
+        "INVALID_POLL_TOKEN",
+        "Managed status poll token is invalid and was ignored.",
+      );
+
+      this._setManagedPersistentError(error, "status");
+      return this.managedStatusState;
+    }
+
+    const current = this._managedAuthoritativeState;
+    const isStale =
+      current && (generation < current.generation || (generation === current.generation && version < current.version));
+
+    if (isStale) return this.getManagedStatusState();
+
+    const normalized = JSON.parse(stableSerialize({ ...state, generation, version }));
+
+    if (
+      current &&
+      generation === current.generation &&
+      version === current.version &&
+      stableSerialize(normalized) !== stableSerialize(current)
+    ) {
+      const error = this._managedDraftError(
+        "STATUS_VERSION_CONFLICT",
+        "Managed status changed without advancing its authoritative version and was ignored.",
+      );
+
+      this._setManagedPersistentError(error, "status");
+      return this.managedStatusState;
+    }
+
+    if (
+      Number.isInteger(pollSequence) &&
+      pollSequence < this._managedAcceptedPollSequence &&
+      current &&
+      generation === current.generation &&
+      version === current.version
+    ) {
+      return this.getManagedStatusState();
+    }
+
+    this._managedAuthoritativeState = Object.freeze(normalized);
+    if (Number.isInteger(pollSequence)) {
+      this._managedAcceptedPollSequence = Math.max(this._managedAcceptedPollSequence, pollSequence);
+    }
+
+    const observedLocalSaveVersion =
+      pollToken?.localSaveVersion ?? state.observed_local_save_version ?? state.observedLocalSaveVersion ?? -1;
+    this._managedAuthoritativeObservedLocalSaveVersion = observedLocalSaveVersion;
+    const incomingPendingCount = Number(state.pending_draft_count ?? state.pendingDraftCount ?? 0);
+    const serverHasPending = Number.isInteger(incomingPendingCount) && incomingPendingCount > 0;
+
+    for (const [taskId, local] of this._managedLocalPendingDrafts) {
+      if (local.localSaveVersion > observedLocalSaveVersion) continue;
+      const member = this._managedAuthoritativeMember(taskId);
+
+      if (
+        this._managedMemberDraftTokenMatches(member, local) &&
+        (serverHasPending || this._managedMemberProvesCommitted(member))
+      ) {
+        this._managedLocalPendingDrafts.delete(taskId);
+      }
+    }
+
+    this._clearManagedPersistentError("status");
+    const status = this._publishManagedStatus();
+
+    this.datamanager.invoke("managedPendingDraftsChanged", this._managedPendingDraftPayload());
+    return status;
+  };
+
+  _managedPendingDraftPayload() {
+    const serverCount = Number(
+      this._managedAuthoritativeState?.pending_draft_count ?? this._managedAuthoritativeState?.pendingDraftCount ?? 0,
+    );
+    const authoritativePendingCount = Number.isInteger(serverCount) && serverCount >= 0 ? serverCount : 0;
+    const localPendingTaskCount = this._managedLocalPendingDrafts.size;
+    const postPollLocalPendingTaskCount = Array.from(this._managedLocalPendingDrafts.values()).filter(
+      (local) => local.localSaveVersion > this._managedAuthoritativeObservedLocalSaveVersion,
+    ).length;
+    const observedLocalPendingTaskCount = localPendingTaskCount - postPollLocalPendingTaskCount;
+    const pendingDraftCount =
+      Math.max(authoritativePendingCount, observedLocalPendingTaskCount) + postPollLocalPendingTaskCount;
+
+    return Object.freeze({
+      pendingDraftCount,
+      authoritativePendingCount,
+      localPendingTaskCount,
+      postPollLocalPendingTaskCount,
+      batchState: this._managedAuthoritativeState?.batch_state ?? this._managedAuthoritativeState?.batchState ?? null,
+      activeBatchId:
+        this._managedAuthoritativeState?.active_batch_id ?? this._managedAuthoritativeState?.activeBatchId ?? null,
+      generation: this._managedAuthoritativeState?.generation ?? null,
+      version: this._managedAuthoritativeState?.version ?? null,
+      error: this._managedPersistentError,
+    });
+  }
+
+  _captureManagedSource(annotation = this.currentAnnotation) {
+    return Object.freeze({
+      taskId: this.task?.id ?? null,
+      annotation,
+      annotationIdentity: this._managedAnnotationIdentity(annotation),
+      serializedHash: annotation ? stableHash(this._serializeManagedAnnotation(annotation)) : null,
+      historyEpoch: this._managedHistoryEpoch(annotation),
+    });
+  }
+
+  _assertManagedSourceIdentity(source) {
+    if (!identitiesEqual(this.task?.id, source.taskId)) {
+      throw new CoordExpDraftSaveError(
+        "SOURCE_TASK_CHANGED",
+        "The task changed while its Draft was being saved. Please retry from the current task.",
+      );
+    }
+
+    if (!source.annotation) return;
+
+    const selected = this.currentAnnotation;
+    const selectedIdentity = this._managedAnnotationIdentity(selected);
+
+    if (selected !== source.annotation || selectedIdentity !== source.annotationIdentity) {
+      throw new CoordExpDraftSaveError(
+        "SOURCE_ANNOTATION_CHANGED",
+        "The selected annotation changed while its Draft was being saved. Please retry.",
+      );
+    }
+  }
+
+  _managedDraftError(code, message) {
+    return new CoordExpDraftSaveError(code, message);
+  }
+
+  _validateManagedDraftResponse(response, source, requestIdentity) {
+    if (!response || typeof response !== "object") {
+      throw this._managedDraftError("EMPTY_RESPONSE", "Draft save did not return a valid response. Please retry.");
+    }
+
+    if (response.error != null || response.response?.error != null) {
+      throw this._managedDraftError("RESOLVED_API_ERROR", "Draft save failed. Your local edits are still present.");
+    }
+
+    const status = response.$meta?.status;
+
+    if (!Number.isInteger(status)) {
+      throw this._managedDraftError("MISSING_RESPONSE_STATUS", "Draft save could not be verified. Please retry.");
+    }
+
+    if (status < 200 || status >= 300) {
+      throw this._managedDraftError("DRAFT_HTTP_ERROR", "Draft save failed. Your local edits are still present.");
+    }
+
+    if (!Number.isInteger(response.id) || response.id <= 0) {
+      throw this._managedDraftError("INVALID_DRAFT_ID", "Draft save returned an invalid Draft identity. Please retry.");
+    }
+
+    if (requestIdentity.draftId !== null && !identitiesEqual(response.id, requestIdentity.draftId)) {
+      throw this._managedDraftError("DRAFT_ID_MISMATCH", "Draft update returned a different Draft identity.");
+    }
+
+    if (!Object.hasOwn(response, "task") || !identitiesEqual(response.task, source.taskId)) {
+      throw this._managedDraftError("DRAFT_TASK_MISMATCH", "Draft save returned a different task identity.");
+    }
+
+    if (!Object.hasOwn(response, "annotation")) {
+      throw this._managedDraftError("DRAFT_ANNOTATION_MISMATCH", "Draft save did not return its annotation identity.");
+    }
+
+    if (requestIdentity.annotationId === null && response.annotation !== null) {
+      throw this._managedDraftError(
+        "DRAFT_ANNOTATION_MISMATCH",
+        "Draft save returned a different annotation identity.",
+      );
+    }
+
+    if (requestIdentity.annotationId !== null && !identitiesEqual(response.annotation, requestIdentity.annotationId)) {
+      throw this._managedDraftError(
+        "DRAFT_ANNOTATION_MISMATCH",
+        "Draft save returned a different annotation identity.",
+      );
+    }
+
+    if (typeof response.updated_at !== "string" || !response.updated_at.trim()) {
+      throw this._managedDraftError("MISSING_DRAFT_UPDATED_AT", "Draft save did not return a durable server revision.");
+    }
+
+    this._assertManagedSourceIdentity(source);
+    return status;
+  }
+
+  _managedDraftRevision(response) {
+    return response.updated_at;
+  }
+
+  _managedReceipt(response, source, annotation, payloadHash, browserSemanticHash) {
+    return Object.freeze({
+      task_id: source.taskId,
+      annotation_id: annotation.pk ?? annotation.id,
+      draft_id: response.id,
+      status: response.$meta.status,
+      revision: this._managedDraftRevision(response),
+      serialized_hash: payloadHash,
+      browser_semantic_projection_hash: browserSemanticHash,
+      authoritative_semantic_hash: null,
+    });
+  }
+
+  async _performManagedDraftRequest(annotation, serializedResult, source, params = {}) {
+    if (this._managedCoordinatorDestroyed) return MANAGED_DRAFT_DETACHED_RESULT;
+
+    const taskId = source.taskId;
+    const data = { body: this.prepareData(annotation, { isNewDraft: true }) };
+    const requestParams = { ...params };
+
+    delete requestParams.useToast;
+    data.body.result = serializedResult;
+    Object.assign(data.body, requestParams);
+
+    try {
+      await this.saveUserLabels();
+      if (this._managedCoordinatorDestroyed) return MANAGED_DRAFT_DETACHED_RESULT;
+      this._assertManagedSourceIdentity(source);
+
+      let response;
+      const requestIdentity = Object.freeze({
+        draftId: annotation.draftId > 0 ? annotation.draftId : null,
+        annotationId: annotation.pk ?? null,
+      });
+
+      if (requestIdentity.draftId !== null) {
+        response = await this.datamanager.apiCall("updateDraft", { draftID: requestIdentity.draftId }, data);
+      } else if (!annotation.pk) {
+        response = await this.datamanager.apiCall("createDraftForTask", { taskID: taskId }, data);
+      } else {
+        response = await this.datamanager.apiCall(
+          "createDraftForAnnotation",
+          { taskID: taskId, annotationID: annotation.pk },
+          data,
+        );
+      }
+
+      if (this._managedCoordinatorDestroyed) return MANAGED_DRAFT_DETACHED_RESULT;
+      const status = this._validateManagedDraftResponse(response, source, requestIdentity);
+
+      if (requestIdentity.draftId === null) annotation.setDraftId(response.id);
+
+      const semanticProjection = managedSemanticProjection(serializedResult);
+      const payloadHash = stableHash(serializedResult);
+      const browserSemanticHash = stableHash(semanticProjection);
+      const serialized = stableSerialize(semanticProjection);
+      const receipt = this._managedReceipt(response, source, annotation, payloadHash, browserSemanticHash);
+      const identity = source.annotationIdentity;
+
+      this._managedDraftBaselines.set(identity, {
+        browserSemanticHash,
+        serialized,
+        hydrated: false,
+        receipt,
+      });
+      this.lastPersistedDraftResult = receipt;
+      this._managedLocalPendingDrafts.set(String(source.taskId), {
+        localSaveVersion: ++this._managedLocalSaveVersion,
+        receipt,
+      });
+      this._clearManagedPersistentError("draft");
+      this.datamanager.invoke("submitDraft", this, annotation, response);
+      this.datamanager.invoke("managedPendingDraftsChanged", this._managedPendingDraftPayload());
+      this._publishManagedStatus();
+
+      return { browserSemanticHash, payloadHash, response, receipt, status };
+    } catch (error) {
+      if (this._managedCoordinatorDestroyed) return MANAGED_DRAFT_DETACHED_RESULT;
+      const managedError =
+        error instanceof CoordExpDraftSaveError
+          ? error
+          : this._managedDraftError("DRAFT_REQUEST_FAILED", "Draft save failed. Your local edits are still present.");
+
+      this._setManagedPersistentError(managedError, "draft");
+      throw managedError;
+    }
+  }
+
+  async _runManagedDraftSave(annotation, { force = false, params = {} } = {}) {
+    const source = this._captureManagedSource(annotation);
+    const seenProgress = new Set();
+    let lastResult = null;
+
+    this._assertManagedSourceIdentity(source);
+    annotation.setDraftSaving?.(true);
+
+    try {
+      for (let attempt = 0; attempt < MANAGED_DRAFT_MAX_SAVE_ATTEMPTS; attempt++) {
+        this._assertManagedSourceIdentity(source);
+
+        const serializedResult = this._serializeManagedAnnotation(annotation);
+        const semanticProjection = managedSemanticProjection(serializedResult);
+        const browserSemanticHash = stableHash(semanticProjection);
+        const serialized = stableSerialize(semanticProjection);
+        const progressKey = `${browserSemanticHash}:${this._managedHistoryEpoch(annotation)}`;
+        const baseline = this._managedDraftBaselines.get(source.annotationIdentity);
+        const needsSave = force || baseline?.serialized !== serialized;
+
+        if (!needsSave) return lastResult;
+
+        if (seenProgress.has(progressKey)) {
+          throw this._managedDraftError(
+            "DRAFT_SAVE_NO_PROGRESS",
+            "Draft edits did not stabilize while saving. Please pause editing and retry.",
+          );
+        }
+        seenProgress.add(progressKey);
+
+        lastResult = await this._performManagedDraftRequest(annotation, serializedResult, source, params);
+        if (lastResult === MANAGED_DRAFT_DETACHED_RESULT) return lastResult;
+        force = false;
+
+        const latestSerialized = stableSerialize(this._managedSemanticProjection(annotation));
+
+        if (latestSerialized === serialized) {
+          annotation.setDraftSaved?.(lastResult.receipt.revision ?? new Date().toISOString());
+          return lastResult;
+        }
+      }
+
+      throw this._managedDraftError(
+        "DRAFT_SAVE_DID_NOT_STABILIZE",
+        "Draft edits kept changing while saving. Please pause editing and retry.",
+      );
+    } finally {
+      if (!this._managedCoordinatorDestroyed) annotation.setDraftSaving?.(false);
+    }
+  }
+
+  _saveManagedDraft(annotation, options = {}) {
+    if (this._managedCoordinatorDestroyed) return Promise.resolve(MANAGED_DRAFT_DETACHED_RESULT);
+    if (!annotation) return Promise.resolve(null);
+
+    const identity = this._managedAnnotationIdentity(annotation);
+
+    if (!identity) {
+      return Promise.reject(
+        this._managedDraftError("MISSING_ANNOTATION_IDENTITY", "The current annotation has no stable local identity."),
+      );
+    }
+
+    const inFlight = this._managedDraftSaves.get(identity);
+
+    if (inFlight) return inFlight;
+
+    const operation = this._runManagedDraftSave(annotation, options).finally(() => {
+      if (this._managedDraftSaves.get(identity) === operation) this._managedDraftSaves.delete(identity);
+    });
+
+    this._managedDraftSaves.set(identity, operation);
+    return operation;
+  }
+
+  ensureDurableDraft = async () => {
+    if (!this.isManagedRefinementProject) {
+      throw this._managedDraftError(
+        "PROJECT_NOT_MANAGED",
+        "Durable refinement Draft receipts are only available for managed refinement projects.",
+      );
+    }
+
+    const result = await this._saveManagedDraft(this.currentAnnotation, { force: true });
+
+    if (!result?.receipt) {
+      throw this._managedDraftError("MISSING_DRAFT_RECEIPT", "Draft save did not produce a durable receipt.");
+    }
+
+    return result.receipt;
+  };
+
+  _notifyManagedNavigationBlocked(error, reason) {
+    if (this._managedPersistentError?.domain !== "draft") {
+      this._setManagedPersistentError(error, "navigation");
+    }
+    this.datamanager.invoke("managedNavigationBlocked", { error, reason });
+    this.datamanager.invoke("toast", { message: error.message, type: "error" });
+  }
+
+  _emitManagedNavigationReminder(reason) {
+    if (this._managedCoordinatorDestroyed) return;
+    const pending = this._managedPendingDraftPayload();
+
+    if (pending.pendingDraftCount <= 0 && pending.localPendingTaskCount <= 0) return;
+    this.datamanager.invoke("managedNavigationReminder", { ...pending, reason });
+  }
+
+  _managedNavigationCancelledDisposition(intentOrKey) {
+    const intentKey = typeof intentOrKey === "string" ? intentOrKey : (intentOrKey?.intentKey ?? null);
+
+    return Object.freeze({ intentKey, reason: "destroyed", status: "cancelled" });
+  }
+
+  _cancelManagedNavigationCoordinator() {
+    if (this._managedCoordinatorDestroyed) return;
+
+    this._managedCoordinatorDestroyed = true;
+    const intents = [this._managedNavigationCurrent, ...this._managedNavigationQueue].filter(Boolean);
+
+    this._managedNavigationCurrent = null;
+    this._managedNavigationQueue = [];
+    for (const intent of new Set(intents)) {
+      intent.cancelled = true;
+      intent.phase = "cancelled";
+      intent.resolve(this._managedNavigationCancelledDisposition(intent));
+    }
+  }
+
+  _executeManagedNavigation = async (intent) => {
+    try {
+      if (this._managedCoordinatorDestroyed || intent.cancelled) {
+        return this._managedNavigationCancelledDisposition(intent);
+      }
+      intent.phase = "saving";
+      if (this._managedRoiRunning) {
+        throw this._managedDraftError(
+          "ROI_RUNNING",
+          "Wait for the current AI Region inference before leaving this annotation.",
+        );
+      }
+
+      const annotation = intent.sourceAnnotation ?? this.currentAnnotation;
+      const source = this._captureManagedSource(annotation);
+
+      this._assertManagedSourceIdentity(source);
+
+      if (this._isManagedAnnotationDirty(annotation) || this._isManagedDraftSaving(annotation)) {
+        await this._saveManagedDraft(annotation);
+      }
+
+      if (this._managedCoordinatorDestroyed || intent.cancelled) {
+        return this._managedNavigationCancelledDisposition(intent);
+      }
+
+      this._assertManagedSourceIdentity(source);
+
+      if (this._isManagedAnnotationDirty(annotation)) {
+        throw this._managedDraftError("DRAFT_REMAINED_DIRTY", "The latest edits were not durably saved. Please retry.");
+      }
+
+      intent.phase = "acting";
+      const result = await intent.action();
+      if (this._managedCoordinatorDestroyed || intent.cancelled) {
+        return this._managedNavigationCancelledDisposition(intent);
+      }
+      const navigationResult = intent.supersededIntentKeys?.length
+        ? Object.freeze({
+            finalIntentKey: intent.intentKey,
+            result,
+            status: "coalesced",
+            supersededIntentKeys: Object.freeze([...intent.supersededIntentKeys]),
+          })
+        : result;
+
+      this._clearManagedPersistentError("navigation");
+      this._publishManagedStatus();
+      this._emitManagedNavigationReminder(intent.reason);
+      return navigationResult;
+    } catch (error) {
+      if (this._managedCoordinatorDestroyed || intent.cancelled) {
+        return this._managedNavigationCancelledDisposition(intent);
+      }
+      if (!(error instanceof CoordExpDraftSaveError)) throw error;
+      this._notifyManagedNavigationBlocked(error, intent.reason);
+      return false;
+    } finally {
+      if (!intent.cancelled) intent.phase = "settled";
+    }
+  };
+
+  _drainManagedNavigationQueue() {
+    if (
+      this._managedCoordinatorDestroyed ||
+      this._managedNavigationCurrent ||
+      this._managedNavigationQueue.length === 0
+    )
+      return;
+
+    const intent = this._managedNavigationQueue.shift();
+
+    this._managedNavigationCurrent = intent;
+    Promise.resolve()
+      .then(() => this._executeManagedNavigation(intent))
+      .then(intent.resolve, intent.reject)
+      .finally(() => {
+        if (this._managedNavigationCurrent === intent) this._managedNavigationCurrent = null;
+        this._drainManagedNavigationQueue();
+      });
+  }
+
+  coordinateManagedNavigation = (
+    action,
+    { coalesceKey: requestedCoalesceKey, reason = "navigation", sourceAnnotation, intentKey: requestedIntentKey } = {},
+  ) => {
+    if (!this.isManagedRefinementProject) return Promise.resolve().then(action);
+    if (this._managedCoordinatorDestroyed) {
+      return Promise.resolve(this._managedNavigationCancelledDisposition(requestedIntentKey ?? null));
+    }
+    if (typeof action !== "function") return Promise.reject(new TypeError("navigation action must be a function"));
+
+    const intentKey =
+      typeof requestedIntentKey === "string" && requestedIntentKey.trim()
+        ? requestedIntentKey
+        : `${reason}:intent-${++this._managedNavigationSequence}`;
+    const coalesceKey =
+      typeof requestedCoalesceKey === "string" && requestedCoalesceKey.trim() ? requestedCoalesceKey : null;
+    const duplicate =
+      (this._managedNavigationCurrent?.intentKey === intentKey && this._managedNavigationCurrent) ||
+      this._managedNavigationQueue.find((intent) => intent.intentKey === intentKey);
+
+    if (duplicate) return duplicate.promise;
+
+    const coalescible = coalesceKey
+      ? [this._managedNavigationCurrent, ...this._managedNavigationQueue].find(
+          (intent) => intent?.coalesceKey === coalesceKey && intent.phase !== "acting" && intent.phase !== "settled",
+        )
+      : null;
+
+    if (coalescible) {
+      coalescible.supersededIntentKeys ??= [];
+      coalescible.supersededIntentKeys.push(coalescible.intentKey);
+      coalescible.action = action;
+      coalescible.intentKey = intentKey;
+      coalescible.reason = reason;
+      return coalescible.promise;
+    }
+
+    let resolve;
+    let reject;
+    const promise = new Promise((promiseResolve, promiseReject) => {
+      resolve = promiseResolve;
+      reject = promiseReject;
+    });
+    const intent = {
+      action,
+      coalesceKey,
+      intentKey,
+      phase: "queued",
+      promise,
+      reason,
+      reject,
+      resolve,
+      sourceAnnotation,
+    };
+
+    this._managedNavigationQueue.push(intent);
+    this._drainManagedNavigationQueue();
+    return promise;
+  };
+
   /** @private */
   async preloadTask() {
     const { comment: commentId, task: taskID } = this.preload;
@@ -316,8 +1218,19 @@ export class LSFWrapper {
     return false;
   }
 
-  /** @private */
   async loadTask(taskID, annotationID, fromHistory = false) {
+    if (!this.isManagedRefinementProject) {
+      return this._loadTaskUncoordinated(taskID, annotationID, fromHistory);
+    }
+
+    return this.coordinateManagedNavigation(() => this._loadTaskUncoordinated(taskID, annotationID, fromHistory), {
+      intentKey: `task:${taskID ?? "next"}:annotation:${annotationID ?? "auto"}`,
+      reason: "load-task",
+    });
+  }
+
+  /** @private */
+  async _loadTaskUncoordinated(taskID, annotationID, fromHistory = false) {
     if (!this.lsf) {
       return console.error("Make sure that LSF was properly initialized");
     }
@@ -365,7 +1278,10 @@ export class LSFWrapper {
   }
 
   exitStream() {
-    this.datamanager.invoke("navigate", "projects");
+    const exit = () => this.datamanager.invoke("navigate", "projects");
+
+    if (!this.isManagedRefinementProject) return exit();
+    return this.coordinateManagedNavigation(exit, { intentKey: "exit-stream", reason: "exit-stream" });
   }
 
   async selectTask(task, annotationID, fromHistory = false) {
@@ -459,6 +1375,7 @@ export class LSFWrapper {
     this.lsf.initializeStore(lsfTask);
 
     await this.setAnnotation(annotationID, fromHistory || isRejectedQueue, selectPrediction);
+    this._initializeManagedDraftBaselines();
     this.setLoading(false);
 
     if (isFF(FF_FIT_1304_STRICT_OVERLAP) && this.overlapReached) {
@@ -978,6 +1895,14 @@ export class LSFWrapper {
 
   saveDraft = async (target = null) => {
     const selected = target || this.lsf?.annotationStore?.selected;
+
+    if (this.isManagedRefinementProject) {
+      const result = await this._saveManagedDraft(selected);
+
+      if (result?.response) this.draftToast(result.status, result.response);
+      return result?.response;
+    }
+
     const hasChanges = selected ? this.needsDraftSave(selected) : false;
 
     if (selected?.isDraftSaving) {
@@ -991,6 +1916,14 @@ export class LSFWrapper {
   };
 
   onSubmitDraft = async (_studio, annotation, params = {}) => {
+    if (this.isManagedRefinementProject) {
+      const showToast = params?.useToast === true;
+      const result = await this._saveManagedDraft(annotation, { force: true, params });
+
+      if (showToast && result?.response) this.draftToast(result.status, result.response);
+      return result?.response;
+    }
+
     // It should be preserved as soon as possible because each `await` will allow it to be changed
     const taskId = this.task.id;
     const annotationDoesntExist = !annotation.pk;
@@ -1155,11 +2088,23 @@ export class LSFWrapper {
   };
 
   // Proxy events that are unused by DM integration
-  onEntityCreate = (...args) => this.datamanager.invoke("onEntityCreate", ...args);
-  onEntityDelete = (...args) => this.datamanager.invoke("onEntityDelete", ...args);
+  onEntityCreate = (...args) => {
+    const result = this.datamanager.invoke("onEntityCreate", ...args);
+
+    this._publishManagedStatus();
+    return result;
+  };
+  onEntityDelete = (...args) => {
+    const result = this.datamanager.invoke("onEntityDelete", ...args);
+
+    this._publishManagedStatus();
+    return result;
+  };
   _selectAnnotationTimeout = null;
   _debouncedFirstOldSelection = undefined;
   onSelectAnnotation = (prevAnnotation, nextAnnotation, options) => {
+    if (this._managedSelectionReplay) return;
+
     // NOTE on parameter naming: LSF fires selectAnnotation(newAnnotation, oldAnnotation).
     // Despite the names here, prevAnnotation = the NEWLY selected annotation,
     // nextAnnotation = the PREVIOUSLY selected annotation (before this selection).
@@ -1200,10 +2145,52 @@ export class LSFWrapper {
   };
 
   _invokeSelectAnnotation = async (prevAnnotation, nextAnnotation, options) => {
+    if (this.isManagedRefinementProject && prevAnnotation && nextAnnotation && prevAnnotation !== nextAnnotation) {
+      const annotationStore = this.lsf?.annotationStore;
+      const sourceAnnotationIdentity = this._managedAnnotationIdentity(nextAnnotation);
+
+      this._managedSelectionReplay = true;
+      try {
+        annotationStore?.selectAnnotation(nextAnnotation.id);
+      } finally {
+        this._managedSelectionReplay = false;
+      }
+
+      return this.coordinateManagedNavigation(
+        async () => {
+          this._managedSelectionReplay = true;
+          try {
+            annotationStore?.selectAnnotation(prevAnnotation.id);
+          } finally {
+            this._managedSelectionReplay = false;
+          }
+
+          prevAnnotation.pauseAutosave?.();
+          this._initializeManagedDraftBaseline(prevAnnotation);
+          return this._invokeSelectAnnotationUncoordinated(prevAnnotation, nextAnnotation, options);
+        },
+        {
+          coalesceKey: sourceAnnotationIdentity ? `annotation-tab-source:${sourceAnnotationIdentity}` : undefined,
+          intentKey: `annotation-tab:${this._managedAnnotationIdentity(prevAnnotation)}`,
+          reason: "annotation-tab",
+          sourceAnnotation: nextAnnotation,
+        },
+      );
+    }
+
+    if (this.isManagedRefinementProject) {
+      prevAnnotation?.pauseAutosave?.();
+      this._initializeManagedDraftBaseline(prevAnnotation);
+    }
+
+    return this._invokeSelectAnnotationUncoordinated(prevAnnotation, nextAnnotation, options);
+  };
+
+  _invokeSelectAnnotationUncoordinated = async (prevAnnotation, nextAnnotation, options) => {
     // Invoke the DataManager callback first so that history fetch can start immediately.
     // The history endpoint only needs the annotation pk (available on stubs).
     // Hydration (which fetches full annotation data) runs in parallel afterwards.
-    if (nextAnnotation?.history?.undoIdx) {
+    if (!this.isManagedRefinementProject && nextAnnotation?.history?.undoIdx) {
       this.saveDraft(nextAnnotation).then(() => {
         this.datamanager.invoke("onSelectAnnotation", prevAnnotation, nextAnnotation, options, this);
       });
@@ -1299,12 +2286,28 @@ export class LSFWrapper {
   };
 
   onNextTask = async (nextTaskId, nextAnnotationId) => {
-    await this.saveDraft();
-    await this.loadTask(nextTaskId, nextAnnotationId, true);
+    if (!this.isManagedRefinementProject) {
+      await this.saveDraft();
+      await this._loadTaskUncoordinated(nextTaskId, nextAnnotationId, true);
+      return;
+    }
+
+    return this.coordinateManagedNavigation(() => this._loadTaskUncoordinated(nextTaskId, nextAnnotationId, true), {
+      intentKey: `next:${nextTaskId ?? "next"}:annotation:${nextAnnotationId ?? "auto"}`,
+      reason: "next-task",
+    });
   };
   onPrevTask = async (prevTaskId, prevAnnotationId) => {
-    await this.saveDraft();
-    await this.loadTask(prevTaskId, prevAnnotationId, true);
+    if (!this.isManagedRefinementProject) {
+      await this.saveDraft();
+      await this._loadTaskUncoordinated(prevTaskId, prevAnnotationId, true);
+      return;
+    }
+
+    return this.coordinateManagedNavigation(() => this._loadTaskUncoordinated(prevTaskId, prevAnnotationId, true), {
+      intentKey: `previous:${prevTaskId ?? "previous"}:annotation:${prevAnnotationId ?? "auto"}`,
+      reason: "previous-task",
+    });
   };
   async submitCurrentAnnotation(eventName, submit, includeId = false, loadNext = true) {
     const { taskID, currentAnnotation } = this;
@@ -1446,6 +2449,24 @@ export class LSFWrapper {
   }
 
   destroy() {
+    this._cancelManagedNavigationCoordinator();
+    if (this._selectAnnotationTimeout !== null) {
+      clearTimeout(this._selectAnnotationTimeout);
+      this._selectAnnotationTimeout = null;
+      this._debouncedFirstOldSelection = undefined;
+    }
+    if (this._managedBeforeUnloadHandler) {
+      window.removeEventListener("beforeunload", this._managedBeforeUnloadHandler);
+      this._managedBeforeUnloadHandler = null;
+    }
+
+    this._managedDraftSaves.clear();
+    this._managedDraftBaselines.clear();
+    this._managedLocalPendingDrafts.clear();
+    this._managedAuthoritativeState = null;
+    this._managedPersistentError = null;
+    this.managedStatusState = null;
+
     // Clean up overlap error event listeners and dismiss toast (only when feature flag is enabled)
     if (isFF(FF_FIT_1304_STRICT_OVERLAP)) {
       window.removeEventListener("overlap-error-next-task", this.handleOverlapNextTask);
@@ -1469,7 +2490,10 @@ export class LSFWrapper {
    */
   closeTask() {
     // Invoke the data manager's close task action
-    this.datamanager.invoke("closeTask");
+    const close = () => this.datamanager.invoke("closeTask");
+
+    if (!this.isManagedRefinementProject) return close();
+    return this.coordinateManagedNavigation(close, { intentKey: "close-task", reason: "close-task" });
   }
 
   get taskID() {
@@ -1504,6 +2528,13 @@ export class LSFWrapper {
   /** @returns {Dict} */
   get project() {
     return this.datamanager.store.project;
+  }
+
+  get isManagedRefinementProject() {
+    return (
+      typeof this.project?.description === "string" &&
+      this.project.description.startsWith(COORDEXP_MANAGED_PROJECT_PREFIX)
+    );
   }
 
   /** @returns {string|null} */
