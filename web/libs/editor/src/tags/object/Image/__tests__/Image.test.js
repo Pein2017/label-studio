@@ -6,7 +6,7 @@ if (typeof globalThis.structuredClone === "undefined") {
   globalThis.structuredClone = (obj) => JSON.parse(JSON.stringify(obj));
 }
 
-import { getRoot, types } from "mobx-state-tree";
+import { getRoot, getSnapshot, types } from "mobx-state-tree";
 
 jest.mock("../../../../utils/feature-flags", () => ({
   isFF: jest.fn(() => false),
@@ -86,6 +86,9 @@ const MockAnnotation = types
     addRegion: jest.fn(),
     reinitHistory: jest.fn(),
     unselectAll: jest.fn(),
+    setRegionFixtures(regions) {
+      self.regionStore.regions.replace(regions);
+    },
   }));
 
 const Root = types
@@ -169,6 +172,154 @@ describe("Image model", () => {
     mockManager.allTools.mockReturnValue([]);
     window.Htx = window.Htx || {};
     window.Htx.annotationStore = window.Htx.annotationStore || { names: new Map() };
+  });
+
+  describe("CoordExp volatile editor state", () => {
+    it("replaces, clips, and clears the temporary AI Region", () => {
+      const image = createStore().annotation.image;
+
+      image.setAIRegion({ x: 10, y: 20, width: 30, height: 40 });
+      expect(image.aiRegion).toEqual({ x: 10, y: 20, width: 30, height: 40 });
+
+      image.setAIRegion({ x: -10, y: 90, width: 30, height: 30 });
+      expect(image.aiRegion).toEqual({ x: 0, y: 90, width: 20, height: 10 });
+
+      image.clearAIRegion();
+      expect(image.aiRegion).toBeNull();
+    });
+
+    it("rejects non-finite and degenerate AI Regions without replacing the current region", () => {
+      const image = createStore().annotation.image;
+      image.setAIRegion({ x: 10, y: 20, width: 30, height: 40 });
+
+      expect(() => image.setAIRegion({ x: 10, y: 20, width: 0, height: 40 })).toThrow(/positive/);
+      expect(() => image.setAIRegion({ x: 110, y: 20, width: 10, height: 40 })).toThrow(/clipped area/);
+      expect(() => image.setAIRegion({ x: Number.NaN, y: 20, width: 10, height: 40 })).toThrow(/finite/);
+      expect(image.aiRegion).toEqual({ x: 10, y: 20, width: 30, height: 40 });
+    });
+
+    it("locks AI Region edits while inference is running", () => {
+      const image = createStore().annotation.image;
+      image.setAIRegionRunning(true);
+
+      expect(image.aiRegionReadonly).toBe(true);
+      expect(image.canEditAIRegion).toBe(false);
+      expect(() => image.setAIRegion({ x: 1, y: 1, width: 2, height: 2 })).toThrow(/read-only/);
+      expect(() => image.clearAIRegion()).toThrow(/read-only/);
+
+      image.setAIRegionRunning(false);
+      expect(image.canEditAIRegion).toBe(true);
+    });
+
+    it("keeps ROI, presentation, and focus state out of snapshots and history", () => {
+      const freeze = jest.fn();
+      const unfreeze = jest.fn();
+      const store = createStore({
+        annotation: {
+          toNames: new Map(),
+          regionStore: { regions: [], suggestions: [] },
+          history: { freeze, unfreeze, history: { length: 0 } },
+          names: new Map(),
+          image: { name: "img", value: "$url", type: "image" },
+        },
+      });
+      const image = store.annotation.image;
+      const before = getSnapshot(image);
+
+      image.setAIRegion({ x: 1, y: 2, width: 3, height: 4 });
+      image.setInferenceRegionPresentation("region-1", { color: "#005A9C", numeric_badge: 9 });
+      image.focusInferenceGroup(["region-1", "region-2"]);
+      image.clearInferenceRegionPresentations(["region-1"]);
+
+      expect(getSnapshot(image)).toEqual(before);
+      expect(freeze).not.toHaveBeenCalled();
+      expect(unfreeze).not.toHaveBeenCalled();
+      expect(image.inferenceFocusMarker).toEqual({ regionKeys: ["region-1", "region-2"], sequence: 1 });
+      expect(image.regionPresentationMode).toBe("show_all");
+      expect(image.isInferenceRegionPresentationRetired("region-1")).toBe(true);
+    });
+
+    it("strictly validates presentation input and restores show-all for nonexistent focus", () => {
+      const image = createStore().annotation.image;
+
+      expect(() => image.setRegionPresentation("unknown", [])).toThrow(/Unknown/);
+      expect(() => image.setInferenceRegionPresentation("r1", { color: "red" })).toThrow(/hex color/);
+      image.setRegionPresentation("hide_non_selected", ["missing"]);
+
+      expect(image.regionPresentationMode).toBe("show_all");
+      expect(image.focusedRegionKeys).toEqual([]);
+    });
+
+    it("retires targeted or all-known inference presentation keys without changing snapshots", () => {
+      const image = createStore().annotation.image;
+      const before = getSnapshot(image);
+      image.setInferenceRegionPresentation("stable-1", { color: "#005A9C", numeric_badge: 9 });
+      image.setInferenceRegionPresentation("stable-2", { color: "#A64073", numeric_badge: null });
+
+      image.clearInferenceRegionPresentations(["stable-1"]);
+      expect(image.isInferenceRegionPresentationRetired("stable-1")).toBe(true);
+      expect(image.getRegionPresentation("stable-1")).toBeNull();
+      expect(image.getRegionPresentation("stable-2")).toEqual({ color: "#A64073", numeric_badge: null });
+      expect(getSnapshot(image)).toEqual(before);
+
+      image.setInferenceRegionPresentation("stable-1", { color: "#007A5E", numeric_badge: 10 });
+      expect(image.isInferenceRegionPresentationRetired("stable-1")).toBe(false);
+      expect(image.getRegionPresentation("stable-1")).toEqual({ color: "#007A5E", numeric_badge: 10 });
+
+      image.clearInferenceRegionPresentations();
+      expect(image.inferenceRegionPresentations).toEqual({});
+      expect(image.isInferenceRegionPresentationRetired("stable-1")).toBe(true);
+      expect(image.isInferenceRegionPresentationRetired("stable-2")).toBe(true);
+      expect(getSnapshot(image)).toEqual(before);
+    });
+
+    it("treats stable region keys and runtime ids as one presentation alias group", () => {
+      const annotation = createStore().annotation;
+      const image = annotation.image;
+      annotation.setRegionFixtures([
+        { object: image, id: "runtime-1", presentationRegionKey: "stable-1", inferencePresentation: null },
+      ]);
+
+      image.setInferenceRegionPresentation("stable-1", { color: "#005A9C", numeric_badge: 9 });
+      expect(image.getRegionPresentation("runtime-1")).toEqual({ color: "#005A9C", numeric_badge: 9 });
+
+      image.clearInferenceRegionPresentations(["runtime-1"]);
+      expect(image.isInferenceRegionPresentationRetired("stable-1")).toBe(true);
+      expect(image.getRegionPresentation("stable-1")).toBeNull();
+      expect(image.getRegionPresentation("runtime-1")).toBeNull();
+
+      image.setInferenceRegionPresentation("runtime-1", { color: "#007A5E", numeric_badge: 10 });
+      expect(image.isInferenceRegionPresentationRetired("stable-1")).toBe(false);
+      expect(image.getRegionPresentation("stable-1")).toEqual({ color: "#007A5E", numeric_badge: 10 });
+
+      image.clearInferenceRegionPresentations(["stable-1"]);
+      expect(image.isInferenceRegionPresentationRetired("runtime-1")).toBe(true);
+      image.setInferenceRegionPresentation("stable-1", { color: "#A64073", numeric_badge: null });
+      expect(image.getRegionPresentation("runtime-1")).toEqual({ color: "#A64073", numeric_badge: null });
+    });
+
+    it("retires both aliases on deletion and restores show-all for the focused stable key", () => {
+      const annotation = createStore().annotation;
+      const image = annotation.image;
+      const region = {
+        object: image,
+        id: "runtime-1",
+        presentationRegionKey: "stable-1",
+        inferencePresentation: { color: "#005A9C", numericBadge: 9 },
+      };
+      annotation.setRegionFixtures([region]);
+      image.setInferenceRegionPresentation("runtime-1", { color: "#005A9C", numeric_badge: 9 });
+      image.setRegionPresentation("hide_non_selected", ["stable-1"]);
+
+      image.removeFocusedRegionKey("stable-1", "runtime-1");
+
+      expect(image.regionPresentationMode).toBe("show_all");
+      expect(image.focusedRegionKeys).toEqual([]);
+      expect(image.isInferenceRegionPresentationRetired("stable-1")).toBe(true);
+      expect(image.isInferenceRegionPresentationRetired("runtime-1")).toBe(true);
+      expect(image.getRegionPresentation("stable-1")).toBeNull();
+      expect(image.getRegionPresentation("runtime-1")).toBeNull();
+    });
   });
 
   describe("store and task", () => {

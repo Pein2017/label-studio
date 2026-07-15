@@ -1,4 +1,5 @@
 import Konva from "konva";
+import chroma from "chroma-js";
 import { getRoot, isAlive, types } from "mobx-state-tree";
 import { useContext } from "react";
 import { Rect } from "react-konva";
@@ -19,6 +20,16 @@ import { AliveRegion } from "./AliveRegion";
 import { EditableRegion } from "./EditableRegion";
 import { RegionWrapper } from "./RegionWrapper";
 import { RELATIVE_STAGE_HEIGHT, RELATIVE_STAGE_WIDTH } from "../components/ImageView/Image";
+
+const applyPresentationColorToFill = (fillColor, presentationColor) => {
+  if (!fillColor || !presentationColor) return fillColor;
+
+  try {
+    return chroma(presentationColor).alpha(chroma(fillColor).alpha()).css();
+  } catch {
+    return fillColor;
+  }
+};
 
 /**
  * Rectangle object for Bounding Box
@@ -408,6 +419,11 @@ const HtxRectangleView = ({ item, setShapeRef }) => {
 
   const { suggestion } = useContext(ImageViewContext) ?? {};
   const regionStyles = useRegionStyles(item, { suggestion });
+  const presentationColor = item.inferencePresentation?.color;
+  const fillColor = applyPresentationColorToFill(regionStyles.fillColor, presentationColor);
+  const strokeColor =
+    presentationColor && !item.inSelection && !item.highlighted ? presentationColor : regionStyles.strokeColor;
+  const labelColor = presentationColor ?? regionStyles.strokeColor;
   const stage = item.parent?.stageRef;
 
   const eventHandlers = {};
@@ -502,8 +518,8 @@ const HtxRectangleView = ({ item, setShapeRef }) => {
         ref={(node) => setShapeRef(node)}
         width={item.canvasWidth}
         height={item.canvasHeight}
-        fill={regionStyles.fillColor}
-        stroke={regionStyles.strokeColor}
+        fill={fillColor}
+        stroke={strokeColor}
         strokeWidth={regionStyles.strokeWidth}
         strokeScaleEnabled={false}
         perfectDrawEnabled={false}
@@ -512,7 +528,7 @@ const HtxRectangleView = ({ item, setShapeRef }) => {
         dash={suggestion ? [10, 10] : null}
         scaleX={item.scaleX}
         scaleY={item.scaleY}
-        opacity={1}
+        opacity={item.presentationOpacity}
         rotation={item.rotation}
         draggable={!item.isReadOnly()}
         name={`${item.id} _transformable`}
@@ -543,7 +559,8 @@ const HtxRectangleView = ({ item, setShapeRef }) => {
         onClick={(e) => {
           const recentModifiers = store.recentCanvasModifiers;
           const recentModifiersActive =
-            Date.now() - (recentModifiers?.timestamp ?? 0) < 1000 && (recentModifiers?.ctrlKey || recentModifiers?.metaKey);
+            Date.now() - (recentModifiers?.timestamp ?? 0) < 1000 &&
+            (recentModifiers?.ctrlKey || recentModifiers?.metaKey);
           const additiveSelectionShortcut = e.evt.ctrlKey || e.evt.metaKey || recentModifiersActive;
           const skipInteractions = item.parent.getSkipInteractions();
           const selectionEvent =
@@ -585,9 +602,16 @@ const HtxRectangleView = ({ item, setShapeRef }) => {
           item.setHighlight(false);
           item.onClickRegion(selectionEvent);
         }}
-        listening={!suggestion && !item.annotation?.isDrawing}
+        listening={!item.presentationHidden && !suggestion && !item.annotation?.isDrawing}
       />
-      <LabelOnRect item={item} color={regionStyles.strokeColor} strokewidth={regionStyles.strokeWidth} />
+      <LabelOnRect
+        item={item}
+        color={labelColor}
+        strokewidth={regionStyles.strokeWidth}
+        numericBadge={item.inferencePresentation?.numericBadge}
+        opacity={item.presentationOpacity}
+        forceIdentity={!!presentationColor}
+      />
     </RegionWrapper>
   );
 };

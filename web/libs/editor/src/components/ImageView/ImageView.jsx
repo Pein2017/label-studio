@@ -94,6 +94,30 @@ const Regions = memo(
   },
 );
 
+export const AIRegionOverlay = observer(({ item }) => {
+  const region = item.aiRegion;
+
+  if (!region) return null;
+
+  return (
+    <Layer name="ai-region-overlay" listening={false}>
+      <Rect
+        x={item.internalToCanvasX(region.x)}
+        y={item.internalToCanvasY(region.y)}
+        width={item.internalToCanvasX(region.width)}
+        height={item.internalToCanvasY(region.height)}
+        fillEnabled={false}
+        stroke="#005A9C"
+        strokeWidth={2}
+        strokeScaleEnabled={false}
+        dash={[8, 6]}
+        listening={false}
+        perfectDrawEnabled={false}
+      />
+    </Layer>
+  );
+});
+
 const DrawingRegion = observer(({ item }) => {
   const { drawingRegion } = item;
 
@@ -1440,6 +1464,7 @@ const StageContent = observer(({ item, store, state, crosshairRef }) => {
           <Fragment key={groupName} />
         );
       })}
+      <AIRegionOverlay item={item} />
       <Selection item={item} isPanning={state.isPanning} />
       <DrawingRegion item={item} />
       {item.smoothingEnabled === false && <PixelGridLayer item={item} />}

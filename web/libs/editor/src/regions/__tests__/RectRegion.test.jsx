@@ -5,6 +5,13 @@
 import { getRoot, types } from "mobx-state-tree";
 
 const rectPropsRef = { current: null };
+const mockRegionStyles = {
+  current: {
+    fillColor: "#ff8800",
+    strokeColor: "#000",
+    strokeWidth: 1,
+  },
+};
 jest.mock("react-konva", () => {
   const React = require("react");
   return {
@@ -21,11 +28,7 @@ jest.mock("../../utils/feature-flags", () => ({
 }));
 
 jest.mock("../../hooks/useRegionColor", () => ({
-  useRegionStyles: jest.fn(() => ({
-    fillColor: "#ff8800",
-    strokeColor: "#000",
-    strokeWidth: 1,
-  })),
+  useRegionStyles: jest.fn(() => mockRegionStyles.current),
 }));
 
 jest.mock("../../components/ImageView/ImageViewContext", () => ({
@@ -37,7 +40,14 @@ jest.mock("../RegionWrapper", () => ({
 }));
 
 jest.mock("../../components/ImageView/LabelOnRegion", () => ({
-  LabelOnRect: () => require("react").createElement("div", { "data-testid": "label-on-rect" }),
+  LabelOnRect: (props) =>
+    require("react").createElement("div", {
+      "data-testid": "label-on-rect",
+      "data-color": props.color,
+      "data-badge": props.numericBadge,
+      "data-opacity": props.opacity,
+      "data-force-identity": props.forceIdentity,
+    }),
 }));
 
 jest.mock("../../utils/image", () => ({
@@ -64,13 +74,19 @@ jest.mock("../../tags/object/Image", () => {
         zoomedPixelSize: { x: 1, y: 1 },
         stageRef: { container: () => ({ style: {} }) },
         getSkipInteractions: () => false,
+        regionPresentationMode: "show_all",
+        focusedRegionKeys: [],
+        inferenceRegionPresentations: {},
       }))
-      .views(() => ({
+      .views((self) => ({
         get naturalWidth() {
           return 100;
         },
         get naturalHeight() {
           return 100;
+        },
+        getRegionPresentation(regionKey) {
+          return self.inferenceRegionPresentations[regionKey] ?? null;
         },
       }))
       .actions((self) => ({
@@ -93,6 +109,13 @@ jest.mock("../../tags/object/Image", () => {
         },
         canvasToInternalY(v) {
           return v;
+        },
+        setPresentation(mode, focusedRegionKeys = []) {
+          self.regionPresentationMode = mode;
+          self.focusedRegionKeys = focusedRegionKeys;
+        },
+        setInferencePresentation(regionKey, presentation) {
+          self.inferenceRegionPresentations = { [regionKey]: presentation };
         },
       })),
   };
@@ -154,6 +177,12 @@ const TestRoot = types
     setAnnotation(ann) {
       self._annotation = ann;
     },
+    setPresentation(mode, focusedRegionKeys = []) {
+      self.image.setPresentation(mode, focusedRegionKeys);
+    },
+    setInferencePresentation(regionKey, presentation) {
+      self.image.setInferencePresentation(regionKey, presentation);
+    },
   }));
 
 const RootWithControl = types
@@ -198,6 +227,11 @@ describe("RectRegion", () => {
 
   beforeEach(() => {
     rectPropsRef.current = null;
+    mockRegionStyles.current = {
+      fillColor: "#ff8800",
+      strokeColor: "#000",
+      strokeWidth: 1,
+    };
     root = TestRoot.create({
       image: { id: "img1" },
       region: {
@@ -524,6 +558,108 @@ describe("RectRegion", () => {
         </ImageViewContext.Provider>,
       );
       expect(getByTestId("konva-rect")).toBeInTheDocument();
+    });
+
+    it("dims non-focused regions while leaving focused regions at normal opacity", () => {
+      root.setAnnotation({
+        regionStore: { isSelected: () => false },
+        history: { freeze: jest.fn(), unfreeze: jest.fn() },
+        isReadOnly: () => false,
+        isDrawing: false,
+      });
+      root.setPresentation("dim_non_selected", ["other"]);
+      const { getByTestId, rerender } = render(
+        <ImageViewContext.Provider value={{ suggestion: null }}>
+          <HtxRectangle item={region} />
+        </ImageViewContext.Provider>,
+      );
+      expect(rectPropsRef.current.opacity).toBe(0.25);
+      expect(getByTestId("label-on-rect")).toHaveAttribute("data-opacity", "0.25");
+
+      root.setPresentation("dim_non_selected", [region.id]);
+      rerender(
+        <ImageViewContext.Provider value={{ suggestion: null }}>
+          <HtxRectangle item={region} />
+        </ImageViewContext.Provider>,
+      );
+      expect(rectPropsRef.current.opacity).toBe(1);
+    });
+
+    it("suppresses hidden non-focused regions without changing native hidden", () => {
+      root.setAnnotation({
+        regionStore: { isSelected: () => false },
+        history: { freeze: jest.fn(), unfreeze: jest.fn() },
+        isReadOnly: () => false,
+        isDrawing: false,
+      });
+      root.setPresentation("hide_non_selected", ["other"]);
+      const { container } = render(
+        <ImageViewContext.Provider value={{ suggestion: null }}>
+          <HtxRectangle item={region} />
+        </ImageViewContext.Provider>,
+      );
+
+      expect(container.querySelector('[data-testid="konva-rect"]')).toBeNull();
+      expect(region.hidden).toBe(false);
+    });
+
+    it("does not create a fill when inference presentation colors an unfilled rectangle", () => {
+      root.setAnnotation({
+        regionStore: { isSelected: () => false },
+        history: { freeze: jest.fn(), unfreeze: jest.fn() },
+        isReadOnly: () => false,
+        isDrawing: false,
+      });
+      mockRegionStyles.current = { fillColor: null, strokeColor: "#000", strokeWidth: 1 };
+      root.setInferencePresentation(region.id, { color: "#005A9C", numeric_badge: 9 });
+      const { getByTestId } = render(
+        <ImageViewContext.Provider value={{ suggestion: null }}>
+          <HtxRectangle item={region} />
+        </ImageViewContext.Provider>,
+      );
+
+      expect(rectPropsRef.current.fill).toBeNull();
+      expect(rectPropsRef.current.stroke).toBe("#005A9C");
+      expect(getByTestId("label-on-rect")).toHaveAttribute("data-color", "#005A9C");
+      expect(getByTestId("label-on-rect")).toHaveAttribute("data-badge", "9");
+      expect(getByTestId("label-on-rect")).toHaveAttribute("data-force-identity", "true");
+    });
+
+    it("changes a native fill hue while preserving its alpha", () => {
+      root.setAnnotation({
+        regionStore: { isSelected: () => false },
+        history: { freeze: jest.fn(), unfreeze: jest.fn() },
+        isReadOnly: () => false,
+        isDrawing: false,
+      });
+      mockRegionStyles.current = { fillColor: "rgba(255, 136, 0, 0.2)", strokeColor: "#000", strokeWidth: 1 };
+      root.setInferencePresentation(region.id, { color: "#005A9C", numeric_badge: null });
+      render(
+        <ImageViewContext.Provider value={{ suggestion: null }}>
+          <HtxRectangle item={region} />
+        </ImageViewContext.Provider>,
+      );
+
+      expect(rectPropsRef.current.fill).toBe("rgba(0,90,156,0.2)");
+    });
+
+    it("keeps the native selected stroke dominant while using the palette for the label", () => {
+      root.setAnnotation({
+        regionStore: { isSelected: () => true },
+        history: { freeze: jest.fn(), unfreeze: jest.fn() },
+        isReadOnly: () => false,
+        isDrawing: false,
+      });
+      mockRegionStyles.current = { fillColor: null, strokeColor: "#40A9FF", strokeWidth: 2 };
+      root.setInferencePresentation(region.id, { color: "#005A9C", numeric_badge: null });
+      const { getByTestId } = render(
+        <ImageViewContext.Provider value={{ suggestion: null }}>
+          <HtxRectangle item={region} />
+        </ImageViewContext.Provider>,
+      );
+
+      expect(rectPropsRef.current.stroke).toBe("#40A9FF");
+      expect(getByTestId("label-on-rect")).toHaveAttribute("data-color", "#005A9C");
     });
 
     it("returns null when inViewPort is false (FF_ZOOM_OPTIM on, object has no viewPortBBoxCoords)", () => {

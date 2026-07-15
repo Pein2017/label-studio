@@ -3,7 +3,7 @@
  */
 import React from "react";
 import { render, screen, fireEvent } from "@testing-library/react";
-import ImageView, { splitRegions } from "../ImageView";
+import ImageView, { AIRegionOverlay, splitRegions } from "../ImageView";
 
 jest.mock("../../../utils/feature-flags", () => ({
   isFF: jest.fn(() => false),
@@ -193,6 +193,9 @@ function createItem(overrides = {}) {
     crosshair: false,
     smoothingEnabled: true,
     naturalWidth: 400,
+    aiRegion: null,
+    internalToCanvasX: (value) => value * 4,
+    internalToCanvasY: (value) => value * 3,
     images: ["https://example.com/img.png"],
     ...overrides,
   };
@@ -251,11 +254,50 @@ describe("splitRegions", () => {
   });
 });
 
+describe("AIRegionOverlay", () => {
+  it("renders one non-listening dashed ROI using current percent-to-canvas scaling", () => {
+    const item = createItem({ aiRegion: { x: 10, y: 20, width: 30, height: 40 } });
+    const { getByTestId } = render(<AIRegionOverlay item={item} />);
+    const rect = getByTestId("konva-rect");
+
+    expect(rect).toHaveAttribute("x", "40");
+    expect(rect).toHaveAttribute("y", "60");
+    expect(rect).toHaveAttribute("width", "120");
+    expect(rect).toHaveAttribute("height", "120");
+    expect(rect).toHaveAttribute("dash", "8,6");
+    expect(rect).not.toHaveAttribute("listening", "true");
+  });
+
+  it("disappears when the AI Region is cleared", () => {
+    const { container, rerender } = render(
+      <AIRegionOverlay item={createItem({ aiRegion: { x: 1, y: 2, width: 3, height: 4 } })} />,
+    );
+    expect(container.querySelector('[data-testid="konva-rect"]')).not.toBeNull();
+
+    rerender(<AIRegionOverlay item={createItem({ aiRegion: null })} />);
+    expect(container.firstChild).toBeNull();
+  });
+});
+
 describe("ImageView", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     const { isAlive } = require("mobx-state-tree");
     isAlive.mockImplementation((x) => !!x);
+  });
+
+  it("places the AI Region after annotation layers and before selection handles", () => {
+    const item = createItem({
+      aiRegion: { x: 10, y: 20, width: 30, height: 40 },
+      regs: [{ id: "r1", type: "rectangleregion", highlighted: false, selected: false, annotation: {} }],
+    });
+    const store = createStore();
+    item.store = store;
+    const { getAllByTestId } = render(<ImageView item={item} store={store} />);
+    const layerNames = getAllByTestId("konva-layer").map((layer) => layer.getAttribute("name"));
+
+    expect(layerNames.indexOf("chunk-0")).toBeLessThan(layerNames.indexOf("ai-region-overlay"));
+    expect(layerNames.indexOf("ai-region-overlay")).toBeLessThan(layerNames.indexOf("selection-regions-layer"));
   });
 
   it("returns null when item is not alive", () => {

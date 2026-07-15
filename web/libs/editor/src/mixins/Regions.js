@@ -62,6 +62,44 @@ const RegionsMixin = types
       return self._highlighted;
     },
 
+    get presentationRegionKey() {
+      const meta = self.results?.find((result) => result?.meta)?.meta;
+      return meta?.stable_region_key ?? meta?.coordexp?.stable_region_key ?? self.id;
+    },
+
+    get inferencePresentation() {
+      const meta = self.results?.find((result) => result?.meta)?.meta;
+      if (self.parent?.isInferenceRegionPresentationRetired?.(self.presentationRegionKey)) return null;
+      const policy = meta?.visual_policy_v1 ?? meta?.coordexp_visual_presentation ?? meta?.visual_policy_presentation;
+      const policyPresentation = Array.isArray(policy?.presentations)
+        ? policy.presentations.find((entry) => entry?.stable_region_key === self.presentationRegionKey)
+        : policy;
+      const volatilePresentation =
+        self.parent?.getRegionPresentation?.(self.presentationRegionKey) ??
+        self.parent?.getRegionPresentation?.(self.id);
+      const presentation = volatilePresentation ?? policyPresentation;
+      const color = presentation?.color;
+      const numericBadge = presentation?.numeric_badge;
+
+      return {
+        color: typeof color === "string" && /^#[0-9a-f]{6}$/i.test(color) ? color : null,
+        numericBadge: Number.isInteger(numericBadge) && numericBadge > 0 ? numericBadge : null,
+      };
+    },
+
+    get isPresentationFocused() {
+      const keys = self.parent?.focusedRegionKeys ?? [];
+      return keys.includes(self.presentationRegionKey) || keys.includes(self.id);
+    },
+
+    get presentationHidden() {
+      return self.parent?.regionPresentationMode === "hide_non_selected" && !self.isPresentationFocused;
+    },
+
+    get presentationOpacity() {
+      return self.parent?.regionPresentationMode === "dim_non_selected" && !self.isPresentationFocused ? 0.25 : 1;
+    },
+
     get inSelection() {
       return self.annotation?.regionStore.isSelected(self);
     },
@@ -148,6 +186,7 @@ const RegionsMixin = types
       },
 
       beforeDestroyArea() {
+        self.parent?.removeFocusedRegionKey?.(self.presentationRegionKey, self.id);
         self.notifyDrawingFinished({ destroy: true });
       },
 

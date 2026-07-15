@@ -32,6 +32,36 @@ const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 100;
 const MAX_ZOOM_CHANGE_PER_EVENT = 0.3; // Maximum zoom change per wheel event (30%)
 
+const getInferencePresentationAliasKeys = (regions, regionKey) => {
+  const aliases = new Set([regionKey]);
+  let changed = true;
+
+  while (changed) {
+    changed = false;
+    for (const region of regions ?? []) {
+      const stableRegionKey = region?.presentationRegionKey;
+      const regionId = region?.id;
+      if (!aliases.has(stableRegionKey) && !aliases.has(regionId)) continue;
+
+      for (const alias of [stableRegionKey, regionId]) {
+        if (typeof alias !== "string" || aliases.has(alias)) continue;
+        aliases.add(alias);
+        changed = true;
+      }
+    }
+  }
+
+  const stableKeys = [];
+  const regionIds = [];
+  for (const region of regions ?? []) {
+    if (!aliases.has(region?.presentationRegionKey) && !aliases.has(region?.id)) continue;
+    if (typeof region?.presentationRegionKey === "string") stableKeys.push(region.presentationRegionKey);
+    if (typeof region?.id === "string") regionIds.push(region.id);
+  }
+
+  return [...new Set([...stableKeys, ...regionIds, regionKey])];
+};
+
 /**
  * The `Image` tag shows an image on the page. Use for all image annotation tasks to display an image on the labeling interface.
  *
@@ -186,6 +216,14 @@ const Model = types
   .volatile(() => ({
     currentImage: undefined,
     supportSuggestions: true,
+    aiRegion: null,
+    aiRegionRunning: false,
+    _regionPresentationMode: "show_all",
+    focusedRegionKeys: [],
+    inferenceRegionPresentations: {},
+    retiredInferencePresentationKeys: {},
+    inferenceFocusMarker: null,
+    inferenceFocusSequence: 0,
   }))
   .views((self) => ({
     get store() {
@@ -194,6 +232,35 @@ const Model = types
 
     get multiImage() {
       return !!self.isMultiItem;
+    },
+
+    get aiRegionReadonly() {
+      return self.aiRegionRunning;
+    },
+
+    get canEditAIRegion() {
+      return !self.aiRegionRunning;
+    },
+
+    get regionPresentationMode() {
+      if (self._regionPresentationMode === "show_all") return "show_all";
+      const hasFocusedRegion = self.regs.some(
+        (region) =>
+          self.focusedRegionKeys.includes(region.id) || self.focusedRegionKeys.includes(region.presentationRegionKey),
+      );
+      return hasFocusedRegion ? self._regionPresentationMode : "show_all";
+    },
+
+    getRegionPresentation(regionKey) {
+      const aliasKeys = getInferencePresentationAliasKeys(self.regs, regionKey);
+      if (aliasKeys.some((alias) => self.retiredInferencePresentationKeys[alias] === true)) return null;
+      return aliasKeys.map((alias) => self.inferenceRegionPresentations[alias]).find(Boolean) ?? null;
+    },
+
+    isInferenceRegionPresentationRetired(regionKey) {
+      return getInferencePresentationAliasKeys(self.regs, regionKey).some(
+        (alias) => self.retiredInferencePresentationKeys[alias] === true,
+      );
     },
 
     // an alias of currentImage to make an interface reusable
@@ -642,10 +709,195 @@ const Model = types
       return manager;
     }
 
+    function assertAIRegionEditable() {
+      if (self.aiRegionRunning) {
+        throw new Error("AI Region is read-only while inference is running");
+      }
+    }
+
+    function setAIRegion(region) {
+      assertAIRegionEditable();
+      if (!region || typeof region !== "object" || Array.isArray(region)) {
+        throw new TypeError("AI Region must be an object with finite x, y, width, and height values");
+      }
+
+      const { x, y, width, height } = region;
+      if (![x, y, width, height].every((value) => typeof value === "number" && Number.isFinite(value))) {
+        throw new TypeError("AI Region must use finite numeric x, y, width, and height values");
+      }
+      if (width <= 0 || height <= 0) {
+        throw new RangeError("AI Region width and height must be positive");
+      }
+
+      const left = Math.max(0, Math.min(100, x));
+      const top = Math.max(0, Math.min(100, y));
+      const right = Math.max(0, Math.min(100, x + width));
+      const bottom = Math.max(0, Math.min(100, y + height));
+
+      if (right <= left || bottom <= top) {
+        throw new RangeError("AI Region must have a positive clipped area inside the image");
+      }
+
+      self.aiRegion = {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+      };
+    }
+
+    function clearAIRegion() {
+      assertAIRegionEditable();
+      self.aiRegion = null;
+    }
+
+    function setAIRegionRunning(running) {
+      if (typeof running !== "boolean") {
+        throw new TypeError("AI Region running state must be boolean");
+      }
+      self.aiRegionRunning = running;
+    }
+
+    function restoreRegionPresentation() {
+      self._regionPresentationMode = "show_all";
+      self.focusedRegionKeys = [];
+    }
+
+    function getKnownRegionKeys() {
+      return new Set(
+        self.regs.flatMap((region) =>
+          [region.id, region.presentationRegionKey].filter((key) => typeof key === "string"),
+        ),
+      );
+    }
+
+    function setRegionPresentation(mode, regionKeys = []) {
+      if (!["show_all", "dim_non_selected", "hide_non_selected"].includes(mode)) {
+        throw new RangeError(`Unknown region presentation mode: ${mode}`);
+      }
+      if (!Array.isArray(regionKeys) || regionKeys.some((key) => typeof key !== "string" || key.length === 0)) {
+        throw new TypeError("Focused region keys must be an array of non-empty strings");
+      }
+      if (mode === "show_all") {
+        restoreRegionPresentation();
+        return;
+      }
+
+      const knownKeys = getKnownRegionKeys();
+      const exactKnownKeys = [...new Set(regionKeys)].filter((key) => knownKeys.has(key));
+      if (exactKnownKeys.length === 0) {
+        restoreRegionPresentation();
+        return;
+      }
+
+      self._regionPresentationMode = mode;
+      self.focusedRegionKeys = exactKnownKeys;
+    }
+
+    function removeFocusedRegionKey(regionKey, regionId) {
+      const aliasKeys = getInferencePresentationAliasKeys(self.regs, regionKey);
+      getInferencePresentationAliasKeys(self.regs, regionId).forEach((alias) => aliasKeys.push(alias));
+      const exactAliasKeys = [...new Set(aliasKeys)];
+      const knownInferenceKeys = new Set(getKnownInferencePresentationKeys());
+      if (exactAliasKeys.some((alias) => knownInferenceKeys.has(alias))) {
+        clearInferenceRegionPresentations(exactAliasKeys);
+      }
+
+      if (self._regionPresentationMode === "show_all") return;
+      self.focusedRegionKeys = self.focusedRegionKeys.filter((key) => !exactAliasKeys.includes(key));
+      if (self.focusedRegionKeys.length === 0) restoreRegionPresentation();
+    }
+
+    function focusInferenceGroup(regionKeys) {
+      if (!Array.isArray(regionKeys) || regionKeys.some((key) => typeof key !== "string" || key.length === 0)) {
+        throw new TypeError("Inference group region keys must be an array of non-empty strings");
+      }
+      const exactRegionKeys = [...new Set(regionKeys)];
+      restoreRegionPresentation();
+      self.inferenceFocusSequence += 1;
+      self.inferenceFocusMarker = {
+        regionKeys: exactRegionKeys,
+        sequence: self.inferenceFocusSequence,
+      };
+    }
+
+    function setInferenceRegionPresentation(regionKey, presentation) {
+      if (typeof regionKey !== "string" || regionKey.length === 0) {
+        throw new TypeError("Inference presentation region key must be a non-empty string");
+      }
+      if (!presentation || typeof presentation !== "object" || Array.isArray(presentation)) {
+        throw new TypeError("Inference presentation must be an object");
+      }
+
+      const { color, numeric_badge: numericBadge = null } = presentation;
+      if (typeof color !== "string" || !/^#[0-9a-f]{6}$/i.test(color)) {
+        throw new TypeError("Inference presentation color must be a six-digit hex color");
+      }
+      if (numericBadge !== null && (!Number.isInteger(numericBadge) || numericBadge <= 0)) {
+        throw new TypeError("Inference presentation numeric_badge must be a positive integer or null");
+      }
+
+      const aliasKeys = getInferencePresentationAliasKeys(self.regs, regionKey);
+      const remainingPresentations = { ...self.inferenceRegionPresentations };
+      const remainingRetiredKeys = { ...self.retiredInferencePresentationKeys };
+      aliasKeys.forEach((alias) => {
+        delete remainingPresentations[alias];
+        delete remainingRetiredKeys[alias];
+      });
+      self.inferenceRegionPresentations = {
+        ...remainingPresentations,
+        [aliasKeys[0]]: { color, numeric_badge: numericBadge },
+      };
+      self.retiredInferencePresentationKeys = remainingRetiredKeys;
+    }
+
+    function getKnownInferencePresentationKeys() {
+      const knownKeys = new Set(Object.keys(self.inferenceRegionPresentations));
+      self.regs.forEach((region) => {
+        const regionKey = region.presentationRegionKey;
+        if (
+          typeof regionKey === "string" &&
+          (region.inferencePresentation?.color || self.retiredInferencePresentationKeys[regionKey])
+        ) {
+          knownKeys.add(regionKey);
+        }
+      });
+      return [...knownKeys];
+    }
+
+    function clearInferenceRegionPresentations(regionKeys) {
+      const exactRegionKeys = regionKeys === undefined ? getKnownInferencePresentationKeys() : regionKeys;
+      if (
+        !Array.isArray(exactRegionKeys) ||
+        exactRegionKeys.some((regionKey) => typeof regionKey !== "string" || regionKey.length === 0)
+      ) {
+        throw new TypeError("Retired inference presentation keys must be an array of non-empty strings");
+      }
+
+      const aliasKeys = exactRegionKeys.flatMap((regionKey) => getInferencePresentationAliasKeys(self.regs, regionKey));
+      const retiredKeys = { ...self.retiredInferencePresentationKeys };
+      const remainingPresentations = { ...self.inferenceRegionPresentations };
+      [...new Set(aliasKeys)].forEach((regionKey) => {
+        retiredKeys[regionKey] = true;
+        delete remainingPresentations[regionKey];
+      });
+      self.retiredInferencePresentationKeys = retiredKeys;
+      self.inferenceRegionPresentations = remainingPresentations;
+    }
+
     return {
       afterAttach,
       getToolsManager,
       afterResultCreated,
+      setAIRegion,
+      clearAIRegion,
+      setAIRegionRunning,
+      setRegionPresentation,
+      restoreRegionPresentation,
+      removeFocusedRegionKey,
+      focusInferenceGroup,
+      setInferenceRegionPresentation,
+      clearInferenceRegionPresentations,
     };
   })
   .extend((self) => {

@@ -8,6 +8,7 @@ import { Portal } from "react-konva-utils";
 type Region = {
   annotation: any;
   hidden: boolean;
+  presentationHidden?: boolean;
   // ...
   setShapeRef(ref: any): void;
   inSelection: boolean;
@@ -33,7 +34,7 @@ export const AliveRegion = (RegionComponent: IReactComponent<RegionComponentProp
   const ObservableRegion = observer(RegionComponent);
 
   return observer(({ item, ...rest }: RegionComponentProps) => {
-    const canRender = options?.renderHidden || !item.hidden;
+    const canRender = (options?.renderHidden || !item.hidden) && !item.presentationHidden;
     const shouldNotUsePortal = options?.shouldNotUsePortal;
     const Wrapper = (shouldNotUsePortal ? Fragment : Portal) as ExoticComponent<PortalProps>;
     const wrapperProps = shouldNotUsePortal ? {} : { selector: ".selection-regions-layer", enabled: item.inSelection };

@@ -61,6 +61,33 @@ describe("LabelOnRegion", () => {
       expect(container.firstChild).toBeNull();
     });
 
+    it("forces inference class text and exhaustion badge visible when ordinary labels are hidden", () => {
+      const { getAllByTestId } = render(
+        <LabelOnBbox
+          x={0}
+          y={0}
+          text="traffic light"
+          showLabels={false}
+          color="#005A9C"
+          numericBadge={9}
+          forceIdentity
+        />,
+      );
+      const texts = getAllByTestId("konva-text").map((node) => node.getAttribute("text"));
+
+      expect(texts).toContain("traffic light");
+      expect(texts).toContain("9");
+    });
+
+    it("forces inference class text visible without inventing an exhaustion badge", () => {
+      const { getAllByTestId } = render(
+        <LabelOnBbox x={0} y={0} text="person" showLabels={false} color="#A64073" numericBadge={null} forceIdentity />,
+      );
+      const texts = getAllByTestId("konva-text").map((node) => node.getAttribute("text"));
+
+      expect(texts).toEqual(["person"]);
+    });
+
     it("renders group with label when showLabels is true", () => {
       const { getByTestId } = render(<LabelOnBbox x={10} y={20} text="Test" showLabels={true} color="#ff0000" />);
       expect(getByTestId("konva-group")).toBeInTheDocument();
@@ -72,6 +99,16 @@ describe("LabelOnRegion", () => {
         <LabelOnBbox x={0} y={0} text="L" showLabels={true} score={0.95} color="#fff" />,
       );
       expect(getAllByTestId("konva-label").length).toBeGreaterThan(1);
+    });
+
+    it("keeps canonical text and renders a separate numeric exhaustion badge", () => {
+      const { getAllByTestId } = render(
+        <LabelOnBbox x={0} y={0} text="traffic light" showLabels={true} color="#005A9C" numericBadge={9} />,
+      );
+      const texts = getAllByTestId("konva-text").map((node) => node.getAttribute("text"));
+
+      expect(texts).toContain("traffic light");
+      expect(texts).toContain("9");
     });
 
     it("renders Path with TAG_PATH when isTexting is false", () => {

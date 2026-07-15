@@ -29,6 +29,9 @@ const LabelOnBbox = ({
   onMouseLeaveLabel,
   adjacent = false,
   isTexting = false,
+  numericBadge = null,
+  opacity = 1,
+  forceIdentity = false,
 }) => {
   const fontSize = 13;
   const height = 20;
@@ -40,17 +43,18 @@ const LabelOnBbox = ({
   const horizontalPaddings = paddingLeft + paddingRight;
   const textMaxWidth = Math.max(0, maxWidth * zoomScale - horizontalPaddings - scoreSpace);
   const isSticking = !!textMaxWidth;
+  const identityVisible = showLabels || forceIdentity;
   const { suggestion } = useContext(ImageViewContext) ?? {};
 
   const width = useMemo(() => {
-    if (!showLabels || !textEl || !maxWidth) return null;
+    if (!identityVisible || !textEl || !maxWidth) return null;
     const currentTextWidth = text ? textEl.measureSize(text).width : 0;
 
     if (currentTextWidth > textMaxWidth) {
       return textMaxWidth;
     }
     return null;
-  }, [textEl, text, maxWidth, scale]);
+  }, [textEl, text, maxWidth, scale, identityVisible]);
 
   const tagSceneFunc = useCallback(
     (context, shape) => {
@@ -93,10 +97,10 @@ const LabelOnBbox = ({
     [adjacent, isSticking, maxWidth],
   );
 
-  if (!showLabels) return null;
+  if (!identityVisible) return null;
 
   return (
-    <Group strokeScaleEnabled={false} x={x} y={y} rotation={rotation}>
+    <Group strokeScaleEnabled={false} x={x} y={y} rotation={rotation} opacity={opacity}>
       {!!score && (
         <Label
           y={-height * scale}
@@ -150,6 +154,18 @@ const LabelOnBbox = ({
         fill={Constants.SHOW_LABEL_FILL}
         data={isTexting ? OCR_PATH : TAG_PATH}
       />
+      {Number.isInteger(numericBadge) && numericBadge > 0 && (
+        <Label x={2 * scale} y={2 * scale} scaleX={scale} scaleY={scale} listening={false}>
+          <Tag fill={color} cornerRadius={8} />
+          <Text
+            text={String(numericBadge)}
+            fontFamily="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
+            fontSize={fontSize}
+            fill={Constants.SHOW_LABEL_FILL}
+            padding={3}
+          />
+        </Label>
+      )}
     </Group>
   );
 };
@@ -176,30 +192,35 @@ const LabelOnEllipse = observer(({ item, color, strokewidth }) => {
   );
 });
 
-const LabelOnRect = observer(({ item, color, strokewidth }) => {
-  if (!item.parent) return null;
-  const isTexting = !!item.texting;
-  const labelText = item.getLabelText(",");
-  const obj = item.parent;
-  const zoomScale = item.parent.zoomScale || 1;
+const LabelOnRect = observer(
+  ({ item, color, strokewidth, numericBadge = null, opacity = 1, forceIdentity = false }) => {
+    if (!item.parent) return null;
+    const isTexting = !!item.texting;
+    const labelText = item.getLabelText(",");
+    const obj = item.parent;
+    const zoomScale = item.parent.zoomScale || 1;
 
-  return (
-    <LabelOnBbox
-      x={obj.internalToCanvasX(item.x) - strokewidth / 2 / zoomScale}
-      y={obj.internalToCanvasY(item.y) - strokewidth / 2 / zoomScale}
-      isTexting={isTexting}
-      text={labelText}
-      score={item.score}
-      showLabels={getRoot(item).settings.showLabels}
-      zoomScale={item.parent.zoomScale}
-      rotation={item.rotation}
-      color={color}
-      maxWidth={obj.internalToCanvasX(item.width) + strokewidth}
-      adjacent
-      onClickLabel={item.onClickLabel}
-    />
-  );
-});
+    return (
+      <LabelOnBbox
+        x={obj.internalToCanvasX(item.x) - strokewidth / 2 / zoomScale}
+        y={obj.internalToCanvasY(item.y) - strokewidth / 2 / zoomScale}
+        isTexting={isTexting}
+        text={labelText}
+        score={item.score}
+        showLabels={getRoot(item).settings.showLabels}
+        zoomScale={item.parent.zoomScale}
+        rotation={item.rotation}
+        color={color}
+        maxWidth={obj.internalToCanvasX(item.width) + strokewidth}
+        adjacent
+        onClickLabel={item.onClickLabel}
+        numericBadge={numericBadge}
+        opacity={opacity}
+        forceIdentity={forceIdentity}
+      />
+    );
+  },
+);
 
 const LabelOnPolygon = observer(({ item, color }) => {
   if (!item.parent) return null;

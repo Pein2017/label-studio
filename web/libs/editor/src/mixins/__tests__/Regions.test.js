@@ -1,7 +1,7 @@
 /**
  * Unit tests for Regions mixin (mixins/Regions.js)
  */
-import { getEnv, getRoot, getParent, types } from "mobx-state-tree";
+import { getEnv, getRoot, getParent, getSnapshot, types } from "mobx-state-tree";
 
 jest.mock("../../utils/feature-flags", () => ({
   isFF: () => false,
@@ -73,10 +73,48 @@ function createStore(annotationOverrides = {}, regionSnapshot = {}) {
     })
     .volatile(() => ({
       annotationStore: { selected: annotation, selectedHistory: null },
+      regionPresentationMode: "show_all",
+      focusedRegionKeys: [],
+      inferenceRegionPresentations: {},
+      retiredInferencePresentationKeys: {},
+      removedFocusedRegionKeys: [],
+    }))
+    .views((self) => ({
+      getRegionPresentation(regionKey) {
+        return self.inferenceRegionPresentations[regionKey] ?? null;
+      },
+      isInferenceRegionPresentationRetired(regionKey) {
+        return self.retiredInferencePresentationKeys[regionKey] === true;
+      },
     }))
     .actions((self) => ({
       setAnnotation(ann) {
         self.annotationStore = { selected: ann, selectedHistory: null };
+      },
+      setPresentation(mode, focusedRegionKeys = []) {
+        self.regionPresentationMode = mode;
+        self.focusedRegionKeys = focusedRegionKeys;
+      },
+      setInferencePresentation(regionKey, presentation) {
+        self.inferenceRegionPresentations = { ...self.inferenceRegionPresentations, [regionKey]: presentation };
+        const remainingRetiredKeys = { ...self.retiredInferencePresentationKeys };
+        delete remainingRetiredKeys[regionKey];
+        self.retiredInferencePresentationKeys = remainingRetiredKeys;
+      },
+      clearInferencePresentations(regionKeys) {
+        const retiredKeys = { ...self.retiredInferencePresentationKeys };
+        const remainingPresentations = { ...self.inferenceRegionPresentations };
+        regionKeys.forEach((regionKey) => {
+          retiredKeys[regionKey] = true;
+          delete remainingPresentations[regionKey];
+        });
+        self.retiredInferencePresentationKeys = retiredKeys;
+        self.inferenceRegionPresentations = remainingPresentations;
+      },
+      removeFocusedRegionKey(regionKey, regionId) {
+        self.removedFocusedRegionKeys.push([regionKey, regionId]);
+        self.focusedRegionKeys = self.focusedRegionKeys.filter((key) => key !== regionKey && key !== regionId);
+        if (self.focusedRegionKeys.length === 0) self.regionPresentationMode = "show_all";
       },
     }));
 
@@ -132,6 +170,52 @@ describe("Regions mixin", () => {
       expect(region.highlighted).toBe(false);
       region.setHighlight(true);
       expect(region.highlighted).toBe(true);
+    });
+
+    it("derives all three dense presentation modes without mutating native hidden", () => {
+      const { root, region } = createStore();
+
+      expect(region.presentationHidden).toBe(false);
+      expect(region.presentationOpacity).toBe(1);
+
+      root.setPresentation("dim_non_selected", ["other"]);
+      expect(region.presentationHidden).toBe(false);
+      expect(region.presentationOpacity).toBe(0.25);
+
+      root.setPresentation("hide_non_selected", ["other"]);
+      expect(region.presentationHidden).toBe(true);
+      expect(region.hidden).toBe(false);
+
+      root.setPresentation("hide_non_selected", [region.id]);
+      expect(region.presentationHidden).toBe(false);
+      expect(region.presentationOpacity).toBe(1);
+    });
+
+    it("gets inference color and exhaustion badge from volatile state or result meta", () => {
+      const { root, region } = createStore();
+      region.setResults([
+        {
+          from_name: { smartEnabled: false },
+          meta: {
+            stable_region_key: "stable-1",
+            visual_policy_v1: { color: "#A64073", numeric_badge: 9 },
+          },
+        },
+      ]);
+
+      expect(region.presentationRegionKey).toBe("stable-1");
+      expect(region.inferencePresentation).toEqual({ color: "#A64073", numericBadge: 9 });
+
+      const persistedPolicy = region.results[0].meta.visual_policy_v1;
+      const semanticSnapshot = getSnapshot(region);
+      root.clearInferencePresentations(["stable-1"]);
+      expect(region.inferencePresentation).toBeNull();
+      expect(getSnapshot(region)).toEqual(semanticSnapshot);
+      expect(region.results[0].meta.visual_policy_v1).toBe(persistedPolicy);
+
+      root.setInferencePresentation("stable-1", { color: "#007A5E", numeric_badge: 10 });
+      expect(region.inferencePresentation).toEqual({ color: "#007A5E", numericBadge: 10 });
+      expect(root.isInferenceRegionPresentationRetired("stable-1")).toBe(false);
     });
 
     it("inSelection uses regionStore.isSelected", () => {
@@ -228,10 +312,13 @@ describe("Regions mixin", () => {
     });
 
     it("beforeDestroy calls beforeDestroyArea when isRealRegion", () => {
-      const { region, annotation } = createStore();
+      const { root, region } = createStore();
+      root.setPresentation("hide_non_selected", [region.id]);
       const spy = jest.spyOn(region, "beforeDestroyArea");
       region.beforeDestroy();
       expect(spy).toHaveBeenCalled();
+      expect(root.regionPresentationMode).toBe("show_all");
+      expect(root.removedFocusedRegionKeys).toEqual([[region.id, region.id]]);
     });
 
     it("beforeDestroy does not call beforeDestroyArea when not real region", () => {
