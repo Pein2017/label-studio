@@ -121,6 +121,36 @@ describe("TimeTraveller", () => {
       expect(root.timeTraveller.isFrozen).toBe(false);
     });
 
+    it("abortFreeze discards pending history without affecting later recording", () => {
+      const { root, store } = createRoot();
+      const initialHistoryLength = root.timeTraveller.history.length;
+
+      root.timeTraveller.freeze("atomic");
+      applySnapshot(store, { value: 1 });
+
+      expect(root.timeTraveller.abortFreeze("atomic")).toBe(true);
+      expect(root.timeTraveller.isFrozen).toBe(false);
+      expect(root.timeTraveller.history).toHaveLength(initialHistoryLength);
+
+      applySnapshot(store, { value: 2 });
+      expect(root.timeTraveller.history).toHaveLength(initialHistoryLength + 1);
+      root.timeTraveller.undo();
+      expect(store.value).toBe(0);
+    });
+
+    it("abortFreeze is a no-op without a matching sole freeze", () => {
+      const { root } = createRoot();
+
+      expect(root.timeTraveller.abortFreeze("missing")).toBe(false);
+      root.timeTraveller.freeze("a");
+      root.timeTraveller.freeze("b");
+      expect(root.timeTraveller.abortFreeze("a")).toBe(false);
+      expect(root.timeTraveller.isFrozen).toBe(true);
+
+      root.timeTraveller.unfreeze("a");
+      root.timeTraveller.unfreeze("b");
+    });
+
     it("unfreeze then addUndoState appends (replace flag was reset)", () => {
       const { root, store } = createRoot();
       root.timeTraveller.freeze("k");

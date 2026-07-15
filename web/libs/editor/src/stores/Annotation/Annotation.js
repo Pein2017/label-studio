@@ -1,5 +1,17 @@
 import { throttle } from "@humansignal/core/lib/utils/lodash-replacements";
-import { destroy, detach, flow, getEnv, getParent, getRoot, isAlive, onSnapshot, types } from "mobx-state-tree";
+import {
+  applySnapshot,
+  destroy,
+  detach,
+  flow,
+  getEnv,
+  getParent,
+  getRoot,
+  getSnapshot,
+  isAlive,
+  onSnapshot,
+  types,
+} from "mobx-state-tree";
 import { ff } from "@humansignal/core";
 import { errorBuilder } from "../../core/DataValidator/ConfigValidator";
 import { guidGenerator } from "../../core/Helpers";
@@ -19,6 +31,152 @@ import { UserExtended } from "../UserStore";
 import { LinkingModes } from "./LinkingModes";
 
 const hotkeys = Hotkey("Annotations", "Annotations");
+const ATOMIC_APPEND_FREEZE_KEY = "coordexp:append-results-atomically";
+const ATOMIC_APPEND_ERROR_CODE = "COORDEXP_ATOMIC_RESULT_APPEND_FAILED";
+const ATOMIC_RESULT_KEYS = new Set([
+  "id",
+  "type",
+  "from_name",
+  "to_name",
+  "original_width",
+  "original_height",
+  "image_rotation",
+  "value",
+  "meta",
+]);
+const ATOMIC_RESULT_VALUE_KEYS = new Set(["x", "y", "width", "height", "rotation", "rectanglelabels"]);
+
+export class AtomicResultAppendError extends Error {
+  constructor(message, options = {}) {
+    super(message);
+    this.name = "AtomicResultAppendError";
+    this.code = ATOMIC_APPEND_ERROR_CODE;
+    this.cause = options.cause;
+  }
+}
+
+const failAtomicAppend = (message, cause) => {
+  throw new AtomicResultAppendError(message, { cause });
+};
+
+const isFiniteNumber = (value) => typeof value === "number" && Number.isFinite(value);
+
+const isJsonValue = (value, seen = new Set()) => {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return false;
+    seen.add(value);
+    const isValid = value.every((item) => isJsonValue(item, seen));
+    seen.delete(value);
+    return isValid;
+  }
+  if (typeof value !== "object") return false;
+
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  if (seen.has(value)) return false;
+
+  seen.add(value);
+  const isValid = Object.values(value).every((item) => isJsonValue(item, seen));
+  seen.delete(value);
+  return isValid;
+};
+
+const jsonValuesEqual = (left, right) => {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((item, index) => jsonValuesEqual(item, right[index]))
+    );
+  }
+  if (!left || !right || typeof left !== "object" || typeof right !== "object") return false;
+
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  return (
+    leftKeys.length === rightKeys.length &&
+    leftKeys.every((key) => rightKeys.includes(key) && jsonValuesEqual(left[key], right[key]))
+  );
+};
+
+const validateAtomicRectangleResult = (result, index) => {
+  const prefix = `Result at index ${index}`;
+
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    failAtomicAppend(`${prefix} must be an object`);
+  }
+  if (Object.keys(result).some((key) => !ATOMIC_RESULT_KEYS.has(key))) {
+    failAtomicAppend(`${prefix} contains fields outside the fixed atomic result shape`);
+  }
+  if (typeof result.id !== "string" || !result.id.trim() || result.id.includes("#")) {
+    failAtomicAppend(`${prefix} must have a stable non-empty id without '#'`);
+  }
+  if (result.type !== "rectanglelabels" || result.from_name !== "bbox" || result.to_name !== "image") {
+    failAtomicAppend(`${prefix} must be a rectanglelabels/bbox/image result`);
+  }
+  if (!Number.isInteger(result.original_width) || result.original_width <= 0) {
+    failAtomicAppend(`${prefix} must have a positive integer original_width`);
+  }
+  if (!Number.isInteger(result.original_height) || result.original_height <= 0) {
+    failAtomicAppend(`${prefix} must have a positive integer original_height`);
+  }
+  if (result.image_rotation !== 0) {
+    failAtomicAppend(`${prefix} must have image_rotation 0`);
+  }
+
+  const value = result.value;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    failAtomicAppend(`${prefix} must have an object value`);
+  }
+  if (
+    Object.keys(value).length !== ATOMIC_RESULT_VALUE_KEYS.size ||
+    Object.keys(value).some((key) => !ATOMIC_RESULT_VALUE_KEYS.has(key))
+  ) {
+    failAtomicAppend(`${prefix} value must match the fixed rectangle geometry shape`);
+  }
+  if (![value.x, value.y, value.width, value.height].every(isFiniteNumber)) {
+    failAtomicAppend(`${prefix} must have finite x, y, width, and height values`);
+  }
+  if (
+    value.x < 0 ||
+    value.y < 0 ||
+    value.width <= 0 ||
+    value.height <= 0 ||
+    value.x + value.width > 100 ||
+    value.y + value.height > 100
+  ) {
+    failAtomicAppend(`${prefix} must contain a positive bbox within percentage bounds`);
+  }
+  if (value.rotation !== 0) {
+    failAtomicAppend(`${prefix} must have value.rotation 0`);
+  }
+  if (
+    !Array.isArray(value.rectanglelabels) ||
+    value.rectanglelabels.length !== 1 ||
+    typeof value.rectanglelabels[0] !== "string" ||
+    !value.rectanglelabels[0].trim()
+  ) {
+    failAtomicAppend(`${prefix} must have exactly one non-empty rectangle label`);
+  }
+  if (result.meta !== undefined && (!result.meta || !isJsonValue(result.meta) || Array.isArray(result.meta))) {
+    failAtomicAppend(`${prefix} meta must be an ordinary JSON object when provided`);
+  }
+};
+
+const matchesAtomicResult = (serialized, expected) =>
+  serialized?.id === expected.id &&
+  serialized.type === expected.type &&
+  serialized.from_name === expected.from_name &&
+  serialized.to_name === expected.to_name &&
+  serialized.original_width === expected.original_width &&
+  serialized.original_height === expected.original_height &&
+  serialized.image_rotation === expected.image_rotation &&
+  jsonValuesEqual(serialized.value, expected.value) &&
+  (expected.meta === undefined ? serialized.meta === undefined : jsonValuesEqual(serialized.meta, expected.meta));
 
 /**
  * Omit value fields from the object.
@@ -1064,6 +1222,146 @@ const _Annotation = types
       self.deserializeResults(results);
       self.updateObjects();
       return self.regionStore.regions.slice(prevSize);
+    },
+
+    appendResultsAtomically(results) {
+      if (!Array.isArray(results) || results.length === 0) {
+        failAtomicAppend("Results must be a non-empty array");
+      }
+      if (self.isReadOnly()) {
+        failAtomicAppend("Results can only be appended to the current editable annotation");
+      }
+      if (self.history.isFrozen) {
+        failAtomicAppend("Cannot atomically append results while annotation history is already frozen");
+      }
+      if (self.names.get("bbox")?.type !== "rectanglelabels" || self.names.get("image")?.type !== "image") {
+        failAtomicAppend("The current annotation must expose rectanglelabels 'bbox' for image 'image'");
+      }
+
+      const bboxControl = self.names.get("bbox");
+      const imageEntity = self.names.get("image").findImageEntity(0);
+      const expectedIds = new Set();
+      const existingIds = new Set(self.regions.map((region) => region.cleanId));
+
+      results.forEach((result, index) => {
+        validateAtomicRectangleResult(result, index);
+
+        if (expectedIds.has(result.id)) {
+          failAtomicAppend(`Duplicate result id '${result.id}'`);
+        }
+        if (existingIds.has(result.id)) {
+          failAtomicAppend(`Result id '${result.id}' conflicts with the current annotation`);
+        }
+        if (!bboxControl.findLabel(result.value.rectanglelabels[0])) {
+          failAtomicAppend(`Result at index ${index} uses an unknown bbox label`);
+        }
+        expectedIds.add(result.id);
+      });
+
+      const [firstResult] = results;
+      if (
+        results.some(
+          (result) =>
+            result.original_width !== firstResult.original_width ||
+            result.original_height !== firstResult.original_height,
+        )
+      ) {
+        failAtomicAppend("All atomic results must use the same original image dimensions");
+      }
+      if (!imageEntity || imageEntity.rotation !== 0) {
+        failAtomicAppend("The current image entity must exist with zero rotation");
+      }
+
+      const imageDimensionsAreUninitialized =
+        !imageEntity.imageLoaded && imageEntity.naturalWidth === 1 && imageEntity.naturalHeight === 1;
+      if (
+        !imageDimensionsAreUninitialized &&
+        (imageEntity.naturalWidth !== firstResult.original_width ||
+          imageEntity.naturalHeight !== firstResult.original_height)
+      ) {
+        failAtomicAppend("Atomic result dimensions do not match the current image entity");
+      }
+
+      const trackedStateSnapshot = getSnapshot(self.trackedState);
+      const previousRegionCount = self.regions.length;
+      const previousResultCount = self.results.length;
+      const previousImageDimensions = {
+        width: imageEntity.naturalWidth,
+        height: imageEntity.naturalHeight,
+      };
+      let imageDimensionsChanged = false;
+
+      self.history.setSkipNextUndoState(false);
+      self.history.setReplaceNextUndoState(false);
+      self.history.freeze(ATOMIC_APPEND_FREEZE_KEY);
+
+      try {
+        if (imageDimensionsAreUninitialized) {
+          imageDimensionsChanged = true;
+          imageEntity.setNaturalWidth(firstResult.original_width);
+          imageEntity.setNaturalHeight(firstResult.original_height);
+        }
+
+        for (const result of results) {
+          self.deserializeSingleResult(
+            result,
+            (id) => self.areas.get(id),
+            (snapshot) => self.areas.put(snapshot),
+          );
+        }
+
+        self.updateObjects();
+
+        const appendedAreas = results.map((result) => self.areas.get(`${result.id}#${self.id}`));
+        const serializedResults = self.serialized.filter((result) => expectedIds.has(result.id));
+        const serializedById = new Map(serializedResults.map((result) => [result.id, result]));
+        const hasExactResults = appendedAreas.every(
+          (area, index) =>
+            area?.cleanId === results[index].id &&
+            area.results.length === 1 &&
+            area.results[0].type === "rectanglelabels" &&
+            matchesAtomicResult(serializedById.get(results[index].id), results[index]),
+        );
+
+        if (
+          !hasExactResults ||
+          serializedResults.length !== results.length ||
+          self.regions.length !== previousRegionCount + results.length ||
+          self.results.length !== previousResultCount + results.length
+        ) {
+          failAtomicAppend("Atomic result append postcondition failed");
+        }
+
+        self.history.unfreeze(ATOMIC_APPEND_FREEZE_KEY);
+
+        return appendedAreas;
+      } catch (error) {
+        let rollbackError;
+
+        try {
+          applySnapshot(self.trackedState, trackedStateSnapshot);
+          if (imageDimensionsChanged) {
+            imageEntity.setNaturalWidth(previousImageDimensions.width);
+            imageEntity.setNaturalHeight(previousImageDimensions.height);
+          }
+          self.updateObjects();
+        } catch (errorDuringRollback) {
+          rollbackError = errorDuringRollback;
+        } finally {
+          // Annotation actions batch MST snapshots until this outer action
+          // exits, so suppress the queued rollback snapshot as well.
+          self.history.abortFreeze(ATOMIC_APPEND_FREEZE_KEY, true);
+        }
+
+        if (rollbackError) {
+          throw new AtomicResultAppendError("Atomic result append failed and rollback could not be completed", {
+            cause: rollbackError,
+          });
+        }
+        if (error instanceof AtomicResultAppendError) throw error;
+
+        throw new AtomicResultAppendError("Atomic result append failed and was rolled back", { cause: error });
+      }
     },
 
     serializeAnnotation(options) {

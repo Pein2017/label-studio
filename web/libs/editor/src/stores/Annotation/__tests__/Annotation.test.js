@@ -13,13 +13,23 @@ jest.mock("keymaster", () => {
   return { __esModule: true, default: keymaster };
 });
 
+import { getSnapshot } from "mobx-state-tree";
 import "../../../tags/visual/View";
 import "../../../tags/object/RichText";
+import "../../../tags/object/Image";
+import "../../../tags/control/RectangleLabels";
 import Tree from "../../../core/Tree";
 import Registry from "../../../core/Registry";
 import AppStore from "../../AppStore";
 
 const MINIMAL_CONFIG = `<View><Text name="t1" value="$text" /></View>`;
+const IMAGE_CONFIG = `<View>
+  <Image name="image" value="$image" />
+  <RectangleLabels name="bbox" toName="image">
+    <Label value="person" />
+    <Label value="dog" />
+  </RectangleLabels>
+</View>`;
 
 const createTestEnv = () => ({
   events: {
@@ -52,7 +62,256 @@ function createStoreWithAnnotation(annotationSnapshot = {}) {
   return { store, annotation: ann, env };
 }
 
+function createImageStoreWithAnnotation(annotationSnapshot = {}) {
+  const env = createTestEnv();
+  const store = AppStore.create(
+    {
+      config: IMAGE_CONFIG,
+      task: { id: 1, data: JSON.stringify({ image: "https://example.test/image.jpg" }) },
+      interfaces: ["basic"],
+    },
+    env,
+  );
+  store.initializeStore({});
+  const annotation = store.annotationStore.addAnnotation({
+    result: [],
+    ...annotationSnapshot,
+  });
+
+  if (annotationSnapshot.result?.length) {
+    annotation.deserializeResults(annotationSnapshot.result);
+    annotation.updateObjects();
+    annotation.history.reinit();
+  }
+
+  return { store, annotation, env };
+}
+
+function rectangleResult(id, overrides = {}) {
+  const base = {
+    id,
+    type: "rectanglelabels",
+    from_name: "bbox",
+    to_name: "image",
+    original_width: 640,
+    original_height: 480,
+    image_rotation: 0,
+    value: {
+      x: 10,
+      y: 20,
+      width: 30,
+      height: 40,
+      rotation: 0,
+      rectanglelabels: ["person"],
+    },
+    meta: {
+      coordexp_region_key: id,
+    },
+  };
+
+  return {
+    ...base,
+    ...overrides,
+    value: { ...base.value, ...overrides.value },
+    meta: overrides.meta ?? base.meta,
+  };
+}
+
 describe("Annotation model", () => {
+  describe("atomic result append", () => {
+    it("appends all results as exactly one undo action without rewriting ids", () => {
+      const { annotation } = createImageStoreWithAnnotation();
+      const results = [rectangleResult("inferred:1"), rectangleResult("inferred:2", { value: { x: 50 } })];
+      const initialHistoryLength = annotation.history.history.length;
+      const initialUndoIdx = annotation.history.undoIdx;
+
+      const appended = annotation.appendResultsAtomically(results);
+
+      expect(appended.map((area) => area.cleanId)).toEqual(["inferred:1", "inferred:2"]);
+      expect(results.map((result) => result.id)).toEqual(["inferred:1", "inferred:2"]);
+      expect(annotation.regions.map((area) => area.cleanId)).toEqual(["inferred:1", "inferred:2"]);
+      expect(annotation.history.history).toHaveLength(initialHistoryLength + 1);
+      expect(annotation.history.undoIdx).toBe(initialUndoIdx + 1);
+
+      annotation.undo();
+      expect(annotation.regions).toHaveLength(0);
+      expect(annotation.history.canUndo).toBe(false);
+
+      annotation.redo();
+      expect(annotation.regions.map((area) => area.cleanId)).toEqual(["inferred:1", "inferred:2"]);
+    });
+
+    it("rejects duplicate input ids during preflight without mutation or history", () => {
+      const { annotation } = createImageStoreWithAnnotation();
+      const initialSnapshot = getSnapshot(annotation.trackedState);
+      const initialHistoryLength = annotation.history.history.length;
+      const deserializeSpy = jest.spyOn(annotation, "deserializeSingleResult");
+
+      expect(() =>
+        annotation.appendResultsAtomically([rectangleResult("duplicate"), rectangleResult("duplicate")]),
+      ).toThrow("Duplicate result id 'duplicate'");
+      expect(deserializeSpy).not.toHaveBeenCalled();
+      expect(getSnapshot(annotation.trackedState)).toEqual(initialSnapshot);
+      expect(annotation.history.history).toHaveLength(initialHistoryLength);
+    });
+
+    it.each([
+      ["no label", { value: { rectanglelabels: [] } }, "exactly one non-empty rectangle label"],
+      ["multiple labels", { value: { rectanglelabels: ["person", "dog"] } }, "exactly one non-empty rectangle label"],
+      ["unknown label", { value: { rectanglelabels: ["cat"] } }, "uses an unknown bbox label"],
+      ["non-object meta", { meta: [] }, "meta must be an ordinary JSON object"],
+    ])("rejects %s during full preflight", (_case, invalidOverride, expectedMessage) => {
+      const { annotation } = createImageStoreWithAnnotation();
+      const initialSnapshot = getSnapshot(annotation.trackedState);
+      const initialHistoryLength = annotation.history.history.length;
+      const deserializeSpy = jest.spyOn(annotation, "deserializeSingleResult");
+
+      expect(() =>
+        annotation.appendResultsAtomically([
+          rectangleResult("valid-first"),
+          rectangleResult("invalid-second", invalidOverride),
+        ]),
+      ).toThrow(expectedMessage);
+      expect(deserializeSpy).not.toHaveBeenCalled();
+      expect(getSnapshot(annotation.trackedState)).toEqual(initialSnapshot);
+      expect(annotation.history.history).toHaveLength(initialHistoryLength);
+    });
+
+    it("rejects an id that conflicts with the current annotation", () => {
+      const existing = rectangleResult("existing");
+      const { annotation } = createImageStoreWithAnnotation({ result: [existing] });
+      const initialSnapshot = getSnapshot(annotation.trackedState);
+      const initialHistoryLength = annotation.history.history.length;
+
+      expect(() => annotation.appendResultsAtomically([rectangleResult("existing")])).toThrow(
+        "Result id 'existing' conflicts with the current annotation",
+      );
+      expect(getSnapshot(annotation.trackedState)).toEqual(initialSnapshot);
+      expect(annotation.history.history).toHaveLength(initialHistoryLength);
+    });
+
+    it("rolls back the complete tracked result snapshot after a mid-insert exception", () => {
+      const existing = rectangleResult("existing", { meta: { retained: true } });
+      const { annotation } = createImageStoreWithAnnotation({ result: [existing] });
+      const initialSnapshot = getSnapshot(annotation.trackedState);
+      const initialHistoryLength = annotation.history.history.length;
+      const originalDeserialize = annotation.deserializeSingleResult;
+      let calls = 0;
+
+      jest.spyOn(annotation, "deserializeSingleResult").mockImplementation((...args) => {
+        calls += 1;
+        if (calls === 2) throw new Error("injected insert failure");
+        return originalDeserialize(...args);
+      });
+
+      let failure;
+      try {
+        annotation.appendResultsAtomically([rectangleResult("inferred:1"), rectangleResult("inferred:2")]);
+      } catch (error) {
+        failure = error;
+      }
+
+      expect(failure).toMatchObject({
+        name: "AtomicResultAppendError",
+        code: "COORDEXP_ATOMIC_RESULT_APPEND_FAILED",
+      });
+      expect(failure.cause?.message).toBe("injected insert failure");
+      expect(getSnapshot(annotation.trackedState)).toEqual(initialSnapshot);
+      expect(annotation.history.history).toHaveLength(initialHistoryLength);
+      expect(annotation.history.isFrozen).toBe(false);
+    });
+
+    it("rolls back when exact-id postconditions are not satisfied", () => {
+      const { annotation } = createImageStoreWithAnnotation();
+      const initialSnapshot = getSnapshot(annotation.trackedState);
+      const initialHistoryLength = annotation.history.history.length;
+      const originalDeserialize = annotation.deserializeSingleResult;
+      let calls = 0;
+
+      jest.spyOn(annotation, "deserializeSingleResult").mockImplementation((...args) => {
+        calls += 1;
+        if (calls === 2) return undefined;
+        return originalDeserialize(...args);
+      });
+
+      expect(() =>
+        annotation.appendResultsAtomically([rectangleResult("inferred:1"), rectangleResult("inferred:2")]),
+      ).toThrow("Atomic result append postcondition failed");
+      expect(getSnapshot(annotation.trackedState)).toEqual(initialSnapshot);
+      expect(annotation.history.history).toHaveLength(initialHistoryLength);
+      expect(annotation.history.isFrozen).toBe(false);
+    });
+
+    it("rolls back when serialized provenance differs from the requested result", () => {
+      const { annotation } = createImageStoreWithAnnotation();
+      const initialSnapshot = getSnapshot(annotation.trackedState);
+      const initialHistoryLength = annotation.history.history.length;
+      const originalDeserialize = annotation.deserializeSingleResult;
+
+      jest
+        .spyOn(annotation, "deserializeSingleResult")
+        .mockImplementation((result, ...args) =>
+          originalDeserialize({ ...result, meta: { silently: "changed" } }, ...args),
+        );
+
+      expect(() => annotation.appendResultsAtomically([rectangleResult("inferred:1")])).toThrow(
+        "Atomic result append postcondition failed",
+      );
+      expect(getSnapshot(annotation.trackedState)).toEqual(initialSnapshot);
+      expect(annotation.history.history).toHaveLength(initialHistoryLength);
+      expect(annotation.history.isFrozen).toBe(false);
+    });
+
+    it("preserves every result's meta through insertion and serialization", () => {
+      const { annotation } = createImageStoreWithAnnotation();
+      const results = [
+        rectangleResult("inferred:1", {
+          meta: {
+            coordexp_region_key: "inferred:1",
+            coordexp_inference_receipt_id: "receipt-1",
+            nested: { source: ["roi", 7] },
+          },
+        }),
+        rectangleResult("inferred:2", {
+          value: { x: 50, rectanglelabels: ["dog"] },
+          meta: {
+            coordexp_region_key: "inferred:2",
+            coordexp_inference_receipt_id: "receipt-2",
+            nested: { source: ["roi", 8] },
+          },
+        }),
+      ];
+
+      annotation.appendResultsAtomically(results);
+
+      for (const expected of results) {
+        expect(annotation.regions.find((area) => area.cleanId === expected.id)?.results[0].meta).toEqual(expected.meta);
+        expect(annotation.serialized.find((result) => result.id === expected.id)?.meta).toEqual(expected.meta);
+      }
+    });
+
+    it("fails fast on an empty array without adding history", () => {
+      const { annotation } = createImageStoreWithAnnotation();
+      const initialHistoryLength = annotation.history.history.length;
+
+      expect(() => annotation.appendResultsAtomically([])).toThrow("Results must be a non-empty array");
+      expect(annotation.regions).toHaveLength(0);
+      expect(annotation.history.history).toHaveLength(initialHistoryLength);
+      expect(annotation.history.isFrozen).toBe(false);
+    });
+
+    it("keeps the existing appendResults id-rewriting behavior", () => {
+      const { annotation } = createImageStoreWithAnnotation();
+      const result = rectangleResult("server-id");
+
+      annotation.appendResults([result]);
+
+      expect(result.id).not.toBe("server-id");
+      expect(annotation.regions).toHaveLength(1);
+      expect(annotation.regions[0].cleanId).toBe(result.id);
+    });
+  });
+
   describe("creation and snapshot", () => {
     it("creates annotation with default type and editable", () => {
       const { annotation } = createStoreWithAnnotation();

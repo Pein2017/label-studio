@@ -54,6 +54,22 @@ const TimeTraveller = types
         self.isFrozen = freezingLockSet.size > 0;
       },
 
+      abortFreeze(key, skipPendingSnapshot = false) {
+        if (!self.isFrozen || !freezingLockSet.has(key)) return false;
+
+        // A shared freeze has one pending-history flag, so aborting only one of
+        // several active locks would also discard another caller's changes.
+        if (freezingLockSet.size !== 1) return false;
+
+        freezingLockSet.delete(key);
+        self.isFrozen = false;
+        changesDuringFreeze = false;
+        replaceNextUndoState = false;
+        if (skipPendingSnapshot) self.skipNextUndoState = true;
+
+        return true;
+      },
+
       unfreeze(key) {
         self.safeUnfreeze(key);
         if (!self.isFrozen) {
