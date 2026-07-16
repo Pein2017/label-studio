@@ -7,6 +7,25 @@ const response = (status, payload) => ({
 });
 
 describe("CoordExpRefinementClient", () => {
+  it("binds the default browser fetch to its owning global receiver", async () => {
+    const originalFetch = Object.getOwnPropertyDescriptor(globalThis, "fetch");
+    const browserFetch = jest.fn(function () {
+      if (this !== globalThis) throw new TypeError("Illegal invocation");
+      return Promise.resolve(response(200, { version: 1, generation: 2 }));
+    });
+
+    Object.defineProperty(globalThis, "fetch", { configurable: true, writable: true, value: browserFetch });
+    try {
+      const client = new CoordExpRefinementClient(7);
+
+      await expect(client.projectState()).resolves.toEqual({ version: 1, generation: 2 });
+      expect(browserFetch.mock.instances).toEqual([globalThis]);
+    } finally {
+      if (originalFetch) Object.defineProperty(globalThis, "fetch", originalFetch);
+      else delete globalThis.fetch;
+    }
+  });
+
   it("uses the exact same-origin read endpoints", async () => {
     const fetchImpl = jest
       .fn()

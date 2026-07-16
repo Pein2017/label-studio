@@ -1,6 +1,7 @@
 import {
   buildVisualPolicy,
   expandedNeighbors,
+  frozenTargetStillCurrent,
   intersectionOverUnion,
   percentRoiToOriginalPixels,
   roiFromDrag,
@@ -241,6 +242,22 @@ describe("AI Region controller", () => {
     expect(() => validateAbandonResponse({}, { requestId: REQUEST_ID, reason: "user_cancelled" })).toThrow(
       /unsupported shape/,
     );
+  });
+
+  it("uses the canonical managed project identity and fails closed on a mismatch", () => {
+    const current = {
+      projectId: 7,
+      store: {
+        project: null,
+        task: { id: 17, dataObj: { coordexp_task_key: "train:42" } },
+      },
+      annotation: { id: 9, draftId: 5, draftSaved: "revision-2" },
+      selectedProfile: profile,
+      browserSemanticProjectionHash: "fnv1a32:abcd",
+    };
+
+    expect(frozenTargetStillCurrent(frozen, current)).toBe(true);
+    expect(frozenTargetStillCurrent(frozen, { ...current, projectId: 8 })).toBe(false);
   });
 
   it("accepts one exact produced payload and derives accepted_with_drops", () => {

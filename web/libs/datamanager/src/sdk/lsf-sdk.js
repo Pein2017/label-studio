@@ -217,6 +217,7 @@ export class LSFWrapper {
 
     this._managedDraftSaves = new Map();
     this._managedDraftBaselines = new Map();
+    this._managedAnnotationTaskIds = new WeakMap();
     this._managedLocalPendingDrafts = new Map();
     this._managedLocalSaveVersion = 0;
     this._managedPollSequence = 0;
@@ -383,13 +384,28 @@ export class LSFWrapper {
     }
   }
 
-  _managedAnnotationIdentity(annotation, task = this.task) {
+  _managedAnnotationTaskId(annotation) {
+    if (!annotation) return null;
+    return (
+      this._managedAnnotationTaskIds.get(annotation) ?? (annotation === this.currentAnnotation ? this.task?.id : null)
+    );
+  }
+
+  _bindManagedAnnotationTask(annotation, task = this.task) {
     if (!annotation || !task?.id) return null;
+    if (!this._managedAnnotationTaskIds.has(annotation)) this._managedAnnotationTaskIds.set(annotation, task.id);
+    return this._managedAnnotationTaskIds.get(annotation);
+  }
+
+  _managedAnnotationIdentity(annotation) {
+    const taskId = this._managedAnnotationTaskId(annotation);
+
+    if (!annotation || !taskId) return null;
 
     const annotationId = annotation.pk ?? annotation.id;
 
     if (!isDefined(annotationId)) return null;
-    return `${task.id}:${annotationId}`;
+    return `${taskId}:${annotationId}`;
   }
 
   _serializeManagedAnnotation(annotation) {
@@ -413,6 +429,7 @@ export class LSFWrapper {
   _initializeManagedDraftBaseline(annotation) {
     if (!this.isManagedRefinementProject || !annotation) return;
 
+    this._bindManagedAnnotationTask(annotation);
     const identity = this._managedAnnotationIdentity(annotation);
 
     if (!identity || this._managedDraftBaselines.has(identity)) return;
@@ -732,8 +749,10 @@ export class LSFWrapper {
   }
 
   _captureManagedSource(annotation = this.currentAnnotation) {
+    const taskId = this._managedAnnotationTaskId(annotation);
+
     return Object.freeze({
-      taskId: this.task?.id ?? null,
+      taskId,
       annotation,
       annotationIdentity: this._managedAnnotationIdentity(annotation),
       serializedHash: annotation ? stableHash(this._serializeManagedAnnotation(annotation)) : null,
@@ -844,6 +863,10 @@ export class LSFWrapper {
     if (this._managedCoordinatorDestroyed) return MANAGED_DRAFT_DETACHED_RESULT;
 
     const taskId = source.taskId;
+    const requestIdentity = Object.freeze({
+      draftId: annotation.draftId > 0 ? annotation.draftId : null,
+      annotationId: annotation.pk ?? null,
+    });
     const data = { body: this.prepareData(annotation, { isNewDraft: true }) };
     const requestParams = { ...params };
 
@@ -857,11 +880,6 @@ export class LSFWrapper {
       this._assertManagedSourceIdentity(source);
 
       let response;
-      const requestIdentity = Object.freeze({
-        draftId: annotation.draftId > 0 ? annotation.draftId : null,
-        annotationId: annotation.pk ?? null,
-      });
-
       if (requestIdentity.draftId !== null) {
         response = await this.datamanager.apiCall("updateDraft", { draftID: requestIdentity.draftId }, data);
       } else if (!annotation.pk) {
@@ -920,13 +938,10 @@ export class LSFWrapper {
     const seenProgress = new Set();
     let lastResult = null;
 
-    this._assertManagedSourceIdentity(source);
     annotation.setDraftSaving?.(true);
 
     try {
       for (let attempt = 0; attempt < MANAGED_DRAFT_MAX_SAVE_ATTEMPTS; attempt++) {
-        this._assertManagedSourceIdentity(source);
-
         const serializedResult = this._serializeManagedAnnotation(annotation);
         const semanticProjection = managedSemanticProjection(serializedResult);
         const browserSemanticHash = stableHash(semanticProjection);
@@ -936,6 +951,8 @@ export class LSFWrapper {
         const needsSave = force || baseline?.serialized !== serialized;
 
         if (!needsSave) return lastResult;
+
+        this._assertManagedSourceIdentity(source);
 
         if (seenProgress.has(progressKey)) {
           throw this._managedDraftError(
@@ -980,7 +997,12 @@ export class LSFWrapper {
 
     const inFlight = this._managedDraftSaves.get(identity);
 
-    if (inFlight) return inFlight;
+    if (inFlight) {
+      const hasPersistedParams = Object.keys(options.params ?? {}).some((key) => key !== "useToast");
+
+      if (hasPersistedParams) return inFlight.then(() => this._saveManagedDraft(annotation, options));
+      return inFlight;
+    }
 
     const operation = this._runManagedDraftSave(annotation, options).finally(() => {
       if (this._managedDraftSaves.get(identity) === operation) this._managedDraftSaves.delete(identity);
@@ -1058,6 +1080,8 @@ export class LSFWrapper {
       }
 
       const annotation = intent.sourceAnnotation ?? this.currentAnnotation;
+
+      annotation?.pauseAutosave?.();
       const source = this._captureManagedSource(annotation);
 
       this._assertManagedSourceIdentity(source);
@@ -1918,7 +1942,8 @@ export class LSFWrapper {
   onSubmitDraft = async (_studio, annotation, params = {}) => {
     if (this.isManagedRefinementProject) {
       const showToast = params?.useToast === true;
-      const result = await this._saveManagedDraft(annotation, { force: true, params });
+      const force = Object.keys(params ?? {}).some((key) => key !== "useToast");
+      const result = await this._saveManagedDraft(annotation, { force, params });
 
       if (showToast && result?.response) this.draftToast(result.status, result.response);
       return result?.response;
@@ -2145,6 +2170,11 @@ export class LSFWrapper {
   };
 
   _invokeSelectAnnotation = async (prevAnnotation, nextAnnotation, options) => {
+    if (this.isManagedRefinementProject) {
+      this._bindManagedAnnotationTask(prevAnnotation);
+      this._bindManagedAnnotationTask(nextAnnotation);
+    }
+
     if (this.isManagedRefinementProject && prevAnnotation && nextAnnotation && prevAnnotation !== nextAnnotation) {
       const annotationStore = this.lsf?.annotationStore;
       const sourceAnnotationIdentity = this._managedAnnotationIdentity(nextAnnotation);

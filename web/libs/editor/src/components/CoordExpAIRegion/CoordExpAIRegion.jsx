@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { observer } from "mobx-react";
 
 import { CoordExpRefinementClient, createBatchId } from "../../services/coordexp-refinement-api";
-import { useReadyDataManager } from "../../services/data-manager-ready";
+import { resolveOwnedDataManagerProject, useReadyDataManager } from "../../services/data-manager-ready";
 import {
   DEFAULT_CANVAS,
   buildVisualPolicy,
@@ -21,11 +21,11 @@ import {
 import "./CoordExpAIRegion.prefix.css";
 
 const errorText = (error) => error?.message || "ROI inference failed. Retry with the same region.";
+const defaultClientFactory = (projectId) => new CoordExpRefinementClient(projectId);
 
 export const resolveAIRegionDataManager = (store, candidate = globalThis.window?.dataManager) => {
-  if (!store || !candidate || candidate.lsf?.lsfInstance?.store !== store) return null;
-  if (candidate.lsf?.isManagedRefinementProject !== true) return null;
-  if (Number(candidate.projectId) !== Number(store.project?.id)) return null;
+  if (!resolveOwnedDataManagerProject(store, candidate)) return null;
+  if (candidate.lsf.task?.id !== store.task?.id) return null;
   return ["on", "off", "ensureDurableDraft", "setManagedRoiRunning", "getManagedStatusState"].every(
     (method) => typeof candidate[method] === "function",
   )
@@ -110,7 +110,7 @@ const applyVisualPolicy = (image, policy) => {
 
 export const CoordExpAIRegionMount = ({ store, image, annotation, candidate, clientFactory, requestIdFactory }) => {
   const dataManager = useReadyDataManager(store, candidate, resolveAIRegionDataManager);
-  const projectId = store?.project?.id;
+  const projectId = dataManager?.lsf?.project?.id;
   const taskId = store?.task?.id;
 
   if (
@@ -142,7 +142,7 @@ export const CoordExpAIRegion = observer(
     image,
     projectId,
     taskId,
-    clientFactory = (id) => new CoordExpRefinementClient(id),
+    clientFactory = defaultClientFactory,
     requestIdFactory = createBatchId,
   }) => {
     const client = useMemo(() => clientFactory(projectId), [clientFactory, projectId]);
@@ -157,7 +157,11 @@ export const CoordExpAIRegion = observer(
     const [message, setMessage] = useState(null);
     const [pendingSave, setPendingSave] = useState(null);
     const [conflictCount, setConflictCount] = useState(0);
-    const [managedStatus, setManagedStatus] = useState(() => dataManager.getManagedStatusState());
+    const [managedStatusState, setManagedStatusState] = useState(() => ({
+      owner: dataManager,
+      value: dataManager.getManagedStatusState(),
+    }));
+    const managedStatus = managedStatusState.owner === dataManager ? managedStatusState.value : null;
     const selectedProfile = profiles.find((profile) => profile.selector === profileSelector) ?? null;
     const resolution = validateCanvasResolution(selectedProfile, width, height);
     const running = state === "running" || state === "cancelling" || state === "saving";
@@ -170,9 +174,13 @@ export const CoordExpAIRegion = observer(
       let currentOwner = owner;
       const onStatus = (next) => {
         if (currentOwner !== owner) return;
-        setManagedStatus((current) => orderedManagedStatus(current, next));
+        setManagedStatusState((current) => ({
+          owner: dataManager,
+          value: orderedManagedStatus(current.owner === dataManager ? current.value : null, next),
+        }));
       };
 
+      setManagedStatusState({ owner: dataManager, value: dataManager.getManagedStatusState() });
       dataManager.on("managedStatusChanged", onStatus);
       return () => {
         currentOwner = null;
@@ -286,8 +294,9 @@ export const CoordExpAIRegion = observer(
       setConflictCount(visualPolicyConflictCount(policy));
     }, [annotation, image, retireInferencePresentations, taskId]);
 
-    useEffect(
-      () => () => {
+    useEffect(() => {
+      mounted.current = true;
+      return () => {
         mounted.current = false;
         const attempt = activeAttempt.current;
 
@@ -300,9 +309,8 @@ export const CoordExpAIRegion = observer(
         } catch {
           // The image model can already be detached during forced unload.
         }
-      },
-      [abandon, finishRuntimeLock],
-    );
+      };
+    }, [abandon, finishRuntimeLock]);
 
     const persistDraft = useCallback(
       async (savedAttempt, acceptedState) => {
@@ -440,6 +448,7 @@ export const CoordExpAIRegion = observer(
         }
         if (
           !frozenTargetStillCurrent(frozen, {
+            projectId,
             store,
             annotation,
             selectedProfile,
@@ -474,6 +483,7 @@ export const CoordExpAIRegion = observer(
           const policy = buildVisualPolicy([...byKey.values()], undefined, [...comparisonByKey.values()]);
           if (
             !frozenTargetStillCurrent(frozen, {
+              projectId,
               store,
               annotation,
               selectedProfile,

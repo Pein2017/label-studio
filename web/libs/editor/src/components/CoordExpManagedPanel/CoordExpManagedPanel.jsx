@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { CoordExpRefinementClient, createBatchId } from "../../services/coordexp-refinement-api";
-import { useReadyDataManager } from "../../services/data-manager-ready";
+import { resolveOwnedDataManagerProject, useReadyDataManager } from "../../services/data-manager-ready";
 import "./CoordExpManagedPanel.prefix.css";
 
 const ACTIVE_BATCH_STATES = new Set(["queued", "running", "reconciling"]);
@@ -150,10 +150,7 @@ const clearBatchId = (storage, projectId) => {
 };
 
 export const resolveManagedDataManager = (store, candidate = globalThis.window?.dataManager) => {
-  if (!store || !candidate) return null;
-  if (candidate.lsf?.lsfInstance?.store !== store) return null;
-  if (candidate.lsf?.isManagedRefinementProject !== true) return null;
-  if (!Number.isInteger(store.project?.id) || Number(candidate.projectId) !== store.project.id) return null;
+  if (!resolveOwnedDataManagerProject(store, candidate)) return null;
 
   const requiredMethods = [
     "on",
@@ -171,10 +168,11 @@ export const CoordExpManagedPanelMount = ({ store, candidate, clientFactory, pol
   const dataManager = useReadyDataManager(store, candidate, resolveManagedDataManager);
 
   if (!dataManager) return null;
+  const projectId = dataManager.lsf.project.id;
 
   return (
     <CoordExpManagedPanel
-      projectId={store.project.id}
+      projectId={projectId}
       dataManager={dataManager}
       clientFactory={clientFactory}
       pollIntervalMs={pollIntervalMs}
@@ -193,9 +191,15 @@ export const CoordExpManagedPanel = ({
 }) => {
   const client = useMemo(() => clientFactory(projectId), [clientFactory, projectId]);
   const mounted = useRef(true);
+  const dataManagerOwner = useRef(dataManager);
+  dataManagerOwner.current = dataManager;
   const pollOwner = useRef(null);
-  const commitAbort = useRef(null);
-  const [status, setStatus] = useState(() => dataManager.getManagedStatusState?.() ?? null);
+  const commitOwner = useRef(null);
+  const [statusState, setStatusState] = useState(() => ({
+    owner: dataManager,
+    value: dataManager.getManagedStatusState?.() ?? null,
+  }));
+  const status = statusState.owner === dataManager ? statusState.value : null;
   const [receipt, setReceipt] = useState(() => {
     const batchId = readBatchId(batchStorage, projectId);
     return batchId ? { batch_id: batchId, status: "reconciling", _origin: "storage" } : null;
@@ -205,16 +209,19 @@ export const CoordExpManagedPanel = ({
   const [operationError, setOperationError] = useState(null);
   const [enqueueing, setEnqueueing] = useState(false);
 
-  const updateStatus = useCallback((next) => {
-    if (!mounted.current || !next) return;
-    setStatus(next);
-    setReminder((current) => {
-      if (!current) return current;
-      const pendingDraftCount = Number(next.pendingDraftCount);
-      if (Number.isInteger(pendingDraftCount) && pendingDraftCount <= 0) return null;
-      return Number.isInteger(pendingDraftCount) ? { ...current, pendingDraftCount } : current;
-    });
-  }, []);
+  const updateStatus = useCallback(
+    (next) => {
+      if (!mounted.current || dataManagerOwner.current !== dataManager || !next) return;
+      setStatusState({ owner: dataManager, value: next });
+      setReminder((current) => {
+        if (!current) return current;
+        const pendingDraftCount = Number(next.pendingDraftCount);
+        if (Number.isInteger(pendingDraftCount) && pendingDraftCount <= 0) return null;
+        return Number.isInteger(pendingDraftCount) ? { ...current, pendingDraftCount } : current;
+      });
+    },
+    [dataManager],
+  );
 
   const refreshProjectState = useCallback(
     async (signal) => {
@@ -235,9 +242,11 @@ export const CoordExpManagedPanel = ({
 
   useEffect(() => {
     mounted.current = true;
+    setReminder(null);
+    updateStatus(dataManager.getManagedStatusState?.());
     const onStatus = (next) => updateStatus(next);
     const onReminder = (next) => {
-      if (!mounted.current) return;
+      if (!mounted.current || dataManagerOwner.current !== dataManager) return;
       const pendingDraftCount = Number(next?.pendingDraftCount);
       setReminder(Number.isInteger(pendingDraftCount) && pendingDraftCount > 0 ? { ...next, pendingDraftCount } : null);
     };
@@ -332,13 +341,18 @@ export const CoordExpManagedPanel = ({
     status?.activeBatchId,
   ]);
 
-  useEffect(
-    () => () => {
-      commitAbort.current?.abort();
-      commitAbort.current = null;
-    },
-    [],
-  );
+  useEffect(() => {
+    setEnqueueing(false);
+
+    return () => {
+      const active = commitOwner.current;
+
+      if (active?.dataManager === dataManager && active.client === client && active.projectId === projectId) {
+        active.controller.abort();
+        commitOwner.current = null;
+      }
+    };
+  }, [client, dataManager, projectId]);
 
   const local = status?.local ?? {};
   const { active: activeBatch, terminal: terminalBatch } = resolveBatchLayers(status, receipt);
@@ -361,24 +375,31 @@ export const CoordExpManagedPanel = ({
   const commit = async () => {
     if (commitDisabled) return;
     const controller = new AbortController();
+    const owner = { client, controller, dataManager, projectId };
+    const isCurrentOwner = () =>
+      mounted.current &&
+      dataManagerOwner.current === dataManager &&
+      commitOwner.current === owner &&
+      !controller.signal.aborted;
 
-    commitAbort.current?.abort();
-    commitAbort.current = controller;
+    commitOwner.current?.controller.abort();
+    commitOwner.current = owner;
     setEnqueueing(true);
     setOperationError(null);
     try {
       await dataManager.ensureDurableDraft();
+      if (!isCurrentOwner()) return;
+
       const batchId = batchIdFactory();
       writeBatchId(batchStorage, projectId, batchId);
       const accepted = await client.commit(batchId, controller.signal);
+      if (!isCurrentOwner()) return;
 
-      if (mounted.current) {
-        setReceipt({ ...accepted.payload, _origin: "commit" });
-        writeBatchId(batchStorage, projectId, accepted.payload?.batch_id);
-        setReminder(null);
-      }
+      setReceipt({ ...accepted.payload, _origin: "commit" });
+      writeBatchId(batchStorage, projectId, accepted.payload?.batch_id);
+      setReminder(null);
     } catch (error) {
-      if (mounted.current && error?.name !== "AbortError") {
+      if (isCurrentOwner() && error?.name !== "AbortError") {
         if (error?.outcomeUnknown === true) {
           const batchId = readBatchId(batchStorage, projectId);
           if (batchId) setReceipt({ batch_id: batchId, status: "reconciling", _origin: "commit-unknown" });
@@ -389,8 +410,10 @@ export const CoordExpManagedPanel = ({
         }
       }
     } finally {
-      if (mounted.current) setEnqueueing(false);
-      if (commitAbort.current === controller) commitAbort.current = null;
+      if (commitOwner.current === owner) {
+        commitOwner.current = null;
+        if (mounted.current && dataManagerOwner.current === dataManager) setEnqueueing(false);
+      }
     }
   };
 

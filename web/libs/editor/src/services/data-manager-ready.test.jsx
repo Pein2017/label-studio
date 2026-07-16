@@ -1,9 +1,33 @@
 import { act, render, screen } from "@testing-library/react";
 
-import { DATA_MANAGER_READY_EVENT, initializeOwnedDataManager, useReadyDataManager } from "./data-manager-ready";
+import {
+  DATA_MANAGER_READY_EVENT,
+  initializeOwnedDataManager,
+  resolveOwnedDataManagerProject,
+  useReadyDataManager,
+} from "./data-manager-ready";
 
 const resolver = (store, candidate) => (candidate?.store === store ? candidate : null);
-const manager = (store, id) => ({ id, store });
+const manager = (store, id, projectId = 7) => ({ id, store, lsf: { project: { id: projectId } } });
+
+const ownedManager = (editorStore, projectId = 7) => {
+  const project = { id: projectId };
+  const ownerStore = { project };
+  const candidate = {
+    projectId,
+    store: ownerStore,
+    lsf: {
+      datamanager: null,
+      store: ownerStore,
+      project,
+      lsfInstance: { store: editorStore },
+      isManagedRefinementProject: true,
+    },
+  };
+
+  candidate.lsf.datamanager = candidate;
+  return candidate;
+};
 
 const Harness = ({ store, candidate }) => {
   const dataManager = useReadyDataManager(store, candidate, resolver);
@@ -134,6 +158,45 @@ describe("initializeOwnedDataManager", () => {
   });
 });
 
+describe("resolveOwnedDataManagerProject", () => {
+  it("returns the exact owning project when the editor store has no project", () => {
+    const editorStore = { project: null };
+    const candidate = ownedManager(editorStore);
+
+    expect(resolveOwnedDataManagerProject(editorStore, candidate)).toBe(candidate.store.project);
+  });
+
+  it.each([
+    ["candidate back-reference", (candidate) => (candidate.lsf.datamanager = {})],
+    ["owner-store back-reference", (candidate) => (candidate.lsf.store = { project: candidate.lsf.project })],
+    ["editor-store identity", (candidate) => (candidate.lsf.lsfInstance.store = { project: null })],
+    ["canonical project object", (candidate) => (candidate.lsf.project = { id: 7 })],
+    ["managed marker", (candidate) => (candidate.lsf.isManagedRefinementProject = false)],
+    ["candidate project id", (candidate) => (candidate.projectId = 8)],
+    [
+      "positive project id",
+      (candidate) => {
+        candidate.projectId = 0;
+        candidate.store.project.id = 0;
+      },
+    ],
+    [
+      "safe project id",
+      (candidate) => {
+        candidate.projectId = Number.MAX_SAFE_INTEGER + 1;
+        candidate.store.project.id = Number.MAX_SAFE_INTEGER + 1;
+      },
+    ],
+  ])("rejects a mismatched %s", (_name, mutate) => {
+    const editorStore = { project: null };
+    const candidate = ownedManager(editorStore);
+
+    mutate(candidate);
+
+    expect(resolveOwnedDataManagerProject(editorStore, candidate)).toBeNull();
+  });
+});
+
 describe("useReadyDataManager", () => {
   afterEach(() => {
     delete window.dataManager;
@@ -141,7 +204,7 @@ describe("useReadyDataManager", () => {
   });
 
   it("seeds from an event published before mount and reacts after an initial null render", () => {
-    const store = { project: { id: 7 } };
+    const store = { project: null };
     const first = manager(store, "first");
 
     publish(first);
@@ -159,8 +222,8 @@ describe("useReadyDataManager", () => {
   });
 
   it("ignores malformed, stale, and other-store events", () => {
-    const store = { project: { id: 7 } };
-    const otherStore = { project: { id: 7 } };
+    const store = { project: null };
+    const otherStore = { project: null };
 
     publish(null);
     render(<Harness store={store} />);
@@ -181,7 +244,7 @@ describe("useReadyDataManager", () => {
   });
 
   it("preserves explicit candidate precedence without subscribing to global readiness", () => {
-    const store = { project: { id: 7 } };
+    const store = { project: null };
     const explicit = manager(store, "explicit");
     const addEventListener = jest.spyOn(window, "addEventListener");
 
@@ -195,7 +258,7 @@ describe("useReadyDataManager", () => {
   });
 
   it("removes the exact readiness listener on unmount", () => {
-    const store = { project: { id: 7 } };
+    const store = { project: null };
     const addEventListener = jest.spyOn(window, "addEventListener");
     const removeEventListener = jest.spyOn(window, "removeEventListener");
     const { unmount } = render(<Harness store={store} />);
@@ -207,8 +270,8 @@ describe("useReadyDataManager", () => {
   });
 
   it("replaces a manager and resets across store and project transitions", () => {
-    const storeA = { project: { id: 7 } };
-    const storeB = { project: { id: 8 } };
+    const storeA = { project: null };
+    const storeB = { project: null };
 
     publish(null);
     const { rerender } = render(<Harness store={storeA} />);
@@ -222,7 +285,18 @@ describe("useReadyDataManager", () => {
     rerender(<Harness store={storeB} />);
     expect(screen.queryByTestId("manager")).not.toBeInTheDocument();
 
-    act(() => publish(manager(storeB, "b")));
+    act(() => publish(manager(storeB, "b", 8)));
     expect(screen.getByTestId("manager")).toHaveTextContent("b");
+  });
+
+  it("replaces the exact-store manager when the owning candidate project changes", () => {
+    const store = { project: null };
+
+    publish(manager(store, "project-7", 7));
+    render(<Harness store={store} />);
+    expect(screen.getByTestId("manager")).toHaveTextContent("project-7");
+
+    act(() => publish(manager(store, "project-8", 8)));
+    expect(screen.getByTestId("manager")).toHaveTextContent("project-8");
   });
 });

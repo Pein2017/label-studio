@@ -1,4 +1,4 @@
-import { destroy } from "mobx-state-tree";
+import { destroy, types } from "mobx-state-tree";
 
 let AppStore;
 let Modal;
@@ -27,11 +27,13 @@ jest.mock("./DataStores", () => ({}));
 
 const deferred = () => {
   let resolve;
-  const promise = new Promise((promiseResolve) => {
+  let reject;
+  const promise = new Promise((promiseResolve, promiseReject) => {
     resolve = promiseResolve;
+    reject = promiseReject;
   });
 
-  return { promise, resolve };
+  return { promise, reject, resolve };
 };
 
 const makeStore = ({ managed = true } = {}) => {
@@ -66,6 +68,52 @@ const makeStore = ({ managed = true } = {}) => {
   store._sdk = sdk;
   store.installManagedHistoryTracking();
   return { gate, getGuardedAction: () => guardedAction, lsf, sdk, store };
+};
+
+const makeTaskInitializationStore = () => {
+  const firstInitialization = deferred();
+  const selectedInitialization = deferred();
+  const annotation = { id: "local-77", pk: "77", type: "annotation" };
+  const task = { id: 11 };
+  const taskStore = {
+    selected: task,
+    setSelected: jest.fn(),
+    loadTask: jest.fn(async () => task),
+  };
+  const annotationStore = {
+    selected: null,
+    setSelected: jest.fn(),
+  };
+  const editorAnnotationStore = {
+    annotations: [annotation],
+    predictions: [],
+    toggleViewingAllAnnotations: jest.fn(),
+    viewingAll: false,
+  };
+  const lsf = {
+    coordinateManagedNavigation: jest.fn((action) => action()),
+    currentAnnotation: annotation,
+    isManagedRefinementProject: true,
+    lsf: { annotationStore: editorAnnotationStore },
+    setLSFTask: jest
+      .fn()
+      .mockImplementationOnce(() => firstInitialization.promise)
+      .mockImplementationOnce(() => selectedInitialization.promise),
+  };
+  const sdk = { lsf, setMode: jest.fn() };
+  const HarnessStore = types.compose(
+    AppStore,
+    types.model("ManagedTaskInitializationHarness").volatile(() => ({ annotationStore, taskStore })),
+  );
+  const store = HarnessStore.create({
+    toolbar: "",
+    interfaces: {},
+    viewsStore: { views: [{ tabKey: "main" }] },
+    project: { config_has_control_tags: true },
+  });
+
+  store._sdk = sdk;
+  return { annotation, editorAnnotationStore, firstInitialization, lsf, selectedInitialization, store, task };
 };
 
 const replaceEntryWithoutTracking = (store, state, href) => {
@@ -129,6 +177,98 @@ afterEach(() => {
 });
 
 describe("AppStore managed navigation wiring", () => {
+  it("keeps task navigation pending until both editor task initializations finish", async () => {
+    jest.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      callback(0);
+      return 1;
+    });
+    const { annotation, firstInitialization, lsf, selectedInitialization, store, task } = makeTaskInitializationStore();
+    const row = { id: annotation.pk, isSelected: false, task_id: task.id };
+    const navigation = store.startLabeling(row);
+    let settled = false;
+
+    navigation.then(() => {
+      settled = true;
+    });
+
+    try {
+      for (let attempt = 0; attempt < 10 && lsf.setLSFTask.mock.calls.length < 1; attempt++) {
+        await Promise.resolve();
+      }
+
+      expect(lsf.setLSFTask).toHaveBeenCalledTimes(1);
+      expect(lsf.setLSFTask).toHaveBeenNthCalledWith(1, task, annotation.pk);
+      expect(lsf.coordinateManagedNavigation).toHaveBeenCalledWith(expect.any(Function), {
+        intentKey: `row:${task.id}:annotation:${annotation.pk}`,
+        reason: "row-click",
+      });
+      expect(store.loadingData).toBe(true);
+      expect(settled).toBe(false);
+
+      firstInitialization.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(lsf.setLSFTask).toHaveBeenCalledTimes(2);
+      expect(lsf.setLSFTask).toHaveBeenNthCalledWith(2, task, annotation.pk, undefined, false);
+      expect(store.loadingData).toBe(true);
+      expect(settled).toBe(false);
+
+      selectedInitialization.resolve();
+      await navigation;
+
+      expect(store.loadingData).toBe(false);
+      expect(settled).toBe(true);
+    } finally {
+      firstInitialization.resolve();
+      selectedInitialization.resolve();
+      await navigation;
+      destroy(store);
+    }
+  });
+
+  it.each([
+    ["initial task", "firstInitialization", 1],
+    ["URL-selected annotation", "selectedInitialization", 2],
+  ])("clears task loading when %s initialization rejects", async (_name, rejectedGate, expectedCalls) => {
+    jest.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      callback(0);
+      return 1;
+    });
+    const { annotation, editorAnnotationStore, firstInitialization, lsf, selectedInitialization, store, task } =
+      makeTaskInitializationStore();
+    const failure = new Error(`${rejectedGate} failed`);
+    const row = { id: annotation.pk, isSelected: false, task_id: task.id };
+    const navigation = store.startLabeling(row, { interface: "annotations:view-all" });
+    const outcome = navigation.catch((error) => error);
+
+    try {
+      for (let attempt = 0; attempt < 10 && lsf.setLSFTask.mock.calls.length < 1; attempt++) {
+        await Promise.resolve();
+      }
+      if (rejectedGate === "selectedInitialization") {
+        firstInitialization.resolve();
+        for (let attempt = 0; attempt < 10 && lsf.setLSFTask.mock.calls.length < 2; attempt++) {
+          await Promise.resolve();
+        }
+      }
+
+      const gate = rejectedGate === "firstInitialization" ? firstInitialization : selectedInitialization;
+
+      gate.reject(failure);
+
+      expect(await outcome).toBe(failure);
+      expect(lsf.setLSFTask).toHaveBeenCalledTimes(expectedCalls);
+      expect(store.loadingData).toBe(false);
+      expect(editorAnnotationStore.toggleViewingAllAnnotations).not.toHaveBeenCalled();
+    } finally {
+      firstInitialization.resolve();
+      selectedInitialization.resolve();
+      await navigation.catch(() => {});
+      destroy(store);
+    }
+  });
+
   it("defers editor close until the shared coordinator succeeds", async () => {
     const { gate, lsf, sdk, store } = makeStore();
 

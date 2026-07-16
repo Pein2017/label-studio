@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
-import { CoordExpManagedPanel, CoordExpManagedPanelMount } from "./CoordExpManagedPanel";
+import { CoordExpManagedPanel, CoordExpManagedPanelMount, resolveManagedDataManager } from "./CoordExpManagedPanel";
 import { CoordExpHttpError } from "../../services/coordexp-refinement-api";
 import { DATA_MANAGER_READY_EVENT } from "../../services/data-manager-ready";
 
@@ -35,10 +35,20 @@ const makeStatus = (overrides = {}) => ({
 
 const makeDataManager = (initialStatus = makeStatus()) => {
   const listeners = new Map();
+  const project = { id: 7 };
+  const ownerStore = { project };
   let status = initialStatus;
   const dataManager = {
     projectId: 7,
-    lsf: { isManagedRefinementProject: true, lsfInstance: { store: null }, task: { id: 11 } },
+    store: ownerStore,
+    lsf: {
+      datamanager: null,
+      store: ownerStore,
+      project,
+      isManagedRefinementProject: true,
+      lsfInstance: { store: null },
+      task: { id: 11 },
+    },
     on: jest.fn((name, callback) => {
       const values = listeners.get(name) ?? new Set();
 
@@ -66,6 +76,17 @@ const makeDataManager = (initialStatus = makeStatus()) => {
     getManagedStatusState: jest.fn(() => status),
   };
 
+  dataManager.lsf.datamanager = dataManager;
+
+  return dataManager;
+};
+
+const setDataManagerProject = (dataManager, projectId) => {
+  const project = { id: projectId };
+
+  dataManager.projectId = projectId;
+  dataManager.store.project = project;
+  dataManager.lsf.project = project;
   return dataManager;
 };
 
@@ -111,6 +132,114 @@ const renderPanel = ({ dataManager = makeDataManager(), client = makeClient(), .
 };
 
 describe("CoordExpManagedPanel", () => {
+  it("immediately adopts a same-project replacement manager and ignores the retired owner", async () => {
+    const oldManager = makeDataManager(makeStatus({ pendingDraftCount: 2, taskSemanticState: "Draft" }));
+    const newManager = makeDataManager(makeStatus({ pendingDraftCount: 0, taskSemanticState: "Committed" }));
+    const client = makeClient();
+    const clientFactory = jest.fn(() => client);
+    const batchStorage = makeStorage();
+    const view = render(
+      <CoordExpManagedPanel
+        projectId={7}
+        dataManager={oldManager}
+        clientFactory={clientFactory}
+        pollIntervalMs={60_000}
+        batchStorage={batchStorage}
+      />,
+    );
+    const retiredStatusHandler = oldManager.on.mock.calls.find(([name]) => name === "managedStatusChanged")?.[1];
+
+    expect(screen.getByText("Pending Drafts: 2")).toBeInTheDocument();
+    expect(screen.getByText("Draft")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Commit Drafts" })).toBeEnabled();
+    expect(retiredStatusHandler).toEqual(expect.any(Function));
+
+    view.rerender(
+      <CoordExpManagedPanel
+        projectId={7}
+        dataManager={newManager}
+        clientFactory={clientFactory}
+        pollIntervalMs={60_000}
+        batchStorage={batchStorage}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByText("Pending Drafts: 0")).toBeInTheDocument());
+    expect(screen.getByText("Committed")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Commit Drafts" })).toBeDisabled();
+
+    act(() => retiredStatusHandler(makeStatus({ pendingDraftCount: 5, taskSemanticState: "Draft" })));
+    expect(screen.getByText("Pending Drafts: 0")).toBeInTheDocument();
+    expect(screen.getByText("Committed")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Commit Drafts" })).toBeDisabled();
+
+    act(() => newManager.emit("managedStatusChanged", makeStatus({ pendingDraftCount: 1 })));
+    expect(screen.getByText("Pending Drafts: 1")).toBeInTheDocument();
+    expect(screen.getByText("Draft")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Commit Drafts" })).toBeEnabled();
+  });
+
+  it("retires a pending old-owner commit and lets the replacement owner commit", async () => {
+    let resolveOldDraft;
+    const oldManager = makeDataManager();
+    const newManager = makeDataManager();
+    const client = makeClient();
+    const clientFactory = jest.fn(() => client);
+    const batchIdFactory = jest.fn(() => ACTIVE_BATCH_ID);
+    const batchStorage = makeStorage();
+
+    oldManager.ensureDurableDraft.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveOldDraft = resolve;
+        }),
+    );
+
+    const view = render(
+      <CoordExpManagedPanel
+        projectId={7}
+        dataManager={oldManager}
+        clientFactory={clientFactory}
+        pollIntervalMs={60_000}
+        batchIdFactory={batchIdFactory}
+        batchStorage={batchStorage}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Commit Drafts" }));
+    await waitFor(() => expect(oldManager.ensureDurableDraft).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole("button", { name: "Saving and queueing…" })).toBeDisabled();
+
+    view.rerender(
+      <CoordExpManagedPanel
+        projectId={7}
+        dataManager={newManager}
+        clientFactory={clientFactory}
+        pollIntervalMs={60_000}
+        batchIdFactory={batchIdFactory}
+        batchStorage={batchStorage}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Commit Drafts" })).toBeEnabled();
+
+    await act(async () => {
+      resolveOldDraft({ draft_id: 10 });
+      await Promise.resolve();
+    });
+
+    expect(client.commit).not.toHaveBeenCalled();
+    expect(batchIdFactory).not.toHaveBeenCalled();
+    expect(batchStorage.setItem).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Batch queued durably/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Commit Drafts" })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Commit Drafts" }));
+    await waitFor(() => expect(newManager.ensureDurableDraft).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(client.commit).toHaveBeenCalledTimes(1));
+    expect(batchIdFactory).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText(/Batch queued durably/)).toBeInTheDocument();
+  });
+
   it("subscribes, updates the post-navigation reminder, and removes exact handlers", async () => {
     const { dataManager, unmount } = renderPanel();
 
@@ -436,22 +565,40 @@ describe("CoordExpManagedPanelMount", () => {
     jest.restoreAllMocks();
   });
 
-  it("mounts only for the identity-matched managed wrapper", async () => {
-    const store = { project: { id: 7 } };
+  it.each([
+    ["candidate back-reference", (dataManager) => (dataManager.lsf.datamanager = {})],
+    ["owner-store back-reference", (dataManager) => (dataManager.lsf.store = { project: dataManager.lsf.project })],
+    ["canonical project object", (dataManager) => (dataManager.lsf.project = { id: 7 })],
+    ["positive project id", (dataManager) => setDataManagerProject(dataManager, 0)],
+    ["safe project id", (dataManager) => setDataManagerProject(dataManager, Number.MAX_SAFE_INTEGER + 1)],
+  ])("rejects a mismatched %s", (_name, mutate) => {
+    const store = { project: null };
     const dataManager = makeDataManager();
+
+    dataManager.lsf.lsfInstance.store = store;
+    mutate(dataManager);
+
+    expect(resolveManagedDataManager(store, dataManager)).toBeNull();
+  });
+
+  it("mounts only for the identity-matched managed wrapper", async () => {
+    const store = { project: null };
+    const dataManager = makeDataManager();
+    const clientFactory = jest.fn(() => makeClient());
 
     dataManager.lsf.lsfInstance.store = store;
     render(
       <CoordExpManagedPanelMount
         store={store}
         candidate={dataManager}
-        clientFactory={() => makeClient()}
+        clientFactory={clientFactory}
         pollIntervalMs={60_000}
         batchStorage={makeStorage()}
       />,
     );
 
     expect(screen.getByRole("complementary", { name: "CoordExp refinement status" })).toBeInTheDocument();
+    expect(clientFactory).toHaveBeenCalledWith(7);
   });
 
   it("renders nothing for an ordinary or mismatched project", () => {
@@ -470,10 +617,15 @@ describe("CoordExpManagedPanelMount", () => {
     dataManager.projectId = 9;
     rerender(<CoordExpManagedPanelMount store={store} candidate={dataManager} clientFactory={() => makeClient()} />);
     expect(container).toBeEmptyDOMElement();
+
+    dataManager.projectId = 7;
+    dataManager.lsf.project = { id: 9 };
+    rerender(<CoordExpManagedPanelMount store={store} candidate={dataManager} clientFactory={() => makeClient()} />);
+    expect(container).toBeEmptyDOMElement();
   });
 
   it("mounts from readiness both before mount and after an initial null render", async () => {
-    const store = { project: { id: 7 } };
+    const store = { project: null };
     const dataManager = makeDataManager();
 
     dataManager.lsf.lsfInstance.store = store;
@@ -505,8 +657,8 @@ describe("CoordExpManagedPanelMount", () => {
   });
 
   it("ignores malformed and other-store readiness events", () => {
-    const store = { project: { id: 7 } };
-    const otherStore = { project: { id: 7 } };
+    const store = { project: null };
+    const otherStore = { project: null };
     const otherManager = makeDataManager();
     const dataManager = makeDataManager();
 
@@ -524,7 +676,7 @@ describe("CoordExpManagedPanelMount", () => {
   });
 
   it("keeps explicit candidate precedence and removes the exact readiness listener", () => {
-    const store = { project: { id: 7 } };
+    const store = { project: null };
     const explicit = makeDataManager();
     const globalManager = makeDataManager();
     const addEventListener = jest.spyOn(window, "addEventListener");
@@ -551,15 +703,15 @@ describe("CoordExpManagedPanelMount", () => {
   });
 
   it("replaces the mounted manager and resets across a project-store transition", () => {
-    const storeA = { project: { id: 7 } };
-    const storeB = { project: { id: 8 } };
+    const storeA = { project: null };
+    const storeB = { project: null };
     const managerA1 = makeDataManager();
     const managerA2 = makeDataManager();
     const managerB = makeDataManager();
 
     managerA1.lsf.lsfInstance.store = storeA;
     managerA2.lsf.lsfInstance.store = storeA;
-    managerB.projectId = 8;
+    setDataManagerProject(managerB, 8);
     managerB.lsf.lsfInstance.store = storeB;
     publish(managerA1);
     const { container, rerender } = render(

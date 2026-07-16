@@ -239,6 +239,48 @@ describe("strict managed Draft responses", () => {
     wrapper.destroy();
   });
 
+  it("persists non-toast Draft parameters even when the managed annotation is semantically clean", async () => {
+    const { annotation, datamanager, wrapper } = makeHarness();
+
+    datamanager.apiCall.mockResolvedValue(draftResponse());
+
+    await expect(wrapper.onSubmitDraft(null, annotation, { was_postponed: true })).resolves.toMatchObject({ id: 501 });
+    expect(datamanager.apiCall).toHaveBeenCalledWith(
+      "createDraftForAnnotation",
+      { taskID: 10, annotationID: "77" },
+      expect.objectContaining({ body: expect.objectContaining({ was_postponed: true }) }),
+    );
+    wrapper.destroy();
+  });
+
+  it("queues persisted Draft parameters behind an in-flight save instead of dropping them", async () => {
+    const { annotation, datamanager, wrapper } = makeHarness();
+    const firstRequest = deferred();
+
+    annotation.replaceResult([{ id: "autosave-in-flight" }]);
+    datamanager.apiCall
+      .mockImplementationOnce(() => firstRequest.promise)
+      .mockResolvedValueOnce(draftResponse({ id: 501, status: 200 }));
+
+    const autosave = wrapper.saveDraft();
+    const postpone = wrapper.onSubmitDraft(null, annotation, { was_postponed: true });
+
+    await Promise.resolve();
+    expect(datamanager.apiCall).toHaveBeenCalledTimes(1);
+    firstRequest.resolve(draftResponse());
+
+    await expect(autosave).resolves.toMatchObject({ id: 501 });
+    await expect(postpone).resolves.toMatchObject({ id: 501 });
+    expect(datamanager.apiCall).toHaveBeenCalledTimes(2);
+    expect(datamanager.apiCall).toHaveBeenNthCalledWith(
+      2,
+      "updateDraft",
+      { draftID: 501 },
+      expect.objectContaining({ body: expect.objectContaining({ was_postponed: true }) }),
+    );
+    wrapper.destroy();
+  });
+
   it("creates and strictly receipts a Draft for an existing Annotation", async () => {
     const { annotation, datamanager, wrapper } = makeHarness();
 
@@ -393,6 +435,73 @@ describe("strict managed Draft responses", () => {
     wrapper.destroy();
   });
 
+  it("awaits the current-task PATCH and ignores its clean delayed autosave after navigation", async () => {
+    const annotationB = makeAnnotation({ draftId: 44 });
+    const annotationA = makeAnnotation({ pk: "88", id: "local-88" });
+    const { annotationStore, datamanager, wrapper } = makeHarness({ annotation: annotationB, taskId: 10 });
+    const patch = deferred();
+
+    annotationB.replaceResult([{ id: "task-b-edit" }]);
+    datamanager.apiCall.mockImplementation(() => patch.promise);
+
+    const autosave = wrapper.onSubmitDraft(null, annotationB);
+
+    await Promise.resolve();
+    expect(datamanager.apiCall).toHaveBeenCalledWith(
+      "updateDraft",
+      { draftID: 44 },
+      expect.objectContaining({ body: expect.objectContaining({ result: [{ id: "task-b-edit" }] }) }),
+    );
+
+    const action = jest.fn(() => {
+      wrapper.task = { ...wrapper.task, id: 11, drafts: [] };
+      annotationStore.annotations.push(annotationA);
+      annotationStore.selected = annotationA;
+      wrapper._initializeManagedDraftBaselines();
+      return "navigated";
+    });
+    const navigation = wrapper.coordinateManagedNavigation(action, {
+      intentKey: "row:11:annotation:88",
+      reason: "row-click",
+    });
+
+    await Promise.resolve();
+    expect(action).not.toHaveBeenCalled();
+
+    patch.resolve(draftResponse({ id: 44, status: 200, task: 10, annotation: 77 }));
+    await expect(autosave).resolves.toMatchObject({ id: 44, task: 10, annotation: 77 });
+    await expect(navigation).resolves.toBe("navigated");
+    expect(wrapper._managedDraftBaselines.has("10:77")).toBe(true);
+    expect(wrapper._managedDraftBaselines.has("11:88")).toBe(true);
+
+    datamanager.apiCall.mockClear();
+    await expect(wrapper.onSubmitDraft(null, annotationB)).resolves.toBeUndefined();
+    expect(datamanager.apiCall).not.toHaveBeenCalled();
+    wrapper.destroy();
+  });
+
+  it("rejects a dirty delayed autosave after its bound task changes without mutating durable state", async () => {
+    const annotationB = makeAnnotation({ draftId: 44 });
+    const annotationA = makeAnnotation({ pk: "88", id: "local-88" });
+    const { annotationStore, datamanager, wrapper } = makeHarness({ annotation: annotationB, taskId: 10 });
+    const priorBaseline = wrapper._managedDraftBaselines.get("10:77");
+    const priorReceipt = wrapper.lastPersistedDraftResult;
+    const priorPending = wrapper._managedPendingDraftPayload();
+
+    annotationB.replaceResult([{ id: "late-dirty-task-b-edit" }]);
+    wrapper.task = { ...wrapper.task, id: 11, drafts: [] };
+    annotationStore.annotations.push(annotationA);
+    annotationStore.selected = annotationA;
+    wrapper._initializeManagedDraftBaselines();
+
+    await expect(wrapper.onSubmitDraft(null, annotationB)).rejects.toMatchObject({ code: "SOURCE_TASK_CHANGED" });
+    expect(datamanager.apiCall).not.toHaveBeenCalled();
+    expect(wrapper._managedDraftBaselines.get("10:77")).toBe(priorBaseline);
+    expect(wrapper.lastPersistedDraftResult).toBe(priorReceipt);
+    expect(wrapper._managedPendingDraftPayload()).toEqual(priorPending);
+    wrapper.destroy();
+  });
+
   it("rejects when the selected annotation identity changes during the request", async () => {
     const { annotation, annotationStore, datamanager, wrapper } = makeHarness();
     const request = deferred();
@@ -413,6 +522,18 @@ describe("strict managed Draft responses", () => {
 });
 
 describe("managed navigation coordination", () => {
+  it("cancels native autosave before executing managed navigation", async () => {
+    const { annotation, wrapper } = makeHarness();
+    const action = jest.fn(() => "navigated");
+
+    annotation.pauseAutosave.mockClear();
+
+    await expect(wrapper.coordinateManagedNavigation(action, { reason: "row-click" })).resolves.toBe("navigated");
+    expect(annotation.pauseAutosave).toHaveBeenCalledTimes(1);
+    expect(annotation.pauseAutosave.mock.invocationCallOrder[0]).toBeLessThan(action.mock.invocationCallOrder[0]);
+    wrapper.destroy();
+  });
+
   it.each([
     ["Next", (wrapper, action) => (wrapper._loadTaskUncoordinated = action) && wrapper.onNextTask(11, 78)],
     ["Previous", (wrapper, action) => (wrapper._loadTaskUncoordinated = action) && wrapper.onPrevTask(9, 76)],

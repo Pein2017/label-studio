@@ -60,6 +60,11 @@ const injector = inject(({ store }) => {
   return props;
 });
 
+export const startLabelingFromRow = (lsf, storeRoot, item) => {
+  if (!lsf?.isManagedRefinementProject) lsf?.saveDraft();
+  return storeRoot.startLabeling(item);
+};
+
 export const DataView = injector(
   ({
     store,
@@ -181,8 +186,7 @@ export const DataView = injector(
         } else if (e.metaKey || e.ctrlKey) {
           window.open(`./?task=${itemID}`, "_blank");
         } else {
-          store._sdk.lsf?.saveDraft();
-          getRoot(view).startLabeling(item);
+          startLabelingFromRow(store._sdk.lsf, getRoot(view), item);
         }
       },
       [view, columns],

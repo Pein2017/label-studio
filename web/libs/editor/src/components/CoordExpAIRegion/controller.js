@@ -544,13 +544,13 @@ export const validateInferenceResponse = (response, frozen) => {
 
 export const frozenTargetStillCurrent = (
   frozen,
-  { store, annotation, selectedProfile, browserSemanticProjectionHash },
+  { projectId, store, annotation, selectedProfile, browserSemanticProjectionHash },
 ) => {
   const currentTaskKey = store?.task?.dataObj?.coordexp_task_key ?? store?.task?.data?.coordexp_task_key;
   const currentAnnotationId = annotation?.pk ?? annotation?.id;
 
   return (
-    String(store?.project?.id) === String(frozen.projectId) &&
+    String(projectId) === String(frozen.projectId) &&
     String(store?.task?.id) === String(frozen.taskId) &&
     currentTaskKey === frozen.taskKey &&
     String(currentAnnotationId) === String(frozen.annotationId) &&

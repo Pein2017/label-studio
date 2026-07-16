@@ -19,8 +19,14 @@ import "../../tags/object/Image";
 import "../../tags/control/RectangleLabels";
 import { ImageModel } from "../../tags/object/Image/Image";
 import AppStore from "../../stores/AppStore";
+import { CoordExpRefinementClient } from "../../services/coordexp-refinement-api";
 import { DATA_MANAGER_READY_EVENT } from "../../services/data-manager-ready";
-import { CoordExpAIRegion, CoordExpAIRegionMount, isAIRegionMountTarget } from "./CoordExpAIRegion";
+import {
+  CoordExpAIRegion,
+  CoordExpAIRegionMount,
+  isAIRegionMountTarget,
+  resolveAIRegionDataManager,
+} from "./CoordExpAIRegion";
 
 const REQUEST_ID = "11111111-1111-4111-8111-111111111111";
 const BROWSER_HASH = "fnv1a32:browser";
@@ -186,6 +192,7 @@ const setup = ({
   profiles = [profile],
   abandonImpl,
   initialManagedStatus,
+  useDefaultClient = false,
 } = {}) => {
   const resultModel = {
     meta: produced().insertion_payload.regions[0].label_studio_result.meta,
@@ -250,9 +257,10 @@ const setup = ({
       listeners.get("managedStatusChanged")?.(next);
     },
   };
-  const store = { project: { id: 7 }, task: { id: 17, dataObj: { coordexp_task_key: "train:42" } } };
-
-  const view = render(
+  const store = { project: null, task: { id: 17, dataObj: { coordexp_task_key: "train:42" } } };
+  const clientFactory = () => client;
+  const requestIdFactory = () => REQUEST_ID;
+  const renderComponent = (overrides = {}) => (
     <CoordExpAIRegion
       store={store}
       dataManager={dataManager}
@@ -260,11 +268,14 @@ const setup = ({
       image={image}
       projectId={7}
       taskId={17}
-      clientFactory={() => client}
-      requestIdFactory={() => REQUEST_ID}
-    />,
+      requestIdFactory={requestIdFactory}
+      {...(useDefaultClient ? {} : { clientFactory })}
+      {...overrides}
+    />
   );
-  return { annotation, image, client, dataManager, statusRef, ...view };
+
+  const view = render(renderComponent());
+  return { annotation, image, client, clientFactory, dataManager, renderComponent, statusRef, store, ...view };
 };
 
 const createRealImage = () => {
@@ -333,6 +344,31 @@ const expectSemanticInferenceOnly = (results) => {
   );
 };
 
+const cloneCandidate = (
+  source,
+  { editorStore = source.lsf.lsfInstance.store, projectId = source.lsf.project.id } = {},
+) => {
+  const project = { id: projectId };
+  const ownerStore = { project };
+  const candidate = {
+    ...source,
+    projectId,
+    store: ownerStore,
+    on: jest.fn(),
+    off: jest.fn(),
+  };
+
+  candidate.lsf = {
+    ...source.lsf,
+    datamanager: candidate,
+    store: ownerStore,
+    project,
+    task: { id: editorStore.task.id },
+    lsfInstance: { store: editorStore },
+  };
+  return candidate;
+};
+
 const mountHarness = ({
   managed = true,
   selected = true,
@@ -340,6 +376,10 @@ const mountHarness = ({
   imageOverrides = {},
   candidateOverrides = {},
   candidateMode = "explicit",
+  projectId = 7,
+  candidateProjectId = 7,
+  storeProject = null,
+  candidateMutator,
 } = {}) => {
   const image = {
     type: "image",
@@ -370,14 +410,24 @@ const mountHarness = ({
     annotation.names.set("image2", { ...image, name: "image2" });
   }
   const store = {
-    project: { id: 7 },
+    project: storeProject,
     task: { id: 17, dataObj: { coordexp_task_key: "train:42" } },
     annotationStore: { selected: selected ? annotation : { id: 10 } },
   };
   const listeners = new Map();
+  const project = { id: candidateProjectId };
+  const ownerStore = { project };
   const dataManager = {
-    projectId: 7,
-    lsf: { lsfInstance: { store }, isManagedRefinementProject: managed },
+    projectId,
+    store: ownerStore,
+    lsf: {
+      datamanager: null,
+      store: ownerStore,
+      project,
+      task: { id: store.task.id },
+      lsfInstance: { store },
+      isManagedRefinementProject: managed,
+    },
     ensureDurableDraft: jest.fn(),
     setManagedRoiRunning: jest.fn(),
     getManagedStatusState: jest.fn(() => managedStatus()),
@@ -387,11 +437,14 @@ const mountHarness = ({
     }),
     ...candidateOverrides,
   };
+  dataManager.lsf.datamanager = dataManager;
+  candidateMutator?.(dataManager);
   const client = {
     profiles: jest.fn().mockResolvedValue({ profiles: [profile] }),
     infer: jest.fn(),
     abandon: jest.fn(),
   };
+  const clientFactory = jest.fn(() => client);
   if (candidateMode === "window") window.dataManager = dataManager;
   if (candidateMode === "none") window.dataManager = null;
   const view = render(
@@ -400,11 +453,11 @@ const mountHarness = ({
       image={image}
       annotation={annotation}
       candidate={candidateMode === "explicit" ? dataManager : undefined}
-      clientFactory={() => client}
+      clientFactory={clientFactory}
     />,
   );
 
-  return { ...view, store, annotation, image, dataManager, client };
+  return { ...view, store, annotation, image, dataManager, client, clientFactory };
 };
 
 describe("CoordExpAIRegionMount", () => {
@@ -418,11 +471,31 @@ describe("CoordExpAIRegionMount", () => {
     jest.restoreAllMocks();
   });
 
+  it.each([
+    ["candidate back-reference", (dataManager) => (dataManager.lsf.datamanager = {})],
+    ["owner-store back-reference", (dataManager) => (dataManager.lsf.store = { project: dataManager.lsf.project })],
+    ["canonical project object", (dataManager) => (dataManager.lsf.project = { id: 7 })],
+    ["task identity", (dataManager) => (dataManager.lsf.task = { id: 18 })],
+  ])("rejects a mismatched %s", (_name, candidateMutator) => {
+    const { store, dataManager } = mountHarness({ candidateMutator });
+
+    expect(resolveAIRegionDataManager(store, dataManager)).toBeNull();
+    expect(screen.queryByLabelText("AI Region inference")).not.toBeInTheDocument();
+  });
+
   it("mounts only the selected annotation's sole ordinary configured Image tag for a managed resolver", async () => {
-    const { dataManager } = mountHarness();
+    const { clientFactory, dataManager } = mountHarness();
 
     expect(await screen.findByLabelText("AI Region inference")).toBeInTheDocument();
     expect(dataManager.on).toHaveBeenCalledWith("managedStatusChanged", expect.any(Function));
+    expect(clientFactory).toHaveBeenCalledWith(7);
+  });
+
+  it("uses the owning candidate project even when a legacy editor project differs", async () => {
+    const { clientFactory } = mountHarness({ storeProject: { id: 999 } });
+
+    expect(await screen.findByLabelText("AI Region inference")).toBeInTheDocument();
+    expect(clientFactory).toHaveBeenCalledWith(7);
   });
 
   it.each([
@@ -437,6 +510,8 @@ describe("CoordExpAIRegionMount", () => {
     ["ordinary value resolving multiple images", { imageOverrides: { parsedValue: ["a", "b"], images: ["a", "b"] } }],
     ["resolver without event subscription", { candidateOverrides: { on: undefined } }],
     ["resolver without event unsubscription", { candidateOverrides: { off: undefined } }],
+    ["candidate project-id mismatch", { projectId: 8 }],
+    ["missing canonical candidate project", { candidateProjectId: null }],
   ])("fails closed for %s", (_name, options) => {
     mountHarness(options);
 
@@ -469,10 +544,7 @@ describe("CoordExpAIRegionMount", () => {
   it("ignores malformed and other-store readiness events", async () => {
     const harness = mountHarness({ candidateMode: "none" });
     const otherStore = { ...harness.store };
-    const otherManager = {
-      ...harness.dataManager,
-      lsf: { ...harness.dataManager.lsf, lsfInstance: { store: otherStore } },
-    };
+    const otherManager = cloneCandidate(harness.dataManager, { editorStore: otherStore });
 
     act(() => publish(otherManager));
     expect(screen.queryByLabelText("AI Region inference")).not.toBeInTheDocument();
@@ -486,11 +558,7 @@ describe("CoordExpAIRegionMount", () => {
     const addEventListener = jest.spyOn(window, "addEventListener");
     const removeEventListener = jest.spyOn(window, "removeEventListener");
     const explicit = mountHarness();
-    const replacement = {
-      ...explicit.dataManager,
-      on: jest.fn(),
-      off: jest.fn(),
-    };
+    const replacement = cloneCandidate(explicit.dataManager);
 
     act(() => publish(replacement));
     expect(explicit.dataManager.on).toHaveBeenCalledWith("managedStatusChanged", expect.any(Function));
@@ -508,11 +576,7 @@ describe("CoordExpAIRegionMount", () => {
 
   it("replaces the manager and resets across a project-store transition", async () => {
     const harness = mountHarness({ candidateMode: "window" });
-    const replacement = {
-      ...harness.dataManager,
-      on: jest.fn(),
-      off: jest.fn(),
-    };
+    const replacement = cloneCandidate(harness.dataManager);
 
     expect(await screen.findByLabelText("AI Region inference")).toBeInTheDocument();
     act(() => publish(replacement));
@@ -521,16 +585,10 @@ describe("CoordExpAIRegionMount", () => {
 
     const storeB = {
       ...harness.store,
-      project: { id: 8 },
+      project: null,
       annotationStore: { selected: harness.annotation },
     };
-    const managerB = {
-      ...harness.dataManager,
-      projectId: 8,
-      lsf: { ...harness.dataManager.lsf, lsfInstance: { store: storeB } },
-      on: jest.fn(),
-      off: jest.fn(),
-    };
+    const managerB = cloneCandidate(harness.dataManager, { editorStore: storeB, projectId: 8 });
 
     harness.rerender(
       <CoordExpAIRegionMount
@@ -557,6 +615,151 @@ describe("CoordExpAIRegionMount", () => {
 });
 
 describe("CoordExpAIRegion", () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it("keeps the default client and active attempt stable through running and status rerenders", async () => {
+    let resolveFrozenDraft;
+    const frozenDraft = new Promise((resolve) => {
+      resolveFrozenDraft = resolve;
+    });
+    const save = jest
+      .fn()
+      .mockImplementationOnce(() => frozenDraft)
+      .mockResolvedValue(draftReceipt());
+    const profiles = jest
+      .spyOn(CoordExpRefinementClient.prototype, "profiles")
+      .mockResolvedValue({ profiles: [profile] });
+    const infer = jest.spyOn(CoordExpRefinementClient.prototype, "infer").mockResolvedValue({ payload: produced() });
+    const abandon = jest
+      .spyOn(CoordExpRefinementClient.prototype, "abandon")
+      .mockImplementation(({ reason }) => Promise.resolve({ payload: abandoned(reason), status: 200 }));
+    const harness = setup({ save, useDefaultClient: true });
+
+    await screen.findByRole("option", { name: "Safe" });
+    expect(profiles).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "Infer" }));
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled();
+
+    act(() => harness.dataManager.emitManagedStatus(managedStatus({ version: 2 })));
+    expect(profiles).toHaveBeenCalledTimes(1);
+    expect(abandon).not.toHaveBeenCalled();
+
+    act(() => resolveFrozenDraft(draftReceipt()));
+    await waitFor(() => expect(infer).toHaveBeenCalledTimes(1));
+    await screen.findByText(/Inserted 1\./);
+    expect(save).toHaveBeenCalledTimes(2);
+    expect(profiles).toHaveBeenCalledTimes(1);
+    expect(abandon).not.toHaveBeenCalled();
+    harness.unmount();
+  });
+
+  it("resets lifecycle and status ownership across a same-project manager and image replacement", async () => {
+    const inferenceResult = produced().insertion_payload.regions[0].label_studio_result;
+    const harness = setup({
+      annotationResults: [inferenceResult],
+      initialManagedStatus: retiredStatus({ generation: 9, version: 9 }),
+    });
+
+    await screen.findByRole("option", { name: "Safe" });
+    expect(harness.client.profiles).toHaveBeenCalledTimes(1);
+
+    const replacementListeners = new Map();
+    const replacementStatus = managedStatus({ generation: 1, version: 1 });
+    const replacementManager = {
+      ensureDurableDraft: jest.fn().mockResolvedValue(draftReceipt()),
+      setManagedRoiRunning: jest.fn(),
+      getManagedStatusState: jest.fn(() => replacementStatus),
+      on: jest.fn((event, listener) => replacementListeners.set(event, listener)),
+      off: jest.fn((event, listener) => {
+        if (replacementListeners.get(event) === listener) replacementListeners.delete(event);
+      }),
+    };
+    let replacementImage;
+
+    replacementImage = {
+      ...harness.image,
+      aiRegion: { x: 25, y: 10, width: 50, height: 40 },
+      aiRegionRunning: false,
+      setAIRegionRunning: jest.fn((running) => {
+        replacementImage.aiRegionRunning = running;
+      }),
+      finishAIRegion: jest.fn(({ clear }) => {
+        if (clear) replacementImage.aiRegion = null;
+        replacementImage.aiRegionRunning = false;
+      }),
+      setInferenceRegionPresentation: jest.fn(),
+      clearInferenceRegionPresentations: jest.fn(),
+      focusInferenceGroup: jest.fn(),
+    };
+
+    harness.rerender(harness.renderComponent({ dataManager: replacementManager, image: replacementImage }));
+    await waitFor(() =>
+      expect(replacementManager.on).toHaveBeenCalledWith("managedStatusChanged", expect.any(Function)),
+    );
+    await waitFor(() => expect(replacementImage.setInferenceRegionPresentation).toHaveBeenCalled());
+    expect(replacementImage.clearInferenceRegionPresentations).not.toHaveBeenCalled();
+    expect(harness.client.profiles).toHaveBeenCalledTimes(1);
+
+    act(() => harness.dataManager.emitManagedStatus(retiredStatus({ generation: 10, version: 10 })));
+    expect(replacementImage.clearInferenceRegionPresentations).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Infer" }));
+    await screen.findByText(/Inserted 1\./);
+    expect(harness.client.infer).toHaveBeenCalledTimes(1);
+    expect(harness.annotation.appendResultsAtomically).toHaveBeenCalledTimes(1);
+    expect(replacementManager.ensureDurableDraft).toHaveBeenCalledTimes(2);
+    expect(harness.client.abandon).not.toHaveBeenCalled();
+  });
+
+  it("still abandons an active attempt on a genuine unmount", async () => {
+    let resolveInfer;
+    const inferPromise = new Promise((resolve) => {
+      resolveInfer = resolve;
+    });
+    const harness = setup({ inferImpl: () => inferPromise });
+
+    await screen.findByRole("option", { name: "Safe" });
+    fireEvent.click(screen.getByRole("button", { name: "Infer" }));
+    await waitFor(() => expect(harness.client.infer).toHaveBeenCalledTimes(1));
+    harness.unmount();
+    await waitFor(() =>
+      expect(harness.client.abandon).toHaveBeenCalledWith({
+        receiptId: `roi-receipt:${REQUEST_ID}`,
+        reason: "user_discarded",
+      }),
+    );
+    act(() => resolveInfer({ payload: produced() }));
+  });
+
+  it("still abandons an active attempt when its task target changes", async () => {
+    let resolveInfer;
+    const inferPromise = new Promise((resolve) => {
+      resolveInfer = resolve;
+    });
+    const harness = setup({ inferImpl: () => inferPromise });
+
+    await screen.findByRole("option", { name: "Safe" });
+    fireEvent.click(screen.getByRole("button", { name: "Infer" }));
+    await waitFor(() => expect(harness.client.infer).toHaveBeenCalledTimes(1));
+    const nextStore = {
+      ...harness.store,
+      task: { id: 18, dataObj: { coordexp_task_key: "train:43" } },
+    };
+
+    harness.rerender(harness.renderComponent({ store: nextStore, taskId: 18 }));
+    act(() => resolveInfer({ payload: produced() }));
+    await waitFor(() =>
+      expect(harness.client.abandon).toHaveBeenCalledWith({
+        receiptId: `roi-receipt:${REQUEST_ID}`,
+        reason: "superseded",
+      }),
+    );
+    expect(harness.annotation.appendResultsAtomically).not.toHaveBeenCalled();
+  });
+
   it("switches Dense Focus overlays using stable selected keys without semantic mutation or saving", async () => {
     const save = jest.fn().mockResolvedValue({ draft_id: 5 });
     const { annotation, image } = setup({

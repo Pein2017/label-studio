@@ -552,77 +552,83 @@ export const AppStore = types
       if (!isDefined(taskID)) return;
 
       self.setLoadingData(true);
+      try {
+        // Yield to browser so loading indicator paints before heavy store operations
+        yield new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
-      // Yield to browser so loading indicator paints before heavy store operations
-      yield new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        if (self.mode === "labelstream") {
+          yield self.taskStore.loadNextTask({
+            select: !!taskID && !!annotationID,
+          });
+        }
 
-      if (self.mode === "labelstream") {
-        yield self.taskStore.loadNextTask({
+        runInAction(() => {
+          if (annotationID !== undefined) {
+            self.annotationStore.setSelected(annotationID);
+          } else {
+            self.taskStore.setSelected(taskID);
+          }
+        });
+
+        const taskPromise = self.taskStore.loadTask(taskID, {
           select: !!taskID && !!annotationID,
         });
-      }
 
-      runInAction(() => {
-        if (annotationID !== undefined) {
-          self.annotationStore.setSelected(annotationID);
-        } else {
-          self.taskStore.setSelected(taskID);
-        }
-      });
+        // wait for the task to be loaded and LSF to be initialized
+        yield taskPromise.then(async () => {
+          // wait for self.LSF to be initialized with currentAnnotation
+          let maxWait = 1000;
+          while (!self.LSF?.currentAnnotation && maxWait > 0) {
+            await new Promise((resolve) => setTimeout(resolve, 1));
+            maxWait -= 1;
+          }
 
-      const taskPromise = self.taskStore.loadTask(taskID, {
-        select: !!taskID && !!annotationID,
-      });
+          if (self.LSF) {
+            const annotation = self.LSF?.currentAnnotation;
+            const id = annotation?.pk ?? annotation?.id;
 
-      // wait for the task to be loaded and LSF to be initialized
-      yield taskPromise.then(async () => {
-        // wait for self.LSF to be initialized with currentAnnotation
-        let maxWait = 1000;
-        while (!self.LSF?.currentAnnotation && maxWait > 0) {
-          await new Promise((resolve) => setTimeout(resolve, 1));
-          maxWait -= 1;
-        }
+            await self.LSF?.setLSFTask(self.taskStore.selected, id);
 
-        if (self.LSF) {
-          const annotation = self.LSF?.currentAnnotation;
-          const id = annotation?.pk ?? annotation?.id;
+            const { annotation: annIDFromUrl, region: regionIDFromUrl } = History.getParams();
+            const annotationStore = self.LSF?.lsf?.annotationStore;
 
-          self.LSF?.setLSFTask(self.taskStore.selected, id);
+            if (annIDFromUrl && annotationStore) {
+              const lsfAnnotation = [...annotationStore.annotations, ...annotationStore.predictions].find((a) => {
+                return a.pk === annIDFromUrl || a.id === annIDFromUrl;
+              });
 
-          const { annotation: annIDFromUrl, region: regionIDFromUrl } = History.getParams();
-          const annotationStore = self.LSF?.lsf?.annotationStore;
-
-          if (annIDFromUrl && annotationStore) {
-            const lsfAnnotation = [...annotationStore.annotations, ...annotationStore.predictions].find((a) => {
-              return a.pk === annIDFromUrl || a.id === annIDFromUrl;
-            });
-
-            if (lsfAnnotation) {
-              const annID = lsfAnnotation.pk ?? lsfAnnotation.id;
-              self.LSF?.setLSFTask(self.taskStore.selected, annID, undefined, lsfAnnotation.type === "prediction");
+              if (lsfAnnotation) {
+                const annID = lsfAnnotation.pk ?? lsfAnnotation.id;
+                await self.LSF?.setLSFTask(
+                  self.taskStore.selected,
+                  annID,
+                  undefined,
+                  lsfAnnotation.type === "prediction",
+                );
+              }
             }
-          }
-          if (regionIDFromUrl) {
-            const currentAnn = self.LSF?.currentAnnotation;
-            // Focus on the region by hiding all other regions
-            currentAnn?.regionStore?.setRegionVisible(regionIDFromUrl);
-            // Select the region so outliner details are visible
-            currentAnn?.regionStore?.selectRegionByID(regionIDFromUrl);
-          }
-
-          // Enable viewingAll mode if interface option is "annotations:view-all"
-          if (interfaceOption === "annotations:view-all" && annotationStore) {
-            if (!annotationStore.viewingAll) {
-              annotationStore.toggleViewingAllAnnotations();
+            if (regionIDFromUrl) {
+              const currentAnn = self.LSF?.currentAnnotation;
+              // Focus on the region by hiding all other regions
+              currentAnn?.regionStore?.setRegionVisible(regionIDFromUrl);
+              // Select the region so outliner details are visible
+              currentAnn?.regionStore?.selectRegionByID(regionIDFromUrl);
             }
-            // Don't set the tab - let it use whatever was last selected
-          }
-        } else {
-          console.error("LSF not initialized properly");
-        }
 
+            // Enable viewingAll mode if interface option is "annotations:view-all"
+            if (interfaceOption === "annotations:view-all" && annotationStore) {
+              if (!annotationStore.viewingAll) {
+                annotationStore.toggleViewingAllAnnotations();
+              }
+              // Don't set the tab - let it use whatever was last selected
+            }
+          } else {
+            console.error("LSF not initialized properly");
+          }
+        });
+      } finally {
         self.setLoadingData(false);
-      });
+      }
     }),
 
     setLoadingData(value) {

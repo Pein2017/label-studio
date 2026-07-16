@@ -66,12 +66,14 @@ export const createBatchId = (cryptoObject = globalThis.crypto) => {
 };
 
 export class CoordExpRefinementClient {
-  constructor(projectId, fetchImpl = globalThis.fetch) {
+  constructor(projectId, fetchImpl) {
     if (!Number.isInteger(projectId) || projectId <= 0) throw new Error("A positive project ID is required.");
-    if (typeof fetchImpl !== "function") throw new Error("A fetch implementation is required.");
+    const resolvedFetch = fetchImpl === undefined ? globalThis.fetch : fetchImpl;
+
+    if (typeof resolvedFetch !== "function") throw new Error("A fetch implementation is required.");
 
     this.baseUrl = `/api/projects/${projectId}/coordexp-refinement`;
-    this.fetch = fetchImpl;
+    this.fetch = fetchImpl === undefined ? resolvedFetch.bind(globalThis) : resolvedFetch;
   }
 
   async request(path, options = {}) {
