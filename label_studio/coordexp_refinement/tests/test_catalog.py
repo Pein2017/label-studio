@@ -4,6 +4,7 @@ import copy
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
+from unittest.mock import patch
 
 from coordexp_refinement.catalog import DjangoAnnotationVerifier, DjangoDraftCatalog
 from django.contrib.auth import get_user_model
@@ -140,6 +141,90 @@ class CatalogTestCase(TestCase):
                 principal=AuthenticatedPrincipal(user_id=str(self.user.pk), authenticated=True),
             )
         )
+
+    def project_state(self):
+        store_state = {
+            'generation': self.store.generation,
+            'working_sha256': getattr(self.store, 'working_sha256', 'a' * 64),
+            'working_line_count': getattr(self.store, 'working_line_count', 117_266),
+            'active_batch_id': None,
+            'batch_state': None,
+            'active_batch': None,
+            'active_member_semantic_hashes': {},
+            'last_terminal_batch': None,
+            'last_terminal_member_semantic_hashes': {},
+        }
+        with patch(
+            'coordexp_refinement.catalog._store_project_state',
+            side_effect=lambda _store: copy.deepcopy(store_state),
+        ):
+            return self.catalog.project_state(
+                split='train',
+                principal=AuthenticatedPrincipal(
+                    user_id=str(self.user.pk),
+                    authenticated=True,
+                ),
+            )
+
+    def test_project_state_with_zero_drafts_never_scans_working_jsonl(self) -> None:
+        state = self.project_state()
+
+        self.assertEqual(state['generation'], 7)
+        self.assertEqual(state['pending_draft_count'], 0)
+        self.assertEqual(state['members'], [])
+        self.assertEqual(self.store.restore_calls, [])
+
+    def test_project_state_reuses_attested_baselines_for_same_store_authority(self) -> None:
+        task, _, draft, _ = self.make_task(10, source_line=1)
+
+        first = self.project_state()
+        second = self.project_state()
+
+        self.assertEqual(self.store.restore_calls, [(10,)])
+        self.assertEqual(second, first)
+        self.assertEqual(
+            first['members'],
+            [
+                {
+                    'task_id': task.pk,
+                    'task_key': 'train:10',
+                    'draft_id': draft.pk,
+                    'draft_updated_at': draft.updated_at.isoformat(),
+                    'draft_semantic_hash': first['members'][0]['draft_semantic_hash'],
+                    'committed_semantic_hash': first['members'][0]['committed_semantic_hash'],
+                    'pending': True,
+                    'draft_ahead_of_committed': True,
+                    'active_batch_member': False,
+                    'active_batch_semantic_hash': None,
+                    'draft_ahead_of_active_batch': False,
+                    'last_terminal_batch_member': False,
+                    'last_terminal_batch_semantic_hash': None,
+                    'draft_matches_last_terminal_batch': False,
+                }
+            ],
+        )
+
+    def test_project_state_rescans_after_generation_or_working_hash_change(self) -> None:
+        self.make_task(16, source_line=1)
+
+        self.project_state()
+        self.store.generation = 8
+        self.store.working_sha256 = 'b' * 64
+        self.store.restores[16] = replace(self.store.restores[16], generation=8)
+        self.project_state()
+        self.store.working_sha256 = 'c' * 64
+        self.project_state()
+
+        self.assertEqual(self.store.restore_calls, [(16,), (16,), (16,)])
+
+    def test_project_state_cache_never_weakens_explicit_draft_capture(self) -> None:
+        self.make_task(17, source_line=1)
+
+        self.project_state()
+        capture = self.capture()
+
+        self.assertEqual([snapshot.image_id for snapshot in capture.snapshots], [17])
+        self.assertEqual(self.store.restore_calls, [(17,), (17,)])
 
     def test_capture_is_current_user_scoped_and_ignores_other_user_draft(self) -> None:
         task, annotation, _, _ = self.make_task(11, source_line=1)

@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from threading import RLock
 from types import MappingProxyType
 from typing import Any
 
@@ -51,6 +52,14 @@ class _LockedDraft:
     source_line: int
 
 
+@dataclass(frozen=True)
+class _StoreAuthority:
+    split: str
+    generation: int
+    working_sha256: str
+    working_line_count: int
+
+
 class DjangoDraftCatalog:
     """Capture all changed authoritative Drafts for one current user."""
 
@@ -61,6 +70,10 @@ class DjangoDraftCatalog:
     ) -> None:
         self._project_ids = _normalize_project_map(project_ids)
         self._stores = _normalize_store_map(stores, expected=self._project_ids)
+        self._project_state_cache_lock = RLock()
+        self._project_state_baselines: dict[
+            _StoreAuthority, dict[int, DraftRestore]
+        ] = {}
 
     def capture_current_user_drafts(self, request: DraftCatalogRequest) -> DraftCatalogCapture:
         split, project_pk, user_pk = self._validate_request(request)
@@ -159,6 +172,7 @@ class DjangoDraftCatalog:
         store = self._stores[split]
         try:
             store_state_before = _store_project_state(store)
+            store_authority = _store_authority(split, store_state_before)
             active_semantic_hashes = store_state_before['active_member_semantic_hashes']
             terminal_semantic_hashes = store_state_before['last_terminal_member_semantic_hashes']
             with transaction.atomic():
@@ -179,7 +193,11 @@ class DjangoDraftCatalog:
                     store=store,
                 )
                 locked.sort(key=lambda item: item.source_line)
-                baselines = store.restore_drafts(tuple(item.image_id for item in locked))
+                baselines = self._restore_project_state_baselines(
+                    store=store,
+                    authority=store_authority,
+                    image_ids=tuple(item.image_id for item in locked),
+                )
                 members: list[dict[str, Any]] = []
                 generation: int | None = None
                 pending_count = 0
@@ -252,6 +270,48 @@ class DjangoDraftCatalog:
             raise
         except Exception as exc:
             raise DraftCatalogError('authoritative project state lookup failed closed') from exc
+
+    def _restore_project_state_baselines(
+        self,
+        *,
+        store: WorkingDatasetStore,
+        authority: _StoreAuthority,
+        image_ids: tuple[int, ...],
+    ) -> tuple[DraftRestore, ...]:
+        """Reuse only baselines fully attested for one published store authority."""
+
+        if not image_ids:
+            return ()
+        with self._project_state_cache_lock:
+            cached = self._project_state_baselines.get(authority, {})
+            if all(image_id in cached for image_id in image_ids):
+                return tuple(cached[image_id] for image_id in image_ids)
+
+            restored = store.restore_drafts(image_ids)
+            if len(restored) != len(image_ids):
+                raise DraftCatalogError('working store returned an incomplete project-state baseline')
+            for image_id, baseline in zip(image_ids, restored, strict=True):
+                _validate_baseline(
+                    baseline,
+                    split=authority.split,
+                    image_id=image_id,
+                )
+                if baseline.generation != authority.generation:
+                    raise DraftCatalogError('working store returned a cross-authority baseline')
+
+            attested_state = _store_project_state(store)
+            if _store_authority(authority.split, attested_state) != authority:
+                raise DraftCatalogError('project store authority changed during baseline attestation')
+
+            updated = dict(cached)
+            updated.update(zip(image_ids, restored, strict=True))
+            self._project_state_baselines = {
+                key: value
+                for key, value in self._project_state_baselines.items()
+                if key.split != authority.split
+            }
+            self._project_state_baselines[authority] = updated
+            return tuple(updated[image_id] for image_id in image_ids)
 
     def _validate_request(self, request: DraftCatalogRequest) -> tuple[str, int, int]:
         if not isinstance(request, DraftCatalogRequest):
@@ -529,6 +589,8 @@ def _store_project_state(store: WorkingDatasetStore) -> dict[str, Any]:
                 )
         return {
             'generation': generation,
+            'working_sha256': manifest.get('working_sha256'),
+            'working_line_count': manifest.get('working_line_count'),
             'active_batch_id': None if active_batch is None else active_batch['batch_id'],
             'batch_state': None if active_batch is None else active_batch['state'],
             'active_batch': active_batch,
@@ -540,6 +602,29 @@ def _store_project_state(store: WorkingDatasetStore) -> dict[str, Any]:
         raise
     except Exception as exc:
         raise DraftCatalogError('working store project status is unavailable') from exc
+
+
+def _store_authority(split: str, state: Mapping[str, Any]) -> _StoreAuthority:
+    generation = state.get('generation')
+    working_sha256 = state.get('working_sha256')
+    working_line_count = state.get('working_line_count')
+    if (
+        split not in _SUPPORTED_SPLITS
+        or isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 0
+        or not _is_sha256(working_sha256)
+        or isinstance(working_line_count, bool)
+        or not isinstance(working_line_count, int)
+        or working_line_count < 0
+    ):
+        raise DraftCatalogError('working store publication authority is invalid')
+    return _StoreAuthority(
+        split=split,
+        generation=generation,
+        working_sha256=working_sha256,
+        working_line_count=working_line_count,
+    )
 
 
 def _last_terminal_batch(
