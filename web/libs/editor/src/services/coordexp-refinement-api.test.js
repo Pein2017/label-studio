@@ -142,6 +142,38 @@ describe("CoordExpRefinementClient", () => {
     );
   });
 
+  it("uses the cached CSRF token for a credentialed same-origin keepalive abandonment", async () => {
+    const fetchImpl = jest
+      .fn()
+      .mockResolvedValueOnce(response(200, { csrf_token: "cached-token" }))
+      .mockResolvedValueOnce(response(200, { request_state: "produced" }))
+      .mockResolvedValueOnce(response(200, { terminal_status: "abandoned_before_insertion" }));
+    const client = new CoordExpRefinementClient(7, fetchImpl);
+
+    await client.infer({
+      requestId: "22222222-2222-4222-8222-222222222222",
+      taskId: 19,
+      roi: { x: 1, y: 2, width: 30, height: 40 },
+      resolution: { width: 1024, height: 768 },
+      profileSelector: "accepted-profile",
+    });
+    await client.abandon(
+      { receiptId: "roi-receipt:22222222-2222-4222-8222-222222222222", reason: "user_discarded" },
+      undefined,
+      { keepalive: true },
+    );
+
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(fetchImpl).toHaveBeenLastCalledWith(
+      "/api/projects/7/coordexp-refinement/roi/abandon/",
+      expect.objectContaining({
+        credentials: "same-origin",
+        keepalive: true,
+        headers: expect.objectContaining({ "X-CSRFToken": "cached-token" }),
+      }),
+    );
+  });
+
   it("rejects resolved HTTP errors instead of treating them as success", async () => {
     const fetchImpl = jest
       .fn()

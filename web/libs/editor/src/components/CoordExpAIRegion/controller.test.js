@@ -259,6 +259,18 @@ describe("AI Region controller", () => {
     expect(validateAbandonResponse(abandoned(), { requestId: REQUEST_ID, reason: "user_cancelled" })).toEqual(
       abandoned(),
     );
+    const earlyCancellation = { ...abandoned(), failure: { stage: "cancel", code: "user_cancelled" } };
+
+    delete earlyCancellation.counts;
+    expect(validateAbandonResponse(earlyCancellation, { requestId: REQUEST_ID, reason: "user_cancelled" })).toEqual(
+      earlyCancellation,
+    );
+    expect(() => validateAbandonResponse(abandoned(), { requestId: REQUEST_ID, reason: "superseded" })).toThrow(
+      /exact terminal receipt/,
+    );
+    expect(() => validateAbandonResponse(earlyCancellation, { requestId: REQUEST_ID, reason: "superseded" })).toThrow(
+      /exact terminal receipt/,
+    );
     expect(() =>
       validateDurableDraftReceipt({ ...draftReceipt, extra: true }, { taskId: 17, annotationId: 9 }),
     ).toThrow(/receipt shape/);
@@ -267,9 +279,68 @@ describe("AI Region controller", () => {
         { ...abandoned(), receipt_id: "roi-receipt:22222222-2222-4222-8222-222222222222" },
         { requestId: REQUEST_ID, reason: "user_cancelled" },
       ),
-    ).toThrow(/exact terminal/);
+    ).toThrow(/exact safe terminal/);
     expect(() => validateAbandonResponse({}, { requestId: REQUEST_ID, reason: "user_cancelled" })).toThrow(
-      /unsupported shape/,
+      /exact safe terminal/,
+    );
+  });
+
+  it.each([
+    [
+      "empty",
+      {
+        receipt_id: `roi-receipt:${REQUEST_ID}`,
+        request_id: REQUEST_ID,
+        request_state: "empty",
+        terminal_status: "empty",
+        clear_roi: true,
+        insertion_payload: null,
+        failure: null,
+        counts: { parsed: 0, produced: 0, rejected: 0 },
+      },
+    ],
+    [
+      "all rejected",
+      {
+        receipt_id: `roi-receipt:${REQUEST_ID}`,
+        request_id: REQUEST_ID,
+        request_state: "all_rejected",
+        terminal_status: "all_rejected",
+        clear_roi: true,
+        insertion_payload: null,
+        failure: null,
+        counts: { parsed: 2, produced: 0, rejected: 2 },
+      },
+    ],
+    [
+      "runtime failure",
+      {
+        receipt_id: `roi-receipt:${REQUEST_ID}`,
+        request_id: REQUEST_ID,
+        request_state: "runtime_failure",
+        terminal_status: "runtime_failure",
+        clear_roi: false,
+        insertion_payload: null,
+        failure: { stage: "runtime", code: "resident.runtime_failure" },
+      },
+    ],
+  ])("accepts an exact existing no-insertion terminal: %s", (_name, response) => {
+    expect(validateAbandonResponse(response, { requestId: REQUEST_ID, reason: "superseded" })).toBe(response);
+  });
+
+  it("rejects produced or inserted responses as abandonment confirmation", () => {
+    expect(() => validateAbandonResponse(response(), { requestId: REQUEST_ID, reason: "superseded" })).toThrow(
+      /safe.*terminal/,
+    );
+    const inserted = {
+      ...abandoned(),
+      request_state: "accepted",
+      terminal_status: "accepted",
+      failure: null,
+    };
+
+    expect(() => validateAbandonResponse(inserted, { requestId: REQUEST_ID, reason: "superseded" })).toThrow(
+      /safe.*terminal/,
     );
   });
 

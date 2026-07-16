@@ -271,22 +271,30 @@ class RoiInferAPI(_JsonBodyAPIView):
             return failure
         try:
             with services.request_admission():
-                captured = services.targets.capture(
-                    user=request.user,
-                    project_pk=pk,
-                    task_pk=body['task_id'],
+                with services.inference_lifecycle(
                     request_id=body['request_id'],
-                    roi=body['roi'],
-                    resolution=body['resolution'],
-                    profile_selector=body['profile_selector'],
-                )
-                with captured:
-                    response = services.manager.infer(
-                        selector=body['profile_selector'],
-                        image=captured.image,
-                        target=captured.target,
-                        transform=captured.transform,
+                    expected_project_pk=pk,
+                    expected_split=binding.split,
+                    expected_user_pk=request.user.pk,
+                ) as active:
+                    captured = services.targets.capture(
+                        user=request.user,
+                        project_pk=pk,
+                        task_pk=body['task_id'],
+                        request_id=body['request_id'],
+                        roi=body['roi'],
+                        resolution=body['resolution'],
+                        profile_selector=body['profile_selector'],
                     )
+                    with captured:
+                        cancellation_token = services.bind_inference_target(active, captured.target)
+                        response = services.manager.infer(
+                            selector=body['profile_selector'],
+                            image=captured.image,
+                            target=captured.target,
+                            transform=captured.transform,
+                            cancellation_token=cancellation_token,
+                        )
                 payload = services.safe_infer_response(response)
         except DjangoRoiTargetError:
             return _error('invalid_roi_target', 'The ROI target is no longer valid.', 409)

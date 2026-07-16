@@ -416,6 +416,10 @@ class ProductionRuntimeFactory:
             stores=stores,
             profile_resolver=profile_resolver,
         )
+        expire_orphans = getattr(roi_services, 'expire_orphan_receipts', None)
+        if not callable(expire_orphans):
+            raise RuntimeFactoryError('ROI services do not provide receipt expiry')
+        expire_orphans()
         return ProductionRuntimeService(
             runtime=runtime,
             project_pks=project_pks,

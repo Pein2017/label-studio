@@ -275,7 +275,7 @@ export const validateDurableDraftReceipt = (receipt, expected) => {
 };
 
 export const validateAbandonResponse = (response, { requestId, reason }) => {
-  const keys = [
+  const baseKeys = [
     "receipt_id",
     "request_id",
     "request_state",
@@ -283,24 +283,78 @@ export const validateAbandonResponse = (response, { requestId, reason }) => {
     "clear_roi",
     "insertion_payload",
     "failure",
-    "counts",
   ];
+  const safeResultStates = new Set(["empty", "all_rejected", "response_failure"]);
+  const safeFailureStates = new Set([
+    "profile_failure",
+    "transport_failure",
+    "runtime_failure",
+    "timeout_failure",
+    "cancelled",
+  ]);
 
-  if (!hasExactKeys(response, keys)) throw contractError("ROI abandon response has an unsupported shape.");
   if (
-    response.receipt_id !== `roi-receipt:${requestId}` ||
-    response.request_id !== requestId ||
-    response.request_state !== "abandoned_before_insertion" ||
-    response.terminal_status !== "abandoned_before_insertion" ||
+    response?.receipt_id !== `roi-receipt:${requestId}` ||
+    response?.request_id !== requestId ||
+    response?.terminal_status !== response?.request_state ||
+    response?.insertion_payload !== null
+  ) {
+    throw contractError("ROI abandon response is not an exact safe terminal receipt.");
+  }
+
+  if (safeResultStates.has(response.request_state)) {
+    if (
+      !hasExactKeys(response, [...baseKeys, "counts"]) ||
+      response.failure !== null ||
+      response.clear_roi !== (response.request_state !== "response_failure") ||
+      !hasExactKeys(response.counts, ["parsed", "produced", "rejected"]) ||
+      ![response.counts.parsed, response.counts.produced, response.counts.rejected].every(nonNegativeInteger) ||
+      response.counts.produced !== 0 ||
+      response.counts.rejected > response.counts.parsed
+    ) {
+      throw contractError("ROI abandon response is not an exact no-insertion result terminal.");
+    }
+    return response;
+  }
+
+  if (safeFailureStates.has(response.request_state)) {
+    if (
+      !hasExactKeys(response, baseKeys) ||
+      response.clear_roi !== false ||
+      !hasExactKeys(response.failure, ["stage", "code"]) ||
+      !nonEmptyText(response.failure.stage) ||
+      !nonEmptyText(response.failure.code)
+    ) {
+      throw contractError("ROI abandon response is not an exact no-insertion failure terminal.");
+    }
+    return response;
+  }
+
+  if (response.request_state !== "abandoned_before_insertion") {
+    throw contractError("ROI abandon response is not a safe no-insertion terminal.");
+  }
+
+  const hasDispositionCounts = hasExactKeys(response, [...baseKeys, "counts"]);
+  const hasEarlyCancellation = hasExactKeys(response, baseKeys);
+
+  if (!hasDispositionCounts && !hasEarlyCancellation) {
+    throw contractError("ROI abandon response has an unsupported shape.");
+  }
+  if (
     response.clear_roi !== false ||
     response.insertion_payload !== null ||
     !hasExactKeys(response.failure, ["stage", "code"]) ||
-    response.failure.stage !== "insertion" ||
-    response.failure.code !== reason ||
-    !hasExactKeys(response.counts, ["parsed", "inserted", "rejected"]) ||
-    ![response.counts.parsed, response.counts.inserted, response.counts.rejected].every(nonNegativeInteger) ||
-    response.counts.inserted !== 0 ||
-    response.counts.rejected > response.counts.parsed
+    response.failure.stage !== (hasDispositionCounts ? "insertion" : "cancel") ||
+    response.failure.code !== reason
+  ) {
+    throw contractError("ROI abandon response is not the exact terminal receipt.");
+  }
+  if (
+    hasDispositionCounts &&
+    (!hasExactKeys(response.counts, ["parsed", "inserted", "rejected"]) ||
+      ![response.counts.parsed, response.counts.inserted, response.counts.rejected].every(nonNegativeInteger) ||
+      response.counts.inserted !== 0 ||
+      response.counts.rejected > response.counts.parsed)
   ) {
     throw contractError("ROI abandon response is not the exact terminal receipt.");
   }

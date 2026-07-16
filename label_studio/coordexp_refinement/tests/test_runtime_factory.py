@@ -127,6 +127,9 @@ class FakeRuntime:
 
 
 class FakeReceiptStore:
+    def __init__(self):
+        self.overdue_calls = 0
+
     def resolve(self, receipt_id):
         del receipt_id
         return None
@@ -134,6 +137,10 @@ class FakeReceiptStore:
     def response(self, receipt_id):
         del receipt_id
         return None
+
+    def overdue_produced(self):
+        self.overdue_calls += 1
+        return ()
 
 
 class FakeLaunchManager:
@@ -165,6 +172,7 @@ class FakeFinalizer:
         self.targets = targets
         self.receipt_store = receipt_store
         self.fence = fence
+        self.reconcile_calls = 0
 
     def preflight_draft_result(self, **kwargs):
         del kwargs
@@ -175,6 +183,10 @@ class FakeFinalizer:
 
     def finalize_abandoned(self, **kwargs):
         del kwargs
+
+    def reconcile_expired(self):
+        self.reconcile_calls += 1
+        return self.receipt_store.overdue_produced()
 
 
 class RecordingRegistry(ProjectRuntimeRegistry):
@@ -328,6 +340,7 @@ class RuntimeFactoryTest(SimpleTestCase):
             roi_services_factory=lambda **kwargs: SimpleNamespace(
                 **kwargs,
                 close_admission=lambda: None,
+                expire_orphan_receipts=lambda: kwargs['finalizer'].reconcile_expired(),
             ),
         )
         return SimpleNamespace(
@@ -358,6 +371,7 @@ class RuntimeFactoryTest(SimpleTestCase):
         self.assertEqual(fixture.verifier_args, [{'train': 101, 'val': 102}])
         self.assertEqual(fixture.catalog_args[0][1], {'train': 101, 'val': 102})
         self.assertEqual(fixture.adapters[0].apply_calls, 1)
+        self.assertEqual(fixture.managers[0].receipt_store.overdue_calls, 1)
         self.assertEqual(fixture.adapters[0].attest_calls, 1)
         self.assertIsNone(fixture.resolvers[0].resolve('unknown-receipt'))
 

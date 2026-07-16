@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import copy
 from contextlib import nullcontext
+from threading import Event, Thread
 from types import SimpleNamespace
+from unittest.mock import patch
 from uuid import uuid4
 
+import coordexp_refinement.roi_services as roi_services_module
 from coordexp_refinement.catalog import DraftCatalogError, _store_project_state
 from coordexp_refinement.roi_services import (
     DeferredCurrentTargetProvider,
@@ -18,6 +21,7 @@ from django.test import SimpleTestCase
 from src.label_studio_coco_refinement.geometry import (
     norm1000_bbox_to_label_studio_xywh,
 )
+from src.label_studio_coco_refinement.inference_results import RequestTarget
 
 
 class _ReceiptStore:
@@ -39,6 +43,17 @@ class _ReceiptStore:
         return copy.deepcopy(self.records[receipt_id]['response'])
 
 
+class _FakeCancellationToken:
+    def __init__(self) -> None:
+        self.requested = False
+        self.reason = None
+
+    def cancel(self, reason):
+        if not self.requested:
+            self.requested = True
+            self.reason = reason
+
+
 class _Manager:
     def __init__(self) -> None:
         self.receipt_store = _ReceiptStore()
@@ -58,6 +73,10 @@ class _Manager:
     def infer(self, **kwargs):
         del kwargs
         return _empty_response()
+
+    @staticmethod
+    def new_cancellation_token():
+        return _FakeCancellationToken()
 
     def close(self):
         return None
@@ -417,7 +436,7 @@ class DeferredCurrentTargetProviderTest(SimpleTestCase):
 
         with self.assertRaises(RoiReceiptConflictError):
             services.abandon(
-                user=object(),
+                user=SimpleNamespace(pk=3),
                 receipt_id=receipt_id,
                 reason='user_discarded',
                 expected_project_pk=7,
@@ -427,6 +446,338 @@ class DeferredCurrentTargetProviderTest(SimpleTestCase):
         self.assertEqual(services.finalizer.calls, [])
         self.assertEqual(services.receipt_store.records, before)
         self.assertEqual(services.receipt_store.disposition(receipt_id), before_disposition)
+
+    def test_active_generation_can_be_abandoned_before_receipt_and_backend_is_reusable(self) -> None:
+        services = _services()
+        first_target = _request_target()
+        first_receipt_id = f'roi-receipt:{first_target.request_id}'
+        generation_started = Event()
+        generation_finished = Event()
+        allow_target_bind = Event()
+        errors = []
+        backend_calls = []
+        active_holder = []
+
+        def run_blocked_generation() -> None:
+            try:
+                with services.inference_lifecycle(
+                    request_id=first_target.request_id,
+                    expected_project_pk=7,
+                    expected_split='train',
+                    expected_user_pk=3,
+                ) as active:
+                    active_holder.append(active)
+                    generation_started.set()
+                    self.assertTrue(allow_target_bind.wait(timeout=5))
+                    token = services.bind_inference_target(active, first_target)
+                    backend_calls.append(first_target.request_id)
+                    self.assertTrue(token.requested)
+                    response = _abandoned_response(first_target.request_id, token.reason)
+                    services.receipt_store.records[first_receipt_id] = {
+                        'record_kind': 'attempt',
+                        'receipt_id': first_receipt_id,
+                        'attempt': {
+                            'request_state': 'abandoned_before_insertion',
+                            'request': {
+                                'project_id': first_target.project_id,
+                                'task_id': first_target.task_id,
+                                'current_user_id': first_target.current_user_id,
+                            },
+                        },
+                        'response': response,
+                    }
+            except BaseException as exc:  # pragma: no cover - asserted below.
+                errors.append(exc)
+            finally:
+                generation_finished.set()
+
+        inference_thread = Thread(target=run_blocked_generation)
+        inference_thread.start()
+        self.assertTrue(generation_started.wait(timeout=5))
+
+        terminal = []
+        abandon_thread = Thread(
+            target=lambda: terminal.append(
+                services.abandon(
+                    user=SimpleNamespace(pk=3),
+                    receipt_id=first_receipt_id,
+                    reason='user_cancelled',
+                    expected_project_pk=7,
+                    expected_split='train',
+                )
+            )
+        )
+        abandon_thread.start()
+        with services._inference_lifecycle:
+            while active_holder[0].abandon_reason is None:
+                services._inference_lifecycle.wait(timeout=5)
+        with self.assertRaisesRegex(RoiReceiptConflictError, 'reason conflicts'):
+            services.abandon(
+                user=SimpleNamespace(pk=3),
+                receipt_id=first_receipt_id,
+                reason='superseded',
+                expected_project_pk=7,
+                expected_split='train',
+            )
+        allow_target_bind.set()
+
+        inference_thread.join(timeout=5)
+        abandon_thread.join(timeout=5)
+        self.assertFalse(inference_thread.is_alive())
+        self.assertFalse(abandon_thread.is_alive())
+        self.assertTrue(generation_finished.is_set())
+        self.assertEqual(errors, [])
+        self.assertEqual(terminal[0]['terminal_status'], 'abandoned_before_insertion')
+        self.assertEqual(terminal[0]['failure'], {'stage': 'cancel', 'code': 'user_cancelled'})
+        self.assertEqual(services.finalizer.calls, [])
+        self.assertEqual(
+            services.abandon(
+                user=SimpleNamespace(pk=3),
+                receipt_id=first_receipt_id,
+                reason='user_cancelled',
+                expected_project_pk=7,
+                expected_split='train',
+            ),
+            terminal[0],
+        )
+        later_target = _request_target(request_id=str(uuid4()))
+        with services.inference_lifecycle(
+            request_id=later_target.request_id,
+            expected_project_pk=7,
+            expected_split='train',
+            expected_user_pk=3,
+        ) as active:
+            token = services.bind_inference_target(active, later_target)
+            backend_calls.append(later_target.request_id)
+            self.assertFalse(token.requested)
+        self.assertEqual(backend_calls, [first_target.request_id, later_target.request_id])
+
+    def test_abandon_first_intent_is_consumed_by_later_inference_registration(self) -> None:
+        services = _services()
+        target = _request_target()
+        receipt_id = f'roi-receipt:{target.request_id}'
+
+        with self.assertRaisesRegex(RoiReceiptConflictError, 'pending inference registration'):
+            services.abandon(
+                user=SimpleNamespace(pk=3),
+                receipt_id=receipt_id,
+                reason='user_discarded',
+                expected_project_pk=7,
+                expected_split='train',
+            )
+
+        self.assertIn(target.request_id, services._pending_abandonments)
+        with services.inference_lifecycle(
+            request_id=target.request_id,
+            expected_project_pk=7,
+            expected_split='train',
+            expected_user_pk=3,
+        ) as active:
+            self.assertEqual(active.abandon_reason, 'user_discarded')
+            token = services.bind_inference_target(active, target)
+            self.assertTrue(token.requested)
+            self.assertEqual(token.reason, 'user_discarded')
+            services.receipt_store.records[receipt_id] = _terminal_record(
+                target,
+                _abandoned_response(target.request_id, token.reason),
+            )
+
+        self.assertNotIn(target.request_id, services._pending_abandonments)
+        self.assertEqual(
+            services.abandon(
+                user=SimpleNamespace(pk=3),
+                receipt_id=receipt_id,
+                reason='user_discarded',
+                expected_project_pk=7,
+                expected_split='train',
+            )['terminal_status'],
+            'abandoned_before_insertion',
+        )
+
+    def test_pending_abandonment_is_bounded_expires_and_conflicts_exactly(self) -> None:
+        services = _services()
+        request_a, request_b = str(uuid4()), str(uuid4())
+        clock = [0.0]
+
+        with (
+            patch.object(roi_services_module, '_PENDING_ABANDON_CAPACITY', 1),
+            patch.object(roi_services_module, '_PENDING_ABANDON_TTL_SECONDS', 10.0),
+            patch.object(roi_services_module.time, 'monotonic', side_effect=lambda: clock[0]),
+        ):
+            with self.assertRaisesRegex(RoiReceiptConflictError, 'pending inference registration'):
+                services.abandon(
+                    user=SimpleNamespace(pk=3),
+                    receipt_id=f'roi-receipt:{request_a}',
+                    reason='user_cancelled',
+                    expected_project_pk=7,
+                    expected_split='train',
+                )
+            pending_a = services._pending_abandonments[request_a]
+            before = dict(services._pending_abandonments)
+
+            clock[0] = 1.0
+            with self.assertRaisesRegex(RoiReceiptConflictError, 'pending inference registration'):
+                services.abandon(
+                    user=SimpleNamespace(pk=3),
+                    receipt_id=f'roi-receipt:{request_a}',
+                    reason='user_cancelled',
+                    expected_project_pk=7,
+                    expected_split='train',
+                )
+            self.assertEqual(services._pending_abandonments, before)
+            self.assertIs(services._pending_abandonments[request_a], pending_a)
+            with self.assertRaisesRegex(RoiReceiptConflictError, 'pending ROI abandonment conflicts'):
+                services.abandon(
+                    user=SimpleNamespace(pk=3),
+                    receipt_id=f'roi-receipt:{request_a}',
+                    reason='superseded',
+                    expected_project_pk=7,
+                    expected_split='train',
+                )
+            with self.assertRaisesRegex(RoiReceiptConflictError, 'pending ROI abandonment conflicts'):
+                services.abandon(
+                    user=SimpleNamespace(pk=4),
+                    receipt_id=f'roi-receipt:{request_a}',
+                    reason='user_cancelled',
+                    expected_project_pk=7,
+                    expected_split='train',
+                )
+
+            with self.assertRaisesRegex(RoiReceiptConflictError, 'capacity is full'):
+                services.abandon(
+                    user=SimpleNamespace(pk=3),
+                    receipt_id=f'roi-receipt:{request_b}',
+                    reason='user_cancelled',
+                    expected_project_pk=7,
+                    expected_split='train',
+                )
+            self.assertEqual(services._pending_abandonments, before)
+            self.assertIs(services._pending_abandonments[request_a], pending_a)
+
+            target_a = _request_target(request_id=request_a)
+            with services.inference_lifecycle(
+                request_id=request_a,
+                expected_project_pk=7,
+                expected_split='train',
+                expected_user_pk=3,
+            ) as active:
+                self.assertEqual(active.abandon_reason, 'user_cancelled')
+                self.assertTrue(services.bind_inference_target(active, target_a).requested)
+
+            with self.assertRaisesRegex(RoiReceiptConflictError, 'admission is saturated'):
+                with services.inference_lifecycle(
+                    request_id=request_b,
+                    expected_project_pk=7,
+                    expected_split='train',
+                    expected_user_pk=3,
+                ):
+                    self.fail('saturated unknown inference was admitted')
+
+            clock[0] = 12.0
+            target_b = _request_target(request_id=request_b)
+            with services.inference_lifecycle(
+                request_id=request_b,
+                expected_project_pk=7,
+                expected_split='train',
+                expected_user_pk=3,
+            ) as active:
+                self.assertIsNone(active.abandon_reason)
+                self.assertFalse(services.bind_inference_target(active, target_b).requested)
+
+    def test_existing_safe_no_insertion_terminals_return_exactly_without_mutation(self) -> None:
+        safe_states = (
+            ('empty', True, True),
+            ('all_rejected', True, True),
+            ('response_failure', False, True),
+            ('profile_failure', False, False),
+            ('transport_failure', False, False),
+            ('runtime_failure', False, False),
+            ('timeout_failure', False, False),
+            ('cancelled', False, False),
+            ('abandoned_before_insertion', False, False),
+        )
+        for state, clear_roi, has_counts in safe_states:
+            with self.subTest(state=state):
+                services = _services()
+                target = _request_target(request_id=str(uuid4()))
+                response = _safe_terminal_response(
+                    target.request_id,
+                    state=state,
+                    clear_roi=clear_roi,
+                    has_counts=has_counts,
+                )
+                services.receipt_store.records[response['receipt_id']] = _terminal_record(target, response)
+                before = copy.deepcopy(services.receipt_store.records)
+                reason = 'safe_terminal' if state == 'abandoned_before_insertion' else 'superseded'
+
+                returned = services.abandon(
+                    user=SimpleNamespace(pk=3),
+                    receipt_id=response['receipt_id'],
+                    reason=reason,
+                    expected_project_pk=7,
+                    expected_split='train',
+                )
+
+                self.assertEqual(returned, response)
+                self.assertEqual(services.receipt_store.records, before)
+                self.assertEqual(services.finalizer.calls, [])
+
+    def test_existing_abandoned_terminal_requires_exact_reason_for_both_shapes(self) -> None:
+        for label, response_factory in (
+            ('early', lambda request_id: _abandoned_response(request_id, 'user_cancelled')),
+            ('disposition', lambda request_id: _abandoned_disposition_response(request_id, 'user_cancelled')),
+        ):
+            with self.subTest(label=label):
+                services = _services()
+                target = _request_target(request_id=str(uuid4()))
+                response = response_factory(target.request_id)
+                services.receipt_store.records[response['receipt_id']] = _terminal_record(target, response)
+
+                self.assertEqual(
+                    services.abandon(
+                        user=SimpleNamespace(pk=3),
+                        receipt_id=response['receipt_id'],
+                        reason='user_cancelled',
+                        expected_project_pk=7,
+                        expected_split='train',
+                    ),
+                    response,
+                )
+                with self.assertRaisesRegex(RoiReceiptConflictError, 'reason conflicts'):
+                    services.abandon(
+                        user=SimpleNamespace(pk=3),
+                        receipt_id=response['receipt_id'],
+                        reason='superseded',
+                        expected_project_pk=7,
+                        expected_split='train',
+                    )
+
+    def test_inserted_acceptance_is_never_treated_as_safe_abandonment(self) -> None:
+        services = _services()
+        target = _request_target()
+        response = _accepted_response(target.request_id)
+        services.receipt_store.records[response['receipt_id']] = {
+            **_terminal_record(target, response),
+            'attempt': {
+                'request_state': 'produced',
+                'request': {
+                    'project_id': target.project_id,
+                    'task_id': target.task_id,
+                    'current_user_id': target.current_user_id,
+                },
+            },
+        }
+
+        with self.assertRaisesRegex(RoiReceiptConflictError, 'already inserted'):
+            services.abandon(
+                user=SimpleNamespace(pk=3),
+                receipt_id=response['receipt_id'],
+                reason='user_discarded',
+                expected_project_pk=7,
+                expected_split='train',
+            )
+
+        self.assertEqual(services.finalizer.calls, [])
 
     def test_store_state_keeps_prior_terminal_and_new_active_snapshot_separate(self) -> None:
         store = _ProjectStateStore()
@@ -524,6 +875,109 @@ def _empty_response(*, request_id=None):
         'failure': None,
         'counts': {'parsed': 0, 'produced': 0, 'rejected': 0},
     }
+
+
+def _abandoned_response(request_id, reason):
+    return {
+        'receipt_id': f'roi-receipt:{request_id}',
+        'request_id': request_id,
+        'request_state': 'abandoned_before_insertion',
+        'terminal_status': 'abandoned_before_insertion',
+        'clear_roi': False,
+        'insertion_payload': None,
+        'failure': {'stage': 'cancel', 'code': reason},
+    }
+
+
+def _abandoned_disposition_response(request_id, reason):
+    return {
+        **_abandoned_response(request_id, reason),
+        'failure': {'stage': 'insertion', 'code': reason},
+        'counts': {'parsed': 1, 'inserted': 0, 'rejected': 0},
+    }
+
+
+def _terminal_record(target, response):
+    return {
+        'record_kind': 'attempt',
+        'receipt_id': response['receipt_id'],
+        'attempt': {
+            'request_state': response['request_state'],
+            'request': {
+                'project_id': target.project_id,
+                'task_id': target.task_id,
+                'current_user_id': target.current_user_id,
+            },
+        },
+        'response': response,
+    }
+
+
+def _safe_terminal_response(request_id, *, state, clear_roi, has_counts):
+    response = {
+        'receipt_id': f'roi-receipt:{request_id}',
+        'request_id': request_id,
+        'request_state': state,
+        'terminal_status': state,
+        'clear_roi': clear_roi,
+        'insertion_payload': None,
+        'failure': None,
+    }
+    if has_counts:
+        response['counts'] = {
+            'parsed': 1 if state == 'all_rejected' else 0,
+            'produced': 0,
+            'rejected': 1 if state == 'all_rejected' else 0,
+        }
+    else:
+        response['failure'] = {
+            'stage': 'cancel' if state in {'cancelled', 'abandoned_before_insertion'} else 'runtime',
+            'code': 'safe_terminal',
+        }
+    return response
+
+
+def _accepted_response(request_id):
+    revision = '2026-07-15T00:00:01.000000Z'
+    return {
+        'receipt_id': f'roi-receipt:{request_id}',
+        'request_id': request_id,
+        'request_state': 'accepted',
+        'terminal_status': 'accepted',
+        'clear_roi': True,
+        'insertion_payload': None,
+        'failure': None,
+        'counts': {'parsed': 1, 'inserted': 1, 'rejected': 0},
+        'result_region_keys': {f'{request_id}:result-0': f'roi:{request_id}:1'},
+        'insertion_attestation': {
+            'source_annotation_revision': revision,
+            'observed_annotation_revision': revision,
+            'source_draft_revision': revision,
+            'inserted_draft_revision': revision,
+            'inserted_draft_updated_at': revision,
+            'saved_full_result_sha256': 'a' * 64,
+            'saved_semantic_result_sha256': 'b' * 64,
+        },
+    }
+
+
+def _request_target(*, request_id=None):
+    return RequestTarget(
+        request_id=request_id or str(uuid4()),
+        project_id='7',
+        task_id='train:41',
+        task_epoch='epoch-1',
+        image_id='41',
+        annotation_id='11',
+        annotation_revision='annotation-revision-1',
+        current_user_id='3',
+        draft_id='12',
+        draft_revision='2026-07-15T00:00:00.000000Z',
+        profile_fingerprint='a' * 64,
+        project_generation=9,
+        transform_fingerprint='b' * 64,
+        preexisting_draft_dirty=False,
+    )
 
 
 def _produced_response(*, request_id=None, bbox=(100, 200, 300, 400)):

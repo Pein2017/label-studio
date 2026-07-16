@@ -76,6 +76,7 @@ class DjangoRoiFinalizer:
             'replay',
             'finalize_inserted',
             'finalize_abandoned',
+            'overdue_produced',
         ):
             if not callable(getattr(receipt_store, method, None)):
                 raise DjangoRoiFinalizationError(f'receipt store must provide {method}()')
@@ -84,6 +85,46 @@ class DjangoRoiFinalizer:
         self.fence = draft_transition_fence if fence is None else fence
         if not isinstance(self.fence, DraftTransitionFence):
             raise DjangoRoiFinalizationError('fence must be a DraftTransitionFence')
+
+    def reconcile_expired(self) -> tuple[str, ...]:
+        """Finalize overdue produced receipts from locked persisted Draft truth."""
+
+        overdue = self.receipt_store.overdue_produced()
+        if not isinstance(overdue, tuple):
+            raise DjangoRoiFinalizationError('overdue receipt query returned invalid data')
+        reconciled: list[str] = []
+        for receipt_id in overdue:
+            plan = self._produced_plan(receipt_id)
+            user_pk = _canonical_text_pk(plan.target.current_user_id, field='current_user_id')
+            project_pk = _canonical_text_pk(plan.target.project_id, field='project_id')
+            with self.fence.hold(
+                project_id=project_pk,
+                user_id=user_pk,
+                task_key=plan.target.task_id,
+            ):
+                plan = self._produced_plan(receipt_id)
+                disposition = self.receipt_store.disposition(receipt_id)
+                if disposition is not None:
+                    _strict_disposition(disposition, plan=plan)
+                    reconciled.append(receipt_id)
+                    continue
+                try:
+                    resolved = self._finalize_inserted_locked(user_pk=user_pk, plan=plan)
+                except DjangoRoiFinalizationError:
+                    try:
+                        resolved = self._finalize_abandoned_locked(
+                            user_pk=user_pk,
+                            plan=plan,
+                            reason='produced_expired',
+                        )
+                    except DjangoRoiFinalizationError as abandoned_error:
+                        raise DjangoRoiFinalizationError(
+                            'expired produced receipt has ambiguous Draft linkage'
+                        ) from abandoned_error
+            if resolved != receipt_id:
+                raise DjangoRoiFinalizationError('expired receipt reconciliation identity differs')
+            reconciled.append(receipt_id)
+        return tuple(reconciled)
 
     def preflight_draft_result(
         self,

@@ -46,6 +46,8 @@ class _ReceiptStore:
         self.fail_next_inserted = False
         self.fail_after_inserted = False
         self.fail_after_abandoned = False
+        self.overdue: tuple[str, ...] = ()
+        self.after_overdue = None
 
     def add_produced(self, target, *, mappings: list[tuple[str, str]]) -> str:
         receipt_id = f'roi-receipt:{target.request_id}'
@@ -104,6 +106,14 @@ class _ReceiptStore:
             for receipt_id, (kind, proof) in self.dispositions.items()
         )
         return tuple(records)
+
+    def overdue_produced(self):
+        overdue = self.overdue
+        callback = self.after_overdue
+        self.after_overdue = None
+        if callback is not None:
+            callback()
+        return overdue
 
     def finalize_inserted(self, proof: AuthoritativeInsertionProof) -> str:
         self.finalize_atomic.append(transaction.get_connection().in_atomic_block)
@@ -640,6 +650,52 @@ class RoiFinalizationTestCase(TestCase):
                         reason='target_changed',
                     )
                 self.assertEqual(self.receipts.dispositions, {})
+
+    def test_expired_reconciliation_inserts_exact_linkage_and_abandons_zero_linkage(self) -> None:
+        self.receipts.overdue = (self.receipt_id,)
+
+        zero_linkage = self.finalizer.reconcile_expired()
+
+        self.assertEqual(zero_linkage, (self.receipt_id,))
+        self.assertEqual(self.receipts.dispositions[self.receipt_id][0], 'abandoned')
+        self.assertEqual(
+            self.receipts.dispositions[self.receipt_id][1]['reason'],
+            'produced_expired',
+        )
+
+        self.receipts.dispositions.clear()
+        self._persist_inserted()
+        exact_linkage = self.finalizer.reconcile_expired()
+
+        self.assertEqual(exact_linkage, (self.receipt_id,))
+        self.assertEqual(self.receipts.dispositions[self.receipt_id][0], 'inserted')
+
+    def test_expired_reconciliation_fails_closed_on_partial_linkage(self) -> None:
+        partial = _human_result('human:partial')
+        partial['meta']['coordexp_inference_receipt_id'] = self.receipt_id
+        self._persist_inserted(result=_result(self.image_id) + [partial])
+        self.receipts.overdue = (self.receipt_id,)
+
+        with self.assertRaisesRegex(DjangoRoiFinalizationError, 'ambiguous Draft linkage'):
+            self.finalizer.reconcile_expired()
+
+        self.assertEqual(self.receipts.dispositions, {})
+
+    def test_expired_reconciliation_honors_disposition_winning_after_listing(self) -> None:
+        self.receipts.overdue = (self.receipt_id,)
+        self.receipts.after_overdue = lambda: self.finalizer.finalize_abandoned(
+            user=self.user,
+            receipt_id_or_request_id=self.receipt_id,
+            reason='user_discarded',
+        )
+
+        reconciled = self.finalizer.reconcile_expired()
+
+        self.assertEqual(reconciled, (self.receipt_id,))
+        self.assertEqual(len(self.receipts.dispositions), 1)
+        kind, proof = self.receipts.dispositions[self.receipt_id]
+        self.assertEqual(kind, 'abandoned')
+        self.assertEqual(proof['reason'], 'user_discarded')
 
 
 def _inference_result(case: RoiFinalizationTestCase) -> dict[str, Any]:

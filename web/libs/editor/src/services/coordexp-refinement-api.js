@@ -74,6 +74,7 @@ export class CoordExpRefinementClient {
 
     this.baseUrl = `/api/projects/${projectId}/coordexp-refinement`;
     this.fetch = fetchImpl === undefined ? resolvedFetch.bind(globalThis) : resolvedFetch;
+    this.csrfToken = null;
   }
 
   async request(path, options = {}) {
@@ -98,6 +99,7 @@ export class CoordExpRefinementClient {
         code: "missing_csrf_token",
       });
     }
+    this.csrfToken = payload.csrf_token;
     return payload;
   }
 
@@ -138,6 +140,21 @@ export class CoordExpRefinementClient {
       }
       throw error;
     }
+  }
+
+  async postWithCachedCsrf(path, body, { signal, keepalive = false } = {}) {
+    const token = this.csrfToken ?? (await this.session(signal)).csrf_token;
+
+    return this.request(path, {
+      method: "POST",
+      signal,
+      keepalive,
+      headers: {
+        ...JSON_HEADERS,
+        "X-CSRFToken": token,
+      },
+      body: JSON.stringify(body),
+    });
   }
 
   commit(batchId, signal) {
@@ -182,14 +199,16 @@ export class CoordExpRefinementClient {
     );
   }
 
-  abandon({ receiptId, reason }, signal) {
-    return this.postWithCsrf(
+  abandon({ receiptId, reason }, signal, { keepalive = false } = {}) {
+    const post = keepalive ? this.postWithCachedCsrf.bind(this) : this.postWithCsrf.bind(this);
+
+    return post(
       "/roi/abandon/",
       {
         receipt_id: receiptId,
         reason,
       },
-      signal,
+      keepalive ? { signal, keepalive: true } : signal,
     );
   }
 }

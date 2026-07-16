@@ -105,6 +105,15 @@ class _Services:
     def request_admission(self):
         yield
 
+    @contextmanager
+    def inference_lifecycle(self, **kwargs):
+        self.inference_lifecycle_call = kwargs
+        yield SimpleNamespace(name='server-active-inference')
+
+    def bind_inference_target(self, active, target):
+        self.bound_inference = (active, target)
+        return SimpleNamespace(name='server-cancellation-token')
+
     def safe_profiles(self):
         return self.manager.profile_options()
 
@@ -260,6 +269,17 @@ class RoiApiTest(TestCase):
         call = self.services.manager.calls[0]
         self.assertIs(call['image'], self.services.targets.captured.image)
         self.assertIs(call['target'], self.services.targets.captured.target)
+        self.assertEqual(call['cancellation_token'].name, 'server-cancellation-token')
+        self.assertEqual(
+            self.services.inference_lifecycle_call,
+            {
+                'request_id': self.request_id,
+                'expected_project_pk': self.project.pk,
+                'expected_split': 'train',
+                'expected_user_pk': self.user.pk,
+            },
+        )
+        self.assertIs(self.services.bound_inference[1], self.services.targets.captured.target)
         self.assertTrue(self.services.targets.captured.closed)
 
     def test_infer_body_rejects_browser_authority_and_non_finite_values(self) -> None:

@@ -224,9 +224,12 @@ export const CoordExpAIRegion = observer(
     );
 
     const abandon = useCallback(
-      async (attempt, reason) => {
+      async (attempt, reason, { keepalive = false } = {}) => {
         try {
-          const response = await client.abandon({ receiptId: `roi-receipt:${attempt.requestId}`, reason });
+          const request = { receiptId: `roi-receipt:${attempt.requestId}`, reason };
+          const response = keepalive
+            ? await client.abandon(request, undefined, { keepalive: true })
+            : await client.abandon(request);
 
           validateAbandonResponse(response.payload ?? response, { requestId: attempt.requestId, reason });
           attempt.abandonConfirmed = true;
@@ -302,7 +305,7 @@ export const CoordExpAIRegion = observer(
 
         if (attempt && !attempt.inserted) {
           attempt.disposition = attempt.disposition ?? "user_discarded";
-          attempt.abandonPromise ??= abandon(attempt, attempt.disposition);
+          attempt.abandonPromise ??= abandon(attempt, attempt.disposition, { keepalive: true });
         }
         try {
           finishRuntimeLock(false);

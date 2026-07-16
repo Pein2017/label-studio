@@ -6,6 +6,7 @@ import json
 import math
 import re
 import threading
+import time
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -32,6 +33,20 @@ class RoiReceiptConflictError(RoiServicesError):
 
 
 _SAFE_TOKEN = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}\Z')
+_RECEIPT_ID = re.compile(r'roi-receipt:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z')
+_PENDING_ABANDON_TTL_SECONDS = 60.0
+_PENDING_ABANDON_CAPACITY = 1024
+_SAFE_NO_INSERTION_TERMINALS = {
+    'empty',
+    'all_rejected',
+    'response_failure',
+    'profile_failure',
+    'transport_failure',
+    'runtime_failure',
+    'timeout_failure',
+    'cancelled',
+    'abandoned_before_insertion',
+}
 _PROFILE_FIELDS = {
     'selector',
     'display_label',
@@ -79,6 +94,28 @@ class DeferredCurrentTargetProvider:
             return self._target
 
 
+@dataclass
+class _ActiveRoiInference:
+    request_id: str
+    project_pk: int
+    split: str
+    user_pk: int
+    target: Any | None = None
+    token: Any | None = None
+    abandon_reason: str | None = None
+    completed: bool = False
+
+
+@dataclass(frozen=True)
+class _PendingRoiAbandonment:
+    request_id: str
+    project_pk: int
+    split: str
+    user_pk: int
+    reason: str
+    recorded_at: float
+
+
 class RoiLaunchProfileResolver:
     """Adapt the parent launch manager's INTERNAL profile contract."""
 
@@ -124,6 +161,22 @@ class RoiProjectServices:
     )
     _closing: bool = field(default=False, init=False, repr=False)
     _active_requests: int = field(default=0, init=False, repr=False)
+    _inference_lifecycle: threading.Condition = field(
+        default_factory=lambda: threading.Condition(threading.Lock()),
+        init=False,
+        repr=False,
+    )
+    _active_inference: dict[str, _ActiveRoiInference] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _pending_abandonments: dict[str, _PendingRoiAbandonment] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _pending_saturated_until: float = field(default=0.0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if getattr(self.manager, 'receipt_store', None) is not self.receipt_store:
@@ -138,7 +191,7 @@ class RoiProjectServices:
             raise RoiServicesError('targets must be a Django ROI target catalog')
         if not isinstance(self.stores, Mapping) or set(self.stores) != {'train', 'val'}:
             raise RoiServicesError('ROI services require train and val stores')
-        for method in ('profile_options', 'infer', 'close'):
+        for method in ('profile_options', 'infer', 'close', 'new_cancellation_token'):
             if not callable(getattr(self.manager, method, None)):
                 raise RoiServicesError(f'ROI launch manager must provide {method}()')
         for method in ('finalize_abandoned',):
@@ -187,6 +240,95 @@ class RoiProjectServices:
         _validate_infer_response(payload)
         return payload
 
+    def expire_orphan_receipts(self) -> tuple[str, ...]:
+        """Delegate overdue decisions to the DB/fence-owning finalizer."""
+
+        expire = getattr(self.finalizer, 'reconcile_expired', None)
+        if not callable(expire):
+            raise RoiServicesError('ROI receipt reconciliation authority is unavailable')
+        expired = expire()
+        if not isinstance(expired, tuple) or any(
+            not isinstance(receipt_id, str) or _RECEIPT_ID.fullmatch(receipt_id) is None
+            for receipt_id in expired
+        ):
+            raise RoiServicesError('ROI receipt expiry returned invalid identities')
+        return expired
+
+    @contextmanager
+    def inference_lifecycle(
+        self,
+        *,
+        request_id: str,
+        expected_project_pk: int,
+        expected_split: str,
+        expected_user_pk: int,
+    ):
+        """Reserve the authenticated route before target capture begins."""
+
+        _canonical_uuid(request_id, field='ROI request id')
+        _positive_int(expected_project_pk, field='expected project id')
+        _positive_int(expected_user_pk, field='expected user id')
+        if expected_split not in {'train', 'val'}:
+            raise RoiServicesError('ROI request split is invalid')
+        active = _ActiveRoiInference(
+            request_id=request_id,
+            project_pk=expected_project_pk,
+            split=expected_split,
+            user_pk=expected_user_pk,
+        )
+        with self._inference_lifecycle:
+            now = time.monotonic()
+            self._prune_pending_abandonments_locked(now)
+            if request_id in self._active_inference:
+                raise RoiServicesError('ROI request is already active')
+            pending = self._pending_abandonments.get(request_id)
+            if pending is not None:
+                if (
+                    pending.project_pk != expected_project_pk
+                    or pending.split != expected_split
+                    or pending.user_pk != expected_user_pk
+                ):
+                    raise RoiReceiptConflictError('pending ROI abandonment route conflicts')
+                active.abandon_reason = pending.reason
+                del self._pending_abandonments[request_id]
+            elif now < self._pending_saturated_until:
+                raise RoiReceiptConflictError('pending ROI abandonment admission is saturated')
+            self._active_inference[request_id] = active
+        try:
+            yield active
+        finally:
+            with self._inference_lifecycle:
+                active.completed = True
+                if self._active_inference.get(request_id) is active:
+                    del self._active_inference[request_id]
+                self._inference_lifecycle.notify_all()
+
+    def bind_inference_target(self, active: _ActiveRoiInference, target: Any) -> Any:
+        """Bind the exact server-frozen target and apply any earlier abandon."""
+
+        with self._inference_lifecycle:
+            if (
+                self._active_inference.get(active.request_id) is not active
+                or active.completed
+                or active.target is not None
+            ):
+                raise RoiServicesError('ROI request reservation is not bindable')
+            _validate_active_target(
+                target=target,
+                request_id=active.request_id,
+                expected_project_pk=active.project_pk,
+                expected_split=active.split,
+                expected_user_pk=active.user_pk,
+            )
+            token = self.manager.new_cancellation_token()
+            if not callable(getattr(token, 'cancel', None)):
+                raise RoiServicesError('ROI manager returned an invalid cancellation token')
+            active.target = target
+            active.token = token
+            if active.abandon_reason is not None:
+                token.cancel(active.abandon_reason)
+            return token
+
     def abandon(
         self,
         *,
@@ -196,12 +338,57 @@ class RoiProjectServices:
         expected_project_pk: int,
         expected_split: str,
     ) -> dict[str, Any]:
+        request_id = receipt_id.removeprefix('roi-receipt:')
+        with self._inference_lifecycle:
+            now = time.monotonic()
+            self._prune_pending_abandonments_locked(now)
+            active = self._active_inference.get(request_id)
+            if active is not None:
+                if (
+                    active.project_pk != expected_project_pk
+                    or active.split != expected_split
+                    or active.user_pk != user.pk
+                ):
+                    raise RoiReceiptConflictError('active ROI target route does not match')
+                if active.abandon_reason is not None and active.abandon_reason != reason:
+                    raise RoiReceiptConflictError('active ROI abandonment reason conflicts')
+                active.abandon_reason = reason
+                self._inference_lifecycle.notify_all()
+                if active.token is not None:
+                    active.token.cancel(reason)
+                while not active.completed:
+                    self._inference_lifecycle.wait()
+            elif self.receipt_store.get(receipt_id) is None:
+                self._remember_pending_abandonment_locked(
+                    request_id=request_id,
+                    project_pk=expected_project_pk,
+                    split=expected_split,
+                    user_pk=user.pk,
+                    reason=reason,
+                    recorded_at=now,
+                )
+                raise RoiReceiptConflictError('ROI receipt is pending inference registration')
         _validate_receipt_route(
             receipt_store=self.receipt_store,
             receipt_id=receipt_id,
             expected_project_pk=expected_project_pk,
             expected_split=expected_split,
+            expected_user_pk=user.pk,
         )
+        response = self.receipt_store.response(receipt_id)
+        if not isinstance(response, Mapping):
+            raise RoiServicesError('ROI abandonment returned no durable response')
+        payload = _ordinary_json(response)
+        _validate_infer_response(payload)
+        if payload['request_state'] in _SAFE_NO_INSERTION_TERMINALS:
+            if (
+                payload['request_state'] == 'abandoned_before_insertion'
+                and payload['failure']['code'] != reason
+            ):
+                raise RoiReceiptConflictError('ROI abandonment reason conflicts')
+            return payload
+        if payload['request_state'] != 'produced' or payload['terminal_status'] is not None:
+            raise RoiReceiptConflictError('ROI receipt is already inserted or not abandonable')
         finalized_id = self.finalizer.finalize_abandoned(
             user=user,
             receipt_id_or_request_id=receipt_id,
@@ -209,12 +396,61 @@ class RoiProjectServices:
         )
         if finalized_id != receipt_id:
             raise RoiServicesError('ROI finalizer returned a mismatched receipt')
-        response = self.receipt_store.response(receipt_id)
-        if not isinstance(response, Mapping):
+        terminal_response = self.receipt_store.response(receipt_id)
+        if not isinstance(terminal_response, Mapping):
             raise RoiServicesError('ROI abandonment returned no durable response')
-        payload = _ordinary_json(response)
-        _validate_infer_response(payload)
-        return payload
+        terminal_payload = _ordinary_json(terminal_response)
+        _validate_infer_response(terminal_payload)
+        return terminal_payload
+
+    def _prune_pending_abandonments_locked(self, now: float) -> None:
+        expired = [
+            request_id
+            for request_id, pending in self._pending_abandonments.items()
+            if now - pending.recorded_at >= _PENDING_ABANDON_TTL_SECONDS
+        ]
+        for request_id in expired:
+            del self._pending_abandonments[request_id]
+
+    def _remember_pending_abandonment_locked(
+        self,
+        *,
+        request_id: str,
+        project_pk: int,
+        split: str,
+        user_pk: int,
+        reason: str,
+        recorded_at: float,
+    ) -> None:
+        _canonical_uuid(request_id, field='ROI request id')
+        _positive_int(project_pk, field='expected project id')
+        _positive_int(user_pk, field='expected user id')
+        if split not in {'train', 'val'}:
+            raise RoiReceiptConflictError('pending ROI abandonment split is invalid')
+        prior = self._pending_abandonments.get(request_id)
+        if prior is not None:
+            if (
+                prior.project_pk != project_pk
+                or prior.split != split
+                or prior.user_pk != user_pk
+                or prior.reason != reason
+            ):
+                raise RoiReceiptConflictError('pending ROI abandonment conflicts')
+            return
+        if len(self._pending_abandonments) >= _PENDING_ABANDON_CAPACITY:
+            self._pending_saturated_until = max(
+                self._pending_saturated_until,
+                recorded_at + _PENDING_ABANDON_TTL_SECONDS,
+            )
+            raise RoiReceiptConflictError('pending ROI abandonment capacity is full')
+        self._pending_abandonments[request_id] = _PendingRoiAbandonment(
+            request_id=request_id,
+            project_pk=project_pk,
+            split=split,
+            user_pk=user_pk,
+            reason=reason,
+            recorded_at=recorded_at,
+        )
 
     def project_state(
         self,
@@ -716,8 +952,10 @@ def _validate_receipt_route(
     receipt_id: str,
     expected_project_pk: int,
     expected_split: str,
+    expected_user_pk: int,
 ) -> None:
     _positive_int(expected_project_pk, field='expected project id')
+    _positive_int(expected_user_pk, field='expected user id')
     if expected_split not in {'train', 'val'}:
         raise RoiReceiptConflictError('receipt route split is invalid')
     record = receipt_store.get(receipt_id)
@@ -727,13 +965,15 @@ def _validate_receipt_route(
         if (
             record.get('record_kind') != 'attempt'
             or record.get('receipt_id') != receipt_id
-            or record.get('attempt', {}).get('request_state') != 'produced'
+            or record.get('attempt', {}).get('request_state')
+            not in {'produced', *_SAFE_NO_INSERTION_TERMINALS}
         ):
-            raise RoiReceiptConflictError('ROI receipt is not a produced attempt')
+            raise RoiReceiptConflictError('ROI receipt is not abandonable')
         target = record['attempt']['request']
         if (
             not isinstance(target, Mapping)
             or target.get('project_id') != str(expected_project_pk)
+            or target.get('current_user_id') != str(expected_user_pk)
             or not isinstance(target.get('task_id'), str)
             or not target['task_id'].startswith(f'{expected_split}:')
         ):
@@ -742,6 +982,28 @@ def _validate_receipt_route(
         raise
     except Exception as exc:
         raise RoiReceiptConflictError('ROI receipt route is malformed') from exc
+
+
+def _validate_active_target(
+    *,
+    target: Any,
+    request_id: str,
+    expected_project_pk: int,
+    expected_split: str,
+    expected_user_pk: int,
+) -> None:
+    _positive_int(expected_project_pk, field='expected project id')
+    _positive_int(expected_user_pk, field='expected user id')
+    if expected_split not in {'train', 'val'}:
+        raise RoiReceiptConflictError('active ROI split is invalid')
+    if (
+        getattr(target, 'request_id', None) != request_id
+        or getattr(target, 'project_id', None) != str(expected_project_pk)
+        or getattr(target, 'current_user_id', None) != str(expected_user_pk)
+        or not isinstance(getattr(target, 'task_id', None), str)
+        or not target.task_id.startswith(f'{expected_split}:')
+    ):
+        raise RoiReceiptConflictError('active ROI target route does not match')
 
 
 def _exact_keys(value: Any, expected: set[str], *, field: str) -> None:
