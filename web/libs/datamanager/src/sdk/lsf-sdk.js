@@ -217,6 +217,7 @@ export class LSFWrapper {
 
     this._managedDraftSaves = new Map();
     this._managedDraftBaselines = new Map();
+    this._managedAnnotationHydrations = new Map();
     this._managedAnnotationTaskIds = new WeakMap();
     this._managedLocalPendingDrafts = new Map();
     this._managedLocalSaveVersion = 0;
@@ -391,6 +392,20 @@ export class LSFWrapper {
     );
   }
 
+  _claimManagedDraftSaveOwner(annotation) {
+    if (!this.isManagedRefinementProject || !annotation) return;
+    if (typeof annotation.setExternalDraftSaveOwner === "function") {
+      annotation.setExternalDraftSaveOwner(true);
+    } else {
+      annotation.pauseAutosave?.();
+    }
+  }
+
+  _claimManagedDraftSaveOwners(annotations = this.annotations ?? []) {
+    if (!this.isManagedRefinementProject) return;
+    for (const annotation of annotations) this._claimManagedDraftSaveOwner(annotation);
+  }
+
   _bindManagedAnnotationTask(annotation, task = this.task) {
     if (!annotation || !task?.id) return null;
     if (!this._managedAnnotationTaskIds.has(annotation)) this._managedAnnotationTaskIds.set(annotation, task.id);
@@ -406,6 +421,68 @@ export class LSFWrapper {
 
     if (!isDefined(annotationId)) return null;
     return `${taskId}:${annotationId}`;
+  }
+
+  _pruneManagedAnnotationHydrations(annotation = this.currentAnnotation) {
+    if (!this.isManagedRefinementProject) return;
+
+    const identity = this._managedAnnotationIdentity(annotation);
+
+    for (const [candidateIdentity, hydration] of this._managedAnnotationHydrations) {
+      if (candidateIdentity !== identity || hydration.annotation !== annotation) {
+        if (hydration.status === "pending" || this._managedDraftSaves.has(candidateIdentity)) continue;
+        this._managedAnnotationHydrations.delete(candidateIdentity);
+      }
+    }
+  }
+
+  async _awaitManagedAnnotationHydration(annotation) {
+    if (!this.isManagedRefinementProject || !annotation) return;
+
+    const identity = this._managedAnnotationIdentity(annotation);
+
+    if (!identity) return;
+
+    // A retry replaces the prior failed generation. Always re-read the
+    // identity-scoped record after awaiting so a save cannot race past a newer
+    // hydration attempt.
+    let observed = false;
+
+    for (;;) {
+      const hydration = this._managedAnnotationHydrations.get(identity);
+
+      if (!hydration) {
+        if (!observed) return;
+        throw this._managedDraftError(
+          "ANNOTATION_HYDRATION_SUPERSEDED",
+          "The annotation changed while its authoritative result was loading. No Draft was saved.",
+        );
+      }
+      observed = true;
+      if (hydration.annotation !== annotation) {
+        throw this._managedDraftError(
+          "ANNOTATION_HYDRATION_SUPERSEDED",
+          "The annotation changed while its authoritative result was loading. No Draft was saved.",
+        );
+      }
+      if (hydration.status === "pending") await hydration.promise;
+      if (this._managedCoordinatorDestroyed) return;
+      if (this._managedAnnotationHydrations.get(identity) !== hydration) {
+        throw this._managedDraftError(
+          "ANNOTATION_HYDRATION_SUPERSEDED",
+          "The annotation changed while its authoritative result was loading. No Draft was saved.",
+        );
+      }
+      if (hydration.status === "ready") return;
+
+      throw (
+        hydration.error ??
+        this._managedDraftError(
+          "ANNOTATION_HYDRATION_FAILED",
+          "The authoritative annotation could not be loaded. No Draft was saved.",
+        )
+      );
+    }
   }
 
   _serializeManagedAnnotation(annotation) {
@@ -429,6 +506,7 @@ export class LSFWrapper {
   _initializeManagedDraftBaseline(annotation) {
     if (!this.isManagedRefinementProject || !annotation) return;
 
+    this._claimManagedDraftSaveOwner(annotation);
     this._bindManagedAnnotationTask(annotation);
     const identity = this._managedAnnotationIdentity(annotation);
 
@@ -454,7 +532,26 @@ export class LSFWrapper {
 
     // The editor treats every resolved submitDraft callback as success. Managed
     // projects save through the strict wrapper coordinator instead.
-    this.currentAnnotation?.pauseAutosave?.();
+    this._claimManagedDraftSaveOwner(this.currentAnnotation);
+    this._publishManagedStatus();
+  }
+
+  _finalizeManagedDraftBaselineAfterLoad(annotation) {
+    if (!this.isManagedRefinementProject || !annotation) return;
+
+    this._claimManagedDraftSaveOwner(annotation);
+    this._bindManagedAnnotationTask(annotation);
+    const identity = this._managedAnnotationIdentity(annotation);
+
+    if (!identity) return;
+    const projection = this._managedSemanticProjection(annotation);
+    this._managedDraftBaselines.set(identity, {
+      browserSemanticHash: stableHash(projection),
+      serialized: stableSerialize(projection),
+      hydrated: true,
+      receipt: null,
+    });
+
     this._publishManagedStatus();
   }
 
@@ -1001,11 +1098,37 @@ export class LSFWrapper {
       const hasPersistedParams = Object.keys(options.params ?? {}).some((key) => key !== "useToast");
 
       if (hasPersistedParams) return inFlight.then(() => this._saveManagedDraft(annotation, options));
+      if (options.force === true) {
+        return inFlight.then((result) => (result?.receipt ? result : this._saveManagedDraft(annotation, options)));
+      }
       return inFlight;
     }
 
-    const operation = this._runManagedDraftSave(annotation, options).finally(() => {
+    let hydration = this._managedAnnotationHydrations.get(identity);
+
+    // Every explicit managed save owns the load-before-save ordering. This is
+    // required even when the UI's deferred FIT-720 selection callback has not
+    // registered the lazy stub yet. A task reload also starts a new generation
+    // when it replaces the MST node under the same stable identity.
+    if (!hydration || hydration.annotation !== annotation) {
+      this._hydrateStubAnnotation(annotation);
+      hydration = this._managedAnnotationHydrations.get(identity);
+    }
+    const saveOperation =
+      hydration?.status !== "ready"
+        ? this._awaitManagedAnnotationHydration(annotation)
+            .then(() => {
+              if (this._managedCoordinatorDestroyed) return MANAGED_DRAFT_DETACHED_RESULT;
+              return this._runManagedDraftSave(annotation, options);
+            })
+            .catch((error) => {
+              if (error instanceof CoordExpDraftSaveError) this._setManagedPersistentError(error, "draft");
+              throw error;
+            })
+        : this._runManagedDraftSave(annotation, options);
+    const operation = saveOperation.finally(() => {
       if (this._managedDraftSaves.get(identity) === operation) this._managedDraftSaves.delete(identity);
+      this._pruneManagedAnnotationHydrations();
     });
 
     this._managedDraftSaves.set(identity, operation);
@@ -1020,7 +1143,10 @@ export class LSFWrapper {
       );
     }
 
-    const result = await this._saveManagedDraft(this.currentAnnotation, { force: true });
+    const annotation = this.currentAnnotation;
+
+    this._claimManagedDraftSaveOwner(annotation);
+    const result = await this._saveManagedDraft(annotation, { force: true });
 
     if (!result?.receipt) {
       throw this._managedDraftError("MISSING_DRAFT_RECEIPT", "Draft save did not produce a durable receipt.");
@@ -1081,7 +1207,7 @@ export class LSFWrapper {
 
       const annotation = intent.sourceAnnotation ?? this.currentAnnotation;
 
-      annotation?.pauseAutosave?.();
+      this._claimManagedDraftSaveOwner(annotation);
       const source = this._captureManagedSource(annotation);
 
       this._assertManagedSourceIdentity(source);
@@ -1105,6 +1231,7 @@ export class LSFWrapper {
       if (this._managedCoordinatorDestroyed || intent.cancelled) {
         return this._managedNavigationCancelledDisposition(intent);
       }
+      this._pruneManagedAnnotationHydrations();
       const navigationResult = intent.supersededIntentKeys?.length
         ? Object.freeze({
             finalIntentKey: intent.intentKey,
@@ -1398,8 +1525,10 @@ export class LSFWrapper {
 
     this.lsf.initializeStore(lsfTask);
 
+    this._claimManagedDraftSaveOwners();
+
     await this.setAnnotation(annotationID, fromHistory || isRejectedQueue, selectPrediction);
-    this._initializeManagedDraftBaselines();
+    this._finalizeManagedDraftBaselineAfterLoad(this.currentAnnotation);
     this.setLoading(false);
 
     if (isFF(FF_FIT_1304_STRICT_OVERLAP) && this.overlapReached) {
@@ -1707,6 +1836,7 @@ export class LSFWrapper {
   };
 
   onStorageInitialized = async (ls) => {
+    this._claimManagedDraftSaveOwners();
     this.datamanager.invoke("onStorageInitialized", ls);
 
     if (this.task && this.labelStream === false) {
@@ -1714,6 +1844,7 @@ export class LSFWrapper {
         this.initialAnnotation?.pk ?? this.task.lastAnnotation?.pk ?? this.task.lastAnnotation?.id ?? "auto";
 
       await this.setAnnotation(annotationID);
+      this._finalizeManagedDraftBaselineAfterLoad(this.currentAnnotation);
     }
   };
 
@@ -2128,6 +2259,8 @@ export class LSFWrapper {
   _selectAnnotationTimeout = null;
   _debouncedFirstOldSelection = undefined;
   onSelectAnnotation = (prevAnnotation, nextAnnotation, options) => {
+    this._claimManagedDraftSaveOwner(prevAnnotation);
+    this._claimManagedDraftSaveOwner(nextAnnotation);
     if (this._managedSelectionReplay) return;
 
     // NOTE on parameter naming: LSF fires selectAnnotation(newAnnotation, oldAnnotation).
@@ -2245,74 +2378,189 @@ export class LSFWrapper {
     }
   };
 
-  // FIT-720: Hydrate a stub annotation by fetching full data from API
-  _hydrateStubAnnotation = async (annotation) => {
-    // Check if annotation is a stub (no regions/results)
-    // Stubs have empty results - check via the areas map which holds deserialized regions
-    const hasRegions = annotation.areas?.size > 0;
-    const isUserGenerated = annotation.userGenerate && !annotation.sentUserGenerate;
-
-    // Also check versions.result to see if the annotation was loaded with actual results
-    const versionsResult = annotation.versions?.result;
-    const hasVersionsResult = Array.isArray(versionsResult) && versionsResult.length > 0;
-
-    // Skip if already hydrated or is a new user-generated annotation
-    // Use versionsResult as the source of truth - if it has data, the annotation is already hydrated
-    if (hasVersionsResult || isUserGenerated) {
-      return;
-    }
+  // FIT-720: Hydrate a stub annotation by fetching full data from API.
+  // Managed saves are fenced on the identity-scoped generation registered by
+  // this method, so an empty lazy stub can never win a race against its full
+  // authoritative result.
+  _hydrateStubAnnotation = (annotation) => {
+    if (!annotation) return Promise.resolve(null);
 
     const annotationPk = annotation.pk;
+    let managedIdentity = null;
+    let managedRecord = null;
+    let priorManagedGeneration = 0;
 
-    try {
+    if (this.isManagedRefinementProject) {
+      this._bindManagedAnnotationTask(annotation);
+      managedIdentity = this._managedAnnotationIdentity(annotation);
+      priorManagedGeneration = this._managedAnnotationHydrations.get(managedIdentity)?.generation ?? 0;
+      this._pruneManagedAnnotationHydrations(annotation);
+      const current = managedIdentity ? this._managedAnnotationHydrations.get(managedIdentity) : null;
+
+      if (current?.annotation === annotation && ["pending", "ready", "failed"].includes(current.status)) {
+        return current.promise;
+      }
+    }
+
+    const hasRegions = annotation.areas?.size > 0;
+    const isUserGenerated = annotation.userGenerate && !annotation.sentUserGenerate;
+    const versionsResult = annotation.versions?.result;
+    const hasVersionsResult = Array.isArray(versionsResult) && versionsResult.length > 0;
+    const localUserEdit = managedIdentity && annotation.history?.hasChanges;
+
+    if (hasRegions || hasVersionsResult || isUserGenerated || localUserEdit) {
+      if (!managedIdentity) return Promise.resolve(null);
+
+      const previous = this._managedAnnotationHydrations.get(managedIdentity);
+      const ready = {
+        annotation,
+        error: null,
+        generation: Math.max(previous?.generation ?? 0, priorManagedGeneration) + 1,
+        promise: Promise.resolve(null),
+        status: "ready",
+      };
+
+      this._managedAnnotationHydrations.set(managedIdentity, ready);
+      return ready.promise;
+    }
+
+    const hydrate = async () => {
       const fullAnnotation = await this.datamanager.apiCall("fetchAnnotation", {
         annotationID: annotationPk,
       });
 
-      if (fullAnnotation?.result && !fullAnnotation.error) {
-        // IMPORTANT: Re-fetch the annotation from the store after async operation
-        // The original reference might be stale (user navigated, scrolled, etc.)
-        // which causes MST "object is protected" errors
-        const freshAnnotation = this.annotations.find((a) => String(a.pk) === String(annotationPk));
-        if (!freshAnnotation) {
-          // Annotation no longer exists in the store
-          return;
-        }
-        if (!isAlive(freshAnnotation) || !isAlive(freshAnnotation.trackedState)) {
-          // Annotation node was detached while hydration request was in-flight
-          return;
-        }
-
-        // Check if annotation was already hydrated while we were fetching
-        const freshVersionsResult = freshAnnotation.versions?.result;
-        const freshHasVersionsResult = Array.isArray(freshVersionsResult) && freshVersionsResult.length > 0;
-        const freshHasRegions = freshAnnotation.areas?.size > 0;
-
-        if (freshHasVersionsResult || freshHasRegions) {
-          // Already hydrated (possibly by another code path)
-          return;
-        }
-
-        // Freeze history to prevent undo/redo issues during hydration
-        freshAnnotation.history?.freeze?.();
-
-        // Deserialize the results into the annotation
-        if (!isAlive(freshAnnotation) || !isAlive(freshAnnotation.trackedState)) return;
-        freshAnnotation.deserializeResults(fullAnnotation.result);
-
-        // Critical: updateObjects() MUST be called to render visual regions after deserializing
-        freshAnnotation.updateObjects?.();
-
-        // Unfreeze history
-        freshAnnotation.history?.safeUnfreeze?.();
-
-        // reinitHistory cancels autosave and sets initial values so LSF knows this is the base state
-        // This prevents the hydration from being treated as a user modification
-        freshAnnotation.reinitHistory?.();
+      if (managedIdentity && this._managedAnnotationHydrations.get(managedIdentity) !== managedRecord) {
+        return { status: "superseded", value: fullAnnotation };
       }
-    } catch {
-      // Failed to hydrate annotation - will show stub state
+
+      if (fullAnnotation?.error || !Array.isArray(fullAnnotation?.result)) {
+        throw this._managedDraftError(
+          "ANNOTATION_HYDRATION_INCOMPLETE",
+          "The authoritative annotation remained unavailable. No Draft was saved.",
+        );
+      }
+
+      // Re-fetch after the async boundary. The original MST reference may have
+      // been detached or replaced while the request was in flight.
+      const freshAnnotation = this.annotations.find((candidate) => String(candidate.pk) === String(annotationPk));
+
+      if (!freshAnnotation || !isAlive(freshAnnotation) || !isAlive(freshAnnotation.trackedState)) {
+        if (!managedIdentity) return { status: "ready", value: fullAnnotation };
+        throw this._managedDraftError(
+          "ANNOTATION_HYDRATION_TARGET_CHANGED",
+          "The annotation changed while its authoritative result was loading. No Draft was saved.",
+        );
+      }
+      if (managedIdentity && this._managedAnnotationIdentity(freshAnnotation) !== managedIdentity) {
+        throw this._managedDraftError(
+          "ANNOTATION_HYDRATION_TARGET_CHANGED",
+          "The annotation changed while its authoritative result was loading. No Draft was saved.",
+        );
+      }
+
+      const freshVersionsResult = freshAnnotation.versions?.result;
+      const freshHasVersionsResult = Array.isArray(freshVersionsResult) && freshVersionsResult.length > 0;
+      const freshHasRegions = freshAnnotation.areas?.size > 0;
+
+      // A user edit or another hydration path wins without being overwritten.
+      // The pending save will resume and persist that current user payload.
+      if (freshAnnotation.history?.hasChanges) return { status: "ready", value: fullAnnotation };
+      if (freshHasVersionsResult || freshHasRegions) return { status: "ready", value: fullAnnotation };
+
+      const history = freshAnnotation.history;
+      const freezeKey = Symbol("coordexp-managed-annotation-hydration");
+      let hydrated = false;
+      let hydrationError = null;
+      let releaseError = null;
+
+      history?.freeze?.(freezeKey);
+      try {
+        if (!isAlive(freshAnnotation) || !isAlive(freshAnnotation.trackedState)) {
+          throw this._managedDraftError(
+            "ANNOTATION_HYDRATION_TARGET_CHANGED",
+            "The annotation changed while its authoritative result was loading. No Draft was saved.",
+          );
+        }
+        freshAnnotation.deserializeResults(fullAnnotation.result);
+        freshAnnotation.updateObjects?.();
+        hydrated = true;
+      } catch (error) {
+        hydrationError = error;
+      } finally {
+        try {
+          if (hydrated) {
+            history?.safeUnfreeze?.(freezeKey);
+          } else {
+            const aborted = history?.abortFreeze?.(freezeKey, true) === true;
+
+            if (!aborted) history?.safeUnfreeze?.(freezeKey);
+          }
+        } catch (error) {
+          history?.abortFreeze?.(freezeKey, true);
+          releaseError = error;
+        }
+      }
+
+      if (hydrationError) throw hydrationError;
+      if (releaseError) throw releaseError;
+
+      // Reset history only after deserialize/render both completed and the
+      // hydration freeze was released. A thrown step never advances baseline.
+      freshAnnotation.reinitHistory?.();
+
+      if (
+        managedIdentity &&
+        isAlive(freshAnnotation) &&
+        isAlive(freshAnnotation.trackedState) &&
+        this._managedAnnotationIdentity(freshAnnotation) === managedIdentity &&
+        !freshAnnotation.history?.hasChanges
+      ) {
+        this._finalizeManagedDraftBaselineAfterLoad(freshAnnotation);
+      }
+
+      return { status: "ready", value: fullAnnotation };
+    };
+
+    if (!managedIdentity) {
+      return hydrate()
+        .then((result) => result.value)
+        .catch(() => null);
     }
+
+    const previous = this._managedAnnotationHydrations.get(managedIdentity);
+    const record = {
+      annotation,
+      error: null,
+      generation: Math.max(previous?.generation ?? 0, priorManagedGeneration) + 1,
+      promise: null,
+      status: "pending",
+    };
+    managedRecord = record;
+    const operation = hydrate()
+      .then((result) => {
+        if (this._managedAnnotationHydrations.get(managedIdentity) === record) record.status = result.status;
+        return result.value;
+      })
+      .catch((error) => {
+        if (this._managedAnnotationHydrations.get(managedIdentity) === record) {
+          record.error =
+            error instanceof CoordExpDraftSaveError
+              ? error
+              : this._managedDraftError(
+                  "ANNOTATION_HYDRATION_FAILED",
+                  "The authoritative annotation could not be loaded. No Draft was saved.",
+                );
+          record.status = "failed";
+        }
+        return null;
+      })
+      .finally(() => {
+        this._pruneManagedAnnotationHydrations();
+      });
+
+    record.promise = operation;
+    this._managedAnnotationHydrations.set(managedIdentity, record);
+    return operation;
   };
 
   onNextTask = async (nextTaskId, nextAnnotationId) => {
@@ -2492,6 +2740,7 @@ export class LSFWrapper {
 
     this._managedDraftSaves.clear();
     this._managedDraftBaselines.clear();
+    this._managedAnnotationHydrations.clear();
     this._managedLocalPendingDrafts.clear();
     this._managedAuthoritativeState = null;
     this._managedPersistentError = null;

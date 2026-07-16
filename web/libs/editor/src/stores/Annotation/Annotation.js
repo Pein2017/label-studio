@@ -532,6 +532,7 @@ const _Annotation = types
     draftId: 0,
     draftSelected: false,
     autosaveDelay: 5000,
+    externalDraftSaveOwner: false,
     isDraftSaving: false,
     // This flag indicates that we are accepting suggestions right now (an accepting is started and not finished yet)
     isSuggestionsAccepting: false,
@@ -915,7 +916,7 @@ const _Annotation = types
       if (shouldSelectDraft && !self.versions.draft) return;
 
       // if there were some changes waiting they'll be saved
-      self.autosave.flush();
+      self.autosave?.flush?.();
       self.pauseAutosave();
 
       // reinit annotation from required state
@@ -933,6 +934,7 @@ const _Annotation = types
     },
 
     startAutosave: flow(function* () {
+      if (self.externalDraftSaveOwner) return;
       if (!getEnv(self).events.hasEvent("submitDraft")) return;
       // view all must never trigger autosave
       if (self.isReadOnly()) return;
@@ -940,6 +942,11 @@ const _Annotation = types
       // some async tasks should be performed after deserialization
       // so start autosave on next tick
       yield delay(0);
+
+      if (self.externalDraftSaveOwner) {
+        self.pauseAutosave();
+        return;
+      }
 
       if (self.autosave) {
         self.autosave.cancel();
@@ -951,7 +958,7 @@ const _Annotation = types
       self.autosave = throttle(
         () => {
           // if autosave is paused, do nothing
-          if (self.autosave.paused) return;
+          if (self.externalDraftSaveOwner || self.autosave.paused) return;
 
           self.saveDraft();
         },
@@ -1003,6 +1010,11 @@ const _Annotation = types
       self.autosave.cancel();
     },
 
+    setExternalDraftSaveOwner(owned = true) {
+      self.externalDraftSaveOwner = Boolean(owned);
+      if (self.externalDraftSaveOwner) self.pauseAutosave();
+    },
+
     beforeDestroy() {
       self.autosave?.cancel?.();
     },
@@ -1021,8 +1033,11 @@ const _Annotation = types
     },
 
     dropDraft() {
-      if (!self.autosave) return;
-      self.autosave.cancel();
+      // Ordinary annotations historically have nothing to drop until native
+      // autosave exists. Managed annotations deliberately never create that
+      // throttle, but their explicit lifecycle still has to retire Draft state.
+      if (!self.autosave && !self.externalDraftSaveOwner) return;
+      self.autosave?.cancel?.();
       self.draftId = 0;
       self.draftSelected = false;
       self.draftSaved = undefined;

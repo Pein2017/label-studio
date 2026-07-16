@@ -549,6 +549,46 @@ describe("Annotation model", () => {
       expect(annotation.draftSaved).toBe("2020-01-01");
     });
 
+    it("keeps delayed native autosave creation disabled after an external owner claims the Draft", async () => {
+      const { annotation, env } = createStoreWithAnnotation();
+
+      env.events.hasEvent.mockImplementation((event) => event === "submitDraft");
+      const starting = annotation.startAutosave();
+      annotation.setExternalDraftSaveOwner(true);
+
+      await starting;
+      expect(annotation.externalDraftSaveOwner).toBe(true);
+      expect(annotation.autosave).toBeUndefined();
+    });
+
+    it("does not unpause an existing native autosave after external ownership is claimed during its delay", async () => {
+      const { annotation, env } = createStoreWithAnnotation();
+
+      env.events.hasEvent.mockImplementation((event) => event === "submitDraft");
+      await annotation.startAutosave();
+      expect(annotation.autosave).toBeDefined();
+      annotation.pauseAutosave();
+      expect(annotation.autosave.paused).toBe(true);
+
+      const restarting = annotation.startAutosave();
+      annotation.setExternalDraftSaveOwner(true);
+      await restarting;
+
+      expect(annotation.autosave.paused).toBe(true);
+    });
+
+    it("starts native autosave normally when there is no external Draft owner", async () => {
+      const { annotation, env } = createStoreWithAnnotation();
+
+      env.events.hasEvent.mockImplementation((event) => event === "submitDraft");
+      await annotation.startAutosave();
+
+      expect(annotation.externalDraftSaveOwner).toBe(false);
+      expect(annotation.autosave).toBeDefined();
+      expect(annotation.autosave.paused).not.toBe(true);
+      annotation.pauseAutosave();
+    });
+
     it("dropDraft clears draft state when autosave exists", () => {
       const { annotation } = createStoreWithAnnotation();
       annotation.autosave = { cancel: jest.fn() };
@@ -559,6 +599,42 @@ describe("Annotation model", () => {
       expect(annotation.draftId).toBe(0);
       expect(annotation.draftSelected).toBe(false);
       expect(annotation.versions.draft).toBeUndefined();
+    });
+
+    it("dropDraft clears managed Draft state without creating native autosave", () => {
+      const { annotation } = createStoreWithAnnotation();
+
+      annotation.setExternalDraftSaveOwner(true);
+      annotation.setDraftId(7);
+      annotation.setDraftSelected(true);
+      annotation.setDraftSaved("2026-07-16T00:00:00Z");
+      annotation.addVersions({ draft: [{ id: "managed-draft" }] });
+
+      expect(annotation.autosave).toBeUndefined();
+      annotation.dropDraft();
+
+      expect(annotation.draftId).toBe(0);
+      expect(annotation.draftSelected).toBe(false);
+      expect(annotation.draftSaved).toBeUndefined();
+      expect(annotation.versions.draft).toBeUndefined();
+    });
+
+    it("keeps the ordinary no-autosave dropDraft behavior unchanged", () => {
+      const { annotation } = createStoreWithAnnotation();
+
+      annotation.setDraftId(7);
+      annotation.setDraftSelected(true);
+      annotation.setDraftSaved("2026-07-16T00:00:00Z");
+      annotation.addVersions({ draft: [{ id: "ordinary-draft" }] });
+
+      expect(annotation.externalDraftSaveOwner).toBe(false);
+      expect(annotation.autosave).toBeUndefined();
+      annotation.dropDraft();
+
+      expect(annotation.draftId).toBe(7);
+      expect(annotation.draftSelected).toBe(true);
+      expect(annotation.draftSaved).toBe("2026-07-16T00:00:00Z");
+      expect(annotation.versions.draft).toEqual([{ id: "ordinary-draft" }]);
     });
 
     it("reinitHistory calls history.reinit and setInitialValues for annotation type", () => {

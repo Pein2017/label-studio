@@ -1,5 +1,10 @@
 import { COORDEXP_MANAGED_PROJECT_PREFIX, CoordExpDraftSaveError, LSFWrapper } from "./lsf-sdk";
 
+jest.mock("mobx-state-tree", () => ({
+  ...jest.requireActual("mobx-state-tree"),
+  isAlive: jest.fn((node) => Boolean(node) && node.__dead !== true),
+}));
+
 class FakeLabelStudio {
   static settings = null;
 
@@ -76,7 +81,26 @@ const makeAnnotation = ({ pk = "77", id = "local-77", draftId = 0, initialResult
     id,
     draftId,
     draftSaved: undefined,
-    history: { hasChanges: false, undoIdx: 0, lastAdditionTime: null },
+    history: {
+      hasChanges: false,
+      isFrozen: false,
+      undoIdx: 0,
+      lastAdditionTime: null,
+      freeze: jest.fn(() => {
+        annotation.history.isFrozen = true;
+      }),
+      safeUnfreeze: jest.fn(() => {
+        annotation.history.isFrozen = false;
+      }),
+      abortFreeze: jest.fn(() => {
+        const wasFrozen = annotation.history.isFrozen;
+
+        annotation.history.isFrozen = false;
+        return wasFrozen;
+      }),
+    },
+    areas: new Map(),
+    trackedState: {},
     versions: { draft: [] },
     loadedDate: new Date("2026-07-15T00:00:00Z"),
     leadTime: 0,
@@ -84,6 +108,11 @@ const makeAnnotation = ({ pk = "77", id = "local-77", draftId = 0, initialResult
     sentUserGenerate: false,
     serializeAnnotation: jest.fn(() => clone(result)),
     pauseAutosave: jest.fn(),
+    startAutosave: jest.fn(),
+    setExternalDraftSaveOwner: jest.fn((owned = true) => {
+      annotation.externalDraftSaveOwner = owned;
+      if (owned) annotation.pauseAutosave();
+    }),
     setDraftId: jest.fn((value) => {
       annotation.draftId = value;
     }),
@@ -92,6 +121,17 @@ const makeAnnotation = ({ pk = "77", id = "local-77", draftId = 0, initialResult
     }),
     setDraftSaving: jest.fn((value) => {
       annotation.isDraftSaving = value;
+    }),
+    deserializeResults: jest.fn((nextResult) => {
+      result = clone(nextResult);
+      annotation.versions.result = clone(nextResult);
+      annotation.areas = new Map(nextResult.map((item, index) => [item.id ?? String(index), item]));
+    }),
+    updateObjects: jest.fn(),
+    reinitHistory: jest.fn(() => {
+      annotation.history.hasChanges = false;
+      annotation.history.undoIdx = 0;
+      annotation.history.lastAdditionTime = null;
     }),
     replaceResult(nextResult) {
       result = clone(nextResult);
@@ -310,6 +350,439 @@ describe("strict managed Draft responses", () => {
     wrapper.destroy();
   });
 
+  it("refreshes only the task-load baseline after a server Draft is fully deserialized", () => {
+    const annotation = makeAnnotation({ initialResult: [] });
+    const { wrapper } = makeHarness({ annotation });
+
+    expect(wrapper._managedDraftBaselines.get("10:77")?.serialized).toBe("[]");
+    annotation.replaceResult([{ id: "server-draft-region" }]);
+
+    wrapper._finalizeManagedDraftBaselineAfterLoad(annotation);
+    const loadedBaseline = wrapper._managedDraftBaselines.get("10:77");
+
+    expect(JSON.parse(loadedBaseline.serialized)).toEqual([{ id: "server-draft-region" }]);
+    expect(wrapper._isManagedAnnotationDirty(annotation)).toBe(false);
+
+    annotation.replaceResult([{ id: "later-user-edit" }]);
+    wrapper._initializeManagedDraftBaseline(annotation);
+    expect(wrapper._managedDraftBaselines.get("10:77")).toBe(loadedBaseline);
+    expect(wrapper._isManagedAnnotationDirty(annotation)).toBe(true);
+    wrapper.destroy();
+  });
+
+  it("finalizes a lazy managed baseline only after deferred server hydration completes", async () => {
+    const annotation = makeAnnotation({ initialResult: [] });
+
+    annotation.userGenerate = false;
+    annotation.sentUserGenerate = true;
+    annotation.versions.result = [];
+    const { datamanager, wrapper } = makeHarness({ annotation });
+    const request = deferred();
+    const baselineBeforeHydration = wrapper._managedDraftBaselines.get("10:77");
+
+    datamanager.apiCall.mockReturnValue(request.promise);
+    const hydration = wrapper._hydrateStubAnnotation(annotation);
+
+    await Promise.resolve();
+    expect(datamanager.apiCall).toHaveBeenCalledWith("fetchAnnotation", { annotationID: "77" });
+    expect(wrapper._managedDraftBaselines.get("10:77")).toBe(baselineBeforeHydration);
+
+    request.resolve({ result: [{ id: "hydrated-server-region" }] });
+    await hydration;
+
+    const hydratedBaseline = wrapper._managedDraftBaselines.get("10:77");
+    expect(hydratedBaseline).not.toBe(baselineBeforeHydration);
+    expect(JSON.parse(hydratedBaseline.serialized)).toEqual([{ id: "hydrated-server-region" }]);
+    expect(annotation.deserializeResults).toHaveBeenCalledWith([{ id: "hydrated-server-region" }]);
+    expect(annotation.reinitHistory).toHaveBeenCalledTimes(1);
+    expect(wrapper._isManagedAnnotationDirty(annotation)).toBe(false);
+    wrapper.destroy();
+  });
+
+  it("does not hydrate or overwrite the baseline after a managed user edit wins the deferred load race", async () => {
+    const annotation = makeAnnotation({ initialResult: [] });
+
+    annotation.userGenerate = false;
+    annotation.sentUserGenerate = true;
+    annotation.versions.result = [];
+    const { datamanager, wrapper } = makeHarness({ annotation });
+    const request = deferred();
+    const baselineBeforeHydration = wrapper._managedDraftBaselines.get("10:77");
+
+    datamanager.apiCall.mockReturnValue(request.promise);
+    const hydration = wrapper._hydrateStubAnnotation(annotation);
+
+    await Promise.resolve();
+    annotation.replaceResult([{ id: "user-edit-during-hydration" }]);
+    request.resolve({ result: [{ id: "late-server-region" }] });
+    await hydration;
+
+    expect(annotation.deserializeResults).not.toHaveBeenCalled();
+    expect(wrapper._managedDraftBaselines.get("10:77")).toBe(baselineBeforeHydration);
+    expect(wrapper._isManagedAnnotationDirty(annotation)).toBe(true);
+    wrapper.destroy();
+  });
+
+  it("waits for deferred managed hydration before force-saving the authoritative server result", async () => {
+    const annotation = makeAnnotation({ initialResult: [] });
+
+    annotation.userGenerate = false;
+    annotation.sentUserGenerate = true;
+    annotation.versions.result = [];
+    const { datamanager, wrapper } = makeHarness({ annotation });
+    const request = deferred();
+
+    datamanager.apiCall.mockImplementation((name) => {
+      if (name === "fetchAnnotation") return request.promise;
+      if (name === "createDraftForAnnotation") return Promise.resolve(draftResponse());
+      throw new Error(`Unexpected API call: ${name}`);
+    });
+
+    const hydration = wrapper._hydrateStubAnnotation(annotation);
+    const save = wrapper.ensureDurableDraft();
+
+    await Promise.resolve();
+    expect(datamanager.apiCall).toHaveBeenCalledTimes(1);
+    expect(datamanager.apiCall).toHaveBeenCalledWith("fetchAnnotation", { annotationID: "77" });
+
+    request.resolve({ result: [{ id: "authoritative-server-region" }] });
+    await hydration;
+    await expect(save).resolves.toMatchObject({ draft_id: 501 });
+
+    expect(datamanager.apiCall).toHaveBeenCalledTimes(2);
+    expect(datamanager.apiCall).toHaveBeenLastCalledWith(
+      "createDraftForAnnotation",
+      { taskID: 10, annotationID: "77" },
+      expect.objectContaining({ body: expect.objectContaining({ result: [{ id: "authoritative-server-region" }] }) }),
+    );
+    wrapper.destroy();
+  });
+
+  it("starts unregistered lazy hydration before a direct force-save", async () => {
+    const annotation = makeAnnotation({ initialResult: [] });
+
+    annotation.userGenerate = false;
+    annotation.sentUserGenerate = true;
+    annotation.versions.result = [];
+    const { datamanager, wrapper } = makeHarness({ annotation });
+    const apiOrder = [];
+
+    datamanager.apiCall.mockImplementation((name) => {
+      apiOrder.push(name);
+      if (name === "fetchAnnotation") return Promise.resolve({ result: [{ id: "server-before-save" }] });
+      if (name === "createDraftForAnnotation") return Promise.resolve(draftResponse());
+      throw new Error(`Unexpected API call: ${name}`);
+    });
+
+    await expect(wrapper.ensureDurableDraft()).resolves.toMatchObject({ draft_id: 501 });
+
+    expect(apiOrder).toEqual(["fetchAnnotation", "createDraftForAnnotation"]);
+    expect(datamanager.apiCall).toHaveBeenLastCalledWith(
+      "createDraftForAnnotation",
+      { taskID: 10, annotationID: "77" },
+      expect.objectContaining({ body: expect.objectContaining({ result: [{ id: "server-before-save" }] }) }),
+    );
+    wrapper.destroy();
+  });
+
+  it("fails closed without a Draft request when managed hydration fails", async () => {
+    const annotation = makeAnnotation({ initialResult: [] });
+
+    annotation.userGenerate = false;
+    annotation.sentUserGenerate = true;
+    annotation.versions.result = [];
+    const { datamanager, wrapper } = makeHarness({ annotation });
+    const request = deferred();
+
+    datamanager.apiCall.mockReturnValue(request.promise);
+    const hydration = wrapper._hydrateStubAnnotation(annotation);
+    const save = wrapper.ensureDurableDraft();
+
+    request.reject(new Error("fetch failed"));
+    await expect(hydration).resolves.toBeNull();
+    await expect(save).rejects.toMatchObject({ code: "ANNOTATION_HYDRATION_FAILED" });
+    expect(datamanager.apiCall).toHaveBeenCalledTimes(1);
+    expect(annotation.setDraftSaved).not.toHaveBeenCalled();
+    wrapper.destroy();
+  });
+
+  it("preserves and saves a managed user edit that wins while hydration is pending", async () => {
+    const annotation = makeAnnotation({ initialResult: [] });
+
+    annotation.userGenerate = false;
+    annotation.sentUserGenerate = true;
+    annotation.versions.result = [];
+    const { datamanager, wrapper } = makeHarness({ annotation });
+    const request = deferred();
+
+    datamanager.apiCall.mockImplementation((name) => {
+      if (name === "fetchAnnotation") return request.promise;
+      if (name === "createDraftForAnnotation") return Promise.resolve(draftResponse());
+      throw new Error(`Unexpected API call: ${name}`);
+    });
+
+    const hydration = wrapper._hydrateStubAnnotation(annotation);
+    const save = wrapper.ensureDurableDraft();
+
+    annotation.replaceResult([{ id: "user-edit-during-hydration" }]);
+    request.resolve({ result: [{ id: "late-server-region" }] });
+    await hydration;
+    await expect(save).resolves.toMatchObject({ draft_id: 501 });
+
+    expect(annotation.deserializeResults).not.toHaveBeenCalled();
+    expect(datamanager.apiCall).toHaveBeenLastCalledWith(
+      "createDraftForAnnotation",
+      { taskID: 10, annotationID: "77" },
+      expect.objectContaining({ body: expect.objectContaining({ result: [{ id: "user-edit-during-hydration" }] }) }),
+    );
+    expect(wrapper._isManagedAnnotationDirty(annotation)).toBe(false);
+    wrapper.destroy();
+  });
+
+  it("lets only the newest annotation-node hydration generation mutate a reused stable identity", async () => {
+    const annotation = makeAnnotation({ initialResult: [] });
+    const replacement = makeAnnotation({ id: "reloaded-local-77", initialResult: [] });
+
+    for (const candidate of [annotation, replacement]) {
+      candidate.userGenerate = false;
+      candidate.sentUserGenerate = true;
+      candidate.versions.result = [];
+    }
+    const { annotationStore, datamanager, wrapper } = makeHarness({ annotation });
+    const first = deferred();
+    const second = deferred();
+    const fetches = [first, second];
+
+    datamanager.apiCall.mockImplementation((name) => {
+      if (name !== "fetchAnnotation") throw new Error(`Unexpected API call: ${name}`);
+      return fetches.shift().promise;
+    });
+
+    const firstHydration = wrapper._hydrateStubAnnotation(annotation);
+
+    annotationStore.annotations.splice(0, 1, replacement);
+    annotationStore.selected = replacement;
+    const secondHydration = wrapper._hydrateStubAnnotation(replacement);
+
+    expect(wrapper._managedAnnotationHydrations.get("10:77")).toMatchObject({
+      annotation: replacement,
+      generation: 2,
+      status: "pending",
+    });
+
+    second.resolve({ result: [{ id: "new-generation-region" }] });
+    await secondHydration;
+    first.resolve({ result: [{ id: "stale-generation-region" }] });
+    await firstHydration;
+
+    expect(annotation.deserializeResults).not.toHaveBeenCalled();
+    expect(replacement.deserializeResults).toHaveBeenCalledTimes(1);
+    expect(replacement.deserializeResults).toHaveBeenCalledWith([{ id: "new-generation-region" }]);
+    expect(JSON.parse(wrapper._managedDraftBaselines.get("10:77").serialized)).toEqual([
+      { id: "new-generation-region" },
+    ]);
+    wrapper.destroy();
+  });
+
+  it("prunes detached hydration nodes while retaining only the active task record", async () => {
+    const { annotation, annotationStore, wrapper } = makeHarness();
+    const retired = [];
+
+    await wrapper._hydrateStubAnnotation(annotation);
+    expect(wrapper._managedAnnotationHydrations.size).toBe(1);
+
+    let active = annotation;
+    for (const taskId of [11, 12, 13]) {
+      retired.push(active);
+      active = makeAnnotation({ id: `local-${taskId}`, pk: String(taskId + 100) });
+      wrapper.task = { ...wrapper.task, id: taskId };
+      annotationStore.annotations.splice(0, 1, active);
+      annotationStore.selected = active;
+
+      await wrapper._hydrateStubAnnotation(active);
+
+      expect(wrapper._managedAnnotationHydrations.size).toBe(1);
+      expect([...wrapper._managedAnnotationHydrations.values()][0]).toMatchObject({
+        annotation: active,
+        status: "ready",
+      });
+      for (const oldNode of retired) {
+        expect([...wrapper._managedAnnotationHydrations.values()].some((record) => record.annotation === oldNode)).toBe(
+          false,
+        );
+      }
+    }
+
+    wrapper.destroy();
+  });
+
+  it("never lets a pruned pending hydration save across a task replacement", async () => {
+    const annotation = makeAnnotation({ initialResult: [] });
+
+    annotation.userGenerate = false;
+    annotation.sentUserGenerate = true;
+    annotation.versions.result = [];
+    const { annotationStore, datamanager, wrapper } = makeHarness({ annotation });
+    const request = deferred();
+    const apiOrder = [];
+
+    datamanager.apiCall.mockImplementation((name) => {
+      apiOrder.push(name);
+      if (name === "fetchAnnotation") return request.promise;
+      throw new Error(`Draft API must not run after task replacement: ${name}`);
+    });
+
+    const hydration = wrapper._hydrateStubAnnotation(annotation);
+    const save = wrapper.ensureDurableDraft();
+
+    await Promise.resolve();
+    const replacement = makeAnnotation({ id: "task-b-local", pk: "88" });
+
+    wrapper.task = { ...wrapper.task, id: 11 };
+    annotationStore.annotations.splice(0, 1, replacement);
+    annotationStore.selected = replacement;
+    await wrapper._hydrateStubAnnotation(replacement);
+
+    expect(wrapper._managedAnnotationHydrations.size).toBe(2);
+    request.resolve({ result: [{ id: "stale-task-a-region" }] });
+    await hydration;
+    await expect(save).rejects.toMatchObject({
+      code: expect.stringMatching(/^ANNOTATION_HYDRATION_/),
+    });
+
+    expect(apiOrder).toEqual(["fetchAnnotation"]);
+    expect(annotation.deserializeResults).not.toHaveBeenCalled();
+    expect(wrapper._managedAnnotationHydrations.size).toBe(1);
+    expect([...wrapper._managedAnnotationHydrations.values()][0].annotation).toBe(replacement);
+    wrapper.destroy();
+  });
+
+  it.each([
+    "deserializeResults",
+    "updateObjects",
+  ])("releases managed hydration history and preserves the baseline when %s throws", async (failingStep) => {
+    const annotation = makeAnnotation({ initialResult: [] });
+
+    annotation.userGenerate = false;
+    annotation.sentUserGenerate = true;
+    annotation.versions.result = [];
+    const { datamanager, wrapper } = makeHarness({ annotation });
+    const baseline = wrapper._managedDraftBaselines.get("10:77");
+    const original = annotation[failingStep].getMockImplementation();
+
+    annotation[failingStep].mockImplementation((...args) => {
+      if (failingStep === "updateObjects") original?.(...args);
+      throw new Error(`${failingStep} failed`);
+    });
+    datamanager.apiCall.mockResolvedValue({ result: [{ id: "server-region" }] });
+
+    await expect(wrapper._hydrateStubAnnotation(annotation)).resolves.toBeNull();
+
+    expect(annotation.history.isFrozen).toBe(false);
+    expect(annotation.history.abortFreeze).toHaveBeenCalledTimes(1);
+    expect(annotation.reinitHistory).not.toHaveBeenCalled();
+    expect(wrapper._managedDraftBaselines.get("10:77")).toBe(baseline);
+    await expect(wrapper.ensureDurableDraft()).rejects.toMatchObject({ code: "ANNOTATION_HYDRATION_FAILED" });
+    expect(datamanager.apiCall).toHaveBeenCalledTimes(1);
+    wrapper.destroy();
+  });
+
+  it("fences a pending native autosave around the forced durable save", async () => {
+    const { annotation, datamanager, wrapper } = makeHarness();
+    const pendingAutosave = jest.fn(async () => {
+      await wrapper.onSubmitDraft(null, annotation);
+      annotation.setDraftSaved("local-autosave-revision");
+    });
+    let pendingTimer = setTimeout(pendingAutosave, 0);
+
+    annotation.pauseAutosave.mockImplementation(() => {
+      clearTimeout(pendingTimer);
+      pendingTimer = null;
+    });
+    annotation.pauseAutosave.mockClear();
+    annotation.startAutosave.mockClear();
+    annotation.setExternalDraftSaveOwner.mockClear();
+    annotation.replaceResult([{ id: "frozen-for-inference" }]);
+    datamanager.apiCall.mockResolvedValue(draftResponse());
+
+    await expect(wrapper.ensureDurableDraft()).resolves.toMatchObject({ revision: "2026-07-15T00:00:00Z" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(annotation.pauseAutosave).toHaveBeenCalledTimes(1);
+    expect(annotation.setExternalDraftSaveOwner).toHaveBeenCalledWith(true);
+    expect(pendingAutosave).not.toHaveBeenCalled();
+    expect(datamanager.apiCall).toHaveBeenCalledTimes(1);
+    expect(annotation.setDraftSaved).toHaveBeenCalledTimes(1);
+    expect(annotation.setDraftSaved).toHaveBeenCalledWith("2026-07-15T00:00:00Z");
+    expect(annotation.startAutosave).not.toHaveBeenCalled();
+    wrapper.destroy();
+  });
+
+  it("keeps native autosave paused after a forced-save failure", async () => {
+    const { annotation, datamanager, wrapper } = makeHarness();
+
+    annotation.pauseAutosave.mockClear();
+    annotation.startAutosave.mockClear();
+    annotation.replaceResult([{ id: "failing-frozen-target" }]);
+    datamanager.apiCall.mockResolvedValue(draftResponse({ status: 409 }));
+
+    await expect(wrapper.ensureDurableDraft()).rejects.toMatchObject({ code: "DRAFT_HTTP_ERROR" });
+    expect(annotation.pauseAutosave).toHaveBeenCalledTimes(1);
+    expect(annotation.startAutosave).not.toHaveBeenCalled();
+    wrapper.destroy();
+  });
+
+  it("does not resume native autosave on a replacement annotation", async () => {
+    const { annotation, annotationStore, datamanager, wrapper } = makeHarness();
+    const request = deferred();
+
+    annotation.pauseAutosave.mockClear();
+    annotation.startAutosave.mockClear();
+    annotation.replaceResult([{ id: "replaced-frozen-target" }]);
+    datamanager.apiCall.mockImplementation(() => request.promise);
+    const save = wrapper.ensureDurableDraft();
+
+    await Promise.resolve();
+    annotationStore.selected = makeAnnotation({ pk: "88", id: "local-88" });
+    request.resolve(draftResponse());
+
+    await expect(save).rejects.toMatchObject({ code: "SOURCE_ANNOTATION_CHANGED" });
+    expect(annotation.pauseAutosave).toHaveBeenCalledTimes(1);
+    expect(annotation.startAutosave).not.toHaveBeenCalled();
+    wrapper.destroy();
+  });
+
+  it("does not resume native autosave after the managed coordinator is destroyed", async () => {
+    const { annotation, datamanager, wrapper } = makeHarness();
+    const request = deferred();
+
+    annotation.pauseAutosave.mockClear();
+    annotation.startAutosave.mockClear();
+    annotation.replaceResult([{ id: "destroyed-frozen-target" }]);
+    datamanager.apiCall.mockImplementation(() => request.promise);
+    const save = wrapper.ensureDurableDraft();
+
+    await Promise.resolve();
+    wrapper.destroy();
+    request.resolve(draftResponse());
+
+    await expect(save).rejects.toMatchObject({ code: "MISSING_DRAFT_RECEIPT" });
+    expect(annotation.pauseAutosave).toHaveBeenCalledTimes(1);
+    expect(annotation.startAutosave).not.toHaveBeenCalled();
+  });
+
+  it("does not touch native autosave for ordinary projects", async () => {
+    const { annotation, wrapper } = makeHarness({ managed: false });
+
+    annotation.pauseAutosave.mockClear();
+    annotation.startAutosave.mockClear();
+
+    await expect(wrapper.ensureDurableDraft()).rejects.toMatchObject({ code: "PROJECT_NOT_MANAGED" });
+    expect(annotation.pauseAutosave).not.toHaveBeenCalled();
+    expect(annotation.startAutosave).not.toHaveBeenCalled();
+    wrapper.destroy();
+  });
+
   it("updates an existing Draft and validates its returned id", async () => {
     const annotation = makeAnnotation({ draftId: 44 });
     const { datamanager, wrapper } = makeHarness({ annotation });
@@ -432,6 +905,38 @@ describe("strict managed Draft responses", () => {
     expect(datamanager.apiCall).toHaveBeenCalledTimes(2);
     expect(receiptA.serialized_hash).toBe(receiptB.serialized_hash);
     expect(wrapper._isManagedAnnotationDirty(annotation)).toBe(false);
+    wrapper.destroy();
+  });
+
+  it("runs one forced save after an in-flight clean native no-op", async () => {
+    const { annotation, datamanager, wrapper } = makeHarness();
+
+    datamanager.apiCall.mockResolvedValue(draftResponse());
+    const nativeSave = wrapper.onSubmitDraft(null, annotation);
+    const receipt = wrapper.ensureDurableDraft();
+
+    await expect(nativeSave).resolves.toBeUndefined();
+    await expect(receipt).resolves.toMatchObject({ draft_id: 501, revision: "2026-07-15T00:00:00Z" });
+    expect(datamanager.apiCall).toHaveBeenCalledTimes(1);
+    wrapper.destroy();
+  });
+
+  it("deduplicates concurrent forced saves behind one dirty in-flight request", async () => {
+    const { annotation, datamanager, wrapper } = makeHarness();
+    const request = deferred();
+
+    annotation.replaceResult([{ id: "one-forced-version" }]);
+    datamanager.apiCall.mockImplementation(() => request.promise);
+    const saveA = wrapper.ensureDurableDraft();
+    const saveB = wrapper.ensureDurableDraft();
+
+    await Promise.resolve();
+    expect(datamanager.apiCall).toHaveBeenCalledTimes(1);
+    request.resolve(draftResponse());
+
+    const [receiptA, receiptB] = await Promise.all([saveA, saveB]);
+    expect(receiptA).toBe(receiptB);
+    expect(datamanager.apiCall).toHaveBeenCalledTimes(1);
     wrapper.destroy();
   });
 
