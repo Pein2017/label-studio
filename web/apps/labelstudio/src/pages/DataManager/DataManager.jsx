@@ -11,17 +11,27 @@ import { useContextProps, useParams } from "../../providers/RoutesProvider";
 import { addCrumb, deleteCrumb } from "../../services/breadrumbs";
 import { cn } from "../../utils/bem";
 import { isDefined } from "../../utils/helpers";
+import { initializeOwnedDataManager } from "../../../../../libs/editor/src/services/data-manager-ready";
 import { ImportModal } from "../CreateProject/Import/ImportModal";
 import { ExportPage } from "../ExportPage/ExportPage";
 import { APIConfig } from "./api-config";
 
 import "./DataManager.prefix.css";
 
+// Stable browser contract shared with the editor's managed CoordExp mounts.
+// CustomEvent.detail is the exact owned DataManager instance, or null after owned teardown.
+const DATA_MANAGER_READY_EVENT = "coordexp:data-manager-ready";
+
+const publishDataManager = (dataManager) => {
+  window.dataManager = dataManager;
+  window.dispatchEvent(new CustomEvent(DATA_MANAGER_READY_EVENT, { detail: dataManager }));
+};
+
 const loadDependencies = () => [import("@humansignal/datamanager"), import("@humansignal/editor")];
 
 const initializeDataManager = async (root, props, params) => {
   if (!window.LabelStudio) throw Error("Label Studio Frontend doesn't exist on the page");
-  if (!root && root.dataset.dmInitialized) return;
+  if (!root || root.dataset.dmInitialized) return;
 
   root.dataset.dmInitialized = true;
 
@@ -69,30 +79,43 @@ export const DataManagerPage = ({ ...props }) => {
   const [crashed, setCrashed] = useState(false);
   const [loading, setLoading] = useState(!window.DataManager || !window.LabelStudio);
   const dataManagerRef = useRef();
+  const initGenerationRef = useRef(0);
   const projectId = project?.id;
 
   const init = useCallback(async () => {
+    const generation = initGenerationRef.current;
+    const isOwner = () => initGenerationRef.current === generation;
+
     if (!window.LabelStudio) return;
     if (!window.DataManager) return;
     if (!root.current) return;
     if (!project?.id) return;
     if (dataManagerRef.current) return;
 
-    const mlBackends = await api.callApi("mlBackends", {
-      params: { project: project.id },
+    let interactiveBacked;
+    const dataManager = await initializeOwnedDataManager({
+      load: async () => {
+        const mlBackends = await api.callApi("mlBackends", {
+          params: { project: project.id },
+        });
+
+        interactiveBacked = (mlBackends ?? []).find(({ is_interactive }) => is_interactive);
+        return interactiveBacked;
+      },
+      create: () =>
+        initializeDataManager(root.current, props, {
+          ...params,
+          project,
+          autoAnnotation: isDefined(interactiveBacked),
+        }),
+      isOwner,
+      publish: (ownedDataManager) => {
+        dataManagerRef.current = ownedDataManager;
+        publishDataManager(ownedDataManager);
+      },
     });
 
-    const interactiveBacked = (mlBackends ?? []).find(({ is_interactive }) => is_interactive);
-
-    const dataManager = (dataManagerRef.current =
-      dataManagerRef.current ??
-      (await initializeDataManager(root.current, props, {
-        ...params,
-        project,
-        autoAnnotation: isDefined(interactiveBacked),
-      })));
-
-    Object.assign(window, { dataManager });
+    if (!dataManager || !isOwner()) return;
 
     dataManager.on("crash", (details) => {
       const error = details?.error;
@@ -195,22 +218,35 @@ export const DataManagerPage = ({ ...props }) => {
   }, [projectId]);
 
   const destroyDM = useCallback(() => {
-    if (dataManagerRef.current) {
-      dataManagerRef.current.destroy();
+    const dataManager = dataManagerRef.current;
+
+    if (!dataManager) {
+      if (root.current) delete root.current.dataset.dmInitialized;
+      return;
+    }
+    try {
+      dataManager.destroy();
+    } finally {
       dataManagerRef.current = null;
+      if (root.current) delete root.current.dataset.dmInitialized;
+      if (window.dataManager === dataManager) publishDataManager(null);
     }
   }, []);
 
   useEffect(() => {
-    Promise.all(dependencies)
-      .then(() => setLoading(false))
-      .then(init);
-  }, [init]);
+    const generation = ++initGenerationRef.current;
 
-  useEffect(() => {
-    // destroy the data manager when the component is unmounted
-    return () => destroyDM();
-  }, []);
+    Promise.all(dependencies).then(() => {
+      if (initGenerationRef.current !== generation) return;
+      setLoading(false);
+      return init();
+    });
+
+    return () => {
+      if (initGenerationRef.current === generation) initGenerationRef.current += 1;
+      destroyDM();
+    };
+  }, [dependencies, destroyDM, init]);
 
   return crashed ? (
     <div className={cn("crash").toClassName()}>

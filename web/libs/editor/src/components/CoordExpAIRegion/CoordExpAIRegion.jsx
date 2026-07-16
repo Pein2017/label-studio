@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { observer } from "mobx-react";
 
 import { CoordExpRefinementClient, createBatchId } from "../../services/coordexp-refinement-api";
+import { useReadyDataManager } from "../../services/data-manager-ready";
 import {
   DEFAULT_CANVAS,
   buildVisualPolicy,
@@ -108,7 +109,7 @@ const applyVisualPolicy = (image, policy) => {
 };
 
 export const CoordExpAIRegionMount = ({ store, image, annotation, candidate, clientFactory, requestIdFactory }) => {
-  const dataManager = resolveAIRegionDataManager(store, candidate);
+  const dataManager = useReadyDataManager(store, candidate, resolveAIRegionDataManager);
   const projectId = store?.project?.id;
   const taskId = store?.task?.id;
 

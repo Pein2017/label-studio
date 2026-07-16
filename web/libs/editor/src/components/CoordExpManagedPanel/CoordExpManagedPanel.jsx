@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { CoordExpRefinementClient, createBatchId } from "../../services/coordexp-refinement-api";
+import { useReadyDataManager } from "../../services/data-manager-ready";
 import "./CoordExpManagedPanel.prefix.css";
 
 const ACTIVE_BATCH_STATES = new Set(["queued", "running", "reconciling"]);
@@ -167,7 +168,7 @@ export const resolveManagedDataManager = (store, candidate = globalThis.window?.
 };
 
 export const CoordExpManagedPanelMount = ({ store, candidate, clientFactory, pollIntervalMs, batchStorage }) => {
-  const dataManager = resolveManagedDataManager(store, candidate);
+  const dataManager = useReadyDataManager(store, candidate, resolveManagedDataManager);
 
   if (!dataManager) return null;
 

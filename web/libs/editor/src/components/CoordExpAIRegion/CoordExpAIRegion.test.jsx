@@ -19,6 +19,7 @@ import "../../tags/object/Image";
 import "../../tags/control/RectangleLabels";
 import { ImageModel } from "../../tags/object/Image/Image";
 import AppStore from "../../stores/AppStore";
+import { DATA_MANAGER_READY_EVENT } from "../../services/data-manager-ready";
 import { CoordExpAIRegion, CoordExpAIRegionMount, isAIRegionMountTarget } from "./CoordExpAIRegion";
 
 const REQUEST_ID = "11111111-1111-4111-8111-111111111111";
@@ -338,6 +339,7 @@ const mountHarness = ({
   imageTags = "one",
   imageOverrides = {},
   candidateOverrides = {},
+  candidateMode = "explicit",
 } = {}) => {
   const image = {
     type: "image",
@@ -390,12 +392,14 @@ const mountHarness = ({
     infer: jest.fn(),
     abandon: jest.fn(),
   };
+  if (candidateMode === "window") window.dataManager = dataManager;
+  if (candidateMode === "none") window.dataManager = null;
   const view = render(
     <CoordExpAIRegionMount
       store={store}
       image={image}
       annotation={annotation}
-      candidate={dataManager}
+      candidate={candidateMode === "explicit" ? dataManager : undefined}
       clientFactory={() => client}
     />,
   );
@@ -404,6 +408,16 @@ const mountHarness = ({
 };
 
 describe("CoordExpAIRegionMount", () => {
+  const publish = (dataManager, detail = dataManager) => {
+    window.dataManager = dataManager;
+    window.dispatchEvent(new CustomEvent(DATA_MANAGER_READY_EVENT, { detail }));
+  };
+
+  afterEach(() => {
+    delete window.dataManager;
+    jest.restoreAllMocks();
+  });
+
   it("mounts only the selected annotation's sole ordinary configured Image tag for a managed resolver", async () => {
     const { dataManager } = mountHarness();
 
@@ -437,6 +451,99 @@ describe("CoordExpAIRegionMount", () => {
     expect(isAIRegionMountTarget(store, annotation, image)).toBe(false);
     annotation.names = undefined;
     expect(isAIRegionMountTarget(store, annotation, image)).toBe(false);
+  });
+
+  it("mounts from readiness both before mount and after an initial null render", async () => {
+    const before = mountHarness({ candidateMode: "window" });
+
+    expect(await screen.findByLabelText("AI Region inference")).toBeInTheDocument();
+    before.unmount();
+
+    const after = mountHarness({ candidateMode: "none" });
+
+    expect(screen.queryByLabelText("AI Region inference")).not.toBeInTheDocument();
+    act(() => publish(after.dataManager));
+    expect(await screen.findByLabelText("AI Region inference")).toBeInTheDocument();
+  });
+
+  it("ignores malformed and other-store readiness events", async () => {
+    const harness = mountHarness({ candidateMode: "none" });
+    const otherStore = { ...harness.store };
+    const otherManager = {
+      ...harness.dataManager,
+      lsf: { ...harness.dataManager.lsf, lsfInstance: { store: otherStore } },
+    };
+
+    act(() => publish(otherManager));
+    expect(screen.queryByLabelText("AI Region inference")).not.toBeInTheDocument();
+    act(() => publish(harness.dataManager, { malformed: true }));
+    expect(screen.queryByLabelText("AI Region inference")).not.toBeInTheDocument();
+    act(() => publish(harness.dataManager));
+    expect(await screen.findByLabelText("AI Region inference")).toBeInTheDocument();
+  });
+
+  it("keeps explicit candidate precedence and removes the exact readiness listener", () => {
+    const addEventListener = jest.spyOn(window, "addEventListener");
+    const removeEventListener = jest.spyOn(window, "removeEventListener");
+    const explicit = mountHarness();
+    const replacement = {
+      ...explicit.dataManager,
+      on: jest.fn(),
+      off: jest.fn(),
+    };
+
+    act(() => publish(replacement));
+    expect(explicit.dataManager.on).toHaveBeenCalledWith("managedStatusChanged", expect.any(Function));
+    expect(replacement.on).not.toHaveBeenCalled();
+    expect(addEventListener).not.toHaveBeenCalledWith(DATA_MANAGER_READY_EVENT, expect.any(Function));
+    explicit.unmount();
+
+    const subscribed = mountHarness({ candidateMode: "window" });
+    const listener = addEventListener.mock.calls.find(([name]) => name === DATA_MANAGER_READY_EVENT)?.[1];
+
+    expect(listener).toEqual(expect.any(Function));
+    subscribed.unmount();
+    expect(removeEventListener).toHaveBeenCalledWith(DATA_MANAGER_READY_EVENT, listener);
+  });
+
+  it("replaces the manager and resets across a project-store transition", async () => {
+    const harness = mountHarness({ candidateMode: "window" });
+    const replacement = {
+      ...harness.dataManager,
+      on: jest.fn(),
+      off: jest.fn(),
+    };
+
+    expect(await screen.findByLabelText("AI Region inference")).toBeInTheDocument();
+    act(() => publish(replacement));
+    expect(harness.dataManager.off).toHaveBeenCalledWith("managedStatusChanged", expect.any(Function));
+    expect(replacement.on).toHaveBeenCalledWith("managedStatusChanged", expect.any(Function));
+
+    const storeB = {
+      ...harness.store,
+      project: { id: 8 },
+      annotationStore: { selected: harness.annotation },
+    };
+    const managerB = {
+      ...harness.dataManager,
+      projectId: 8,
+      lsf: { ...harness.dataManager.lsf, lsfInstance: { store: storeB } },
+      on: jest.fn(),
+      off: jest.fn(),
+    };
+
+    harness.rerender(
+      <CoordExpAIRegionMount
+        store={storeB}
+        image={harness.image}
+        annotation={harness.annotation}
+        clientFactory={() => harness.client}
+      />,
+    );
+    expect(screen.queryByLabelText("AI Region inference")).not.toBeInTheDocument();
+
+    act(() => publish(managerB));
+    expect(await screen.findByLabelText("AI Region inference")).toBeInTheDocument();
   });
 
   it("fails closed when the sole configured Image tag is not the supplied Image identity", () => {

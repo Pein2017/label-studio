@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 
 import { CoordExpManagedPanel, CoordExpManagedPanelMount } from "./CoordExpManagedPanel";
 import { CoordExpHttpError } from "../../services/coordexp-refinement-api";
+import { DATA_MANAGER_READY_EVENT } from "../../services/data-manager-ready";
 
 const ACTIVE_BATCH_ID = "11111111-1111-4111-8111-111111111111";
 const TERMINAL_BATCH_ID = "22222222-2222-4222-8222-222222222222";
@@ -425,6 +426,16 @@ describe("CoordExpManagedPanel", () => {
 });
 
 describe("CoordExpManagedPanelMount", () => {
+  const publish = (dataManager, detail = dataManager) => {
+    window.dataManager = dataManager;
+    window.dispatchEvent(new CustomEvent(DATA_MANAGER_READY_EVENT, { detail }));
+  };
+
+  afterEach(() => {
+    delete window.dataManager;
+    jest.restoreAllMocks();
+  });
+
   it("mounts only for the identity-matched managed wrapper", async () => {
     const store = { project: { id: 7 } };
     const dataManager = makeDataManager();
@@ -459,5 +470,109 @@ describe("CoordExpManagedPanelMount", () => {
     dataManager.projectId = 9;
     rerender(<CoordExpManagedPanelMount store={store} candidate={dataManager} clientFactory={() => makeClient()} />);
     expect(container).toBeEmptyDOMElement();
+  });
+
+  it("mounts from readiness both before mount and after an initial null render", async () => {
+    const store = { project: { id: 7 } };
+    const dataManager = makeDataManager();
+
+    dataManager.lsf.lsfInstance.store = store;
+    publish(null);
+    const first = render(
+      <CoordExpManagedPanelMount
+        store={store}
+        clientFactory={() => makeClient()}
+        pollIntervalMs={60_000}
+        batchStorage={makeStorage()}
+      />,
+    );
+
+    expect(first.container).toBeEmptyDOMElement();
+    act(() => publish(dataManager));
+    expect(await screen.findByRole("complementary", { name: "CoordExp refinement status" })).toBeInTheDocument();
+    first.unmount();
+
+    publish(dataManager);
+    render(
+      <CoordExpManagedPanelMount
+        store={store}
+        clientFactory={() => makeClient()}
+        pollIntervalMs={60_000}
+        batchStorage={makeStorage()}
+      />,
+    );
+    expect(screen.getByRole("complementary", { name: "CoordExp refinement status" })).toBeInTheDocument();
+  });
+
+  it("ignores malformed and other-store readiness events", () => {
+    const store = { project: { id: 7 } };
+    const otherStore = { project: { id: 7 } };
+    const otherManager = makeDataManager();
+    const dataManager = makeDataManager();
+
+    otherManager.lsf.lsfInstance.store = otherStore;
+    dataManager.lsf.lsfInstance.store = store;
+    publish(null);
+    const { container } = render(<CoordExpManagedPanelMount store={store} clientFactory={() => makeClient()} />);
+
+    act(() => publish(otherManager));
+    expect(container).toBeEmptyDOMElement();
+    act(() => publish(dataManager, { malformed: true }));
+    expect(container).toBeEmptyDOMElement();
+    act(() => publish(dataManager));
+    expect(screen.getByRole("complementary", { name: "CoordExp refinement status" })).toBeInTheDocument();
+  });
+
+  it("keeps explicit candidate precedence and removes the exact readiness listener", () => {
+    const store = { project: { id: 7 } };
+    const explicit = makeDataManager();
+    const globalManager = makeDataManager();
+    const addEventListener = jest.spyOn(window, "addEventListener");
+    const removeEventListener = jest.spyOn(window, "removeEventListener");
+
+    explicit.lsf.lsfInstance.store = store;
+    globalManager.lsf.lsfInstance.store = store;
+    publish(globalManager);
+    const explicitView = render(
+      <CoordExpManagedPanelMount store={store} candidate={explicit} clientFactory={() => makeClient()} />,
+    );
+
+    expect(explicit.on).toHaveBeenCalled();
+    expect(globalManager.on).not.toHaveBeenCalled();
+    expect(addEventListener).not.toHaveBeenCalledWith(DATA_MANAGER_READY_EVENT, expect.any(Function));
+    explicitView.unmount();
+
+    const subscribedView = render(<CoordExpManagedPanelMount store={store} clientFactory={() => makeClient()} />);
+    const listener = addEventListener.mock.calls.find(([name]) => name === DATA_MANAGER_READY_EVENT)?.[1];
+
+    expect(listener).toEqual(expect.any(Function));
+    subscribedView.unmount();
+    expect(removeEventListener).toHaveBeenCalledWith(DATA_MANAGER_READY_EVENT, listener);
+  });
+
+  it("replaces the mounted manager and resets across a project-store transition", () => {
+    const storeA = { project: { id: 7 } };
+    const storeB = { project: { id: 8 } };
+    const managerA1 = makeDataManager();
+    const managerA2 = makeDataManager();
+    const managerB = makeDataManager();
+
+    managerA1.lsf.lsfInstance.store = storeA;
+    managerA2.lsf.lsfInstance.store = storeA;
+    managerB.projectId = 8;
+    managerB.lsf.lsfInstance.store = storeB;
+    publish(managerA1);
+    const { container, rerender } = render(
+      <CoordExpManagedPanelMount store={storeA} clientFactory={() => makeClient()} pollIntervalMs={60_000} />,
+    );
+
+    act(() => publish(managerA2));
+    expect(managerA1.off).toHaveBeenCalledWith("managedStatusChanged", expect.any(Function));
+    expect(managerA2.on).toHaveBeenCalledWith("managedStatusChanged", expect.any(Function));
+
+    rerender(<CoordExpManagedPanelMount store={storeB} clientFactory={() => makeClient()} pollIntervalMs={60_000} />);
+    expect(container).toBeEmptyDOMElement();
+    act(() => publish(managerB));
+    expect(screen.getByRole("complementary", { name: "CoordExp refinement status" })).toBeInTheDocument();
   });
 });
