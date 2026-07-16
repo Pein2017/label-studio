@@ -726,10 +726,14 @@ describe("CoordExpAIRegion", () => {
     await waitFor(() => expect(harness.client.infer).toHaveBeenCalledTimes(1));
     harness.unmount();
     await waitFor(() =>
-      expect(harness.client.abandon).toHaveBeenCalledWith({
-        receiptId: `roi-receipt:${REQUEST_ID}`,
-        reason: "user_discarded",
-      }),
+      expect(harness.client.abandon).toHaveBeenCalledWith(
+        {
+          receiptId: `roi-receipt:${REQUEST_ID}`,
+          reason: "user_discarded",
+        },
+        undefined,
+        { keepalive: true },
+      ),
     );
     act(() => resolveInfer({ payload: produced() }));
   });
