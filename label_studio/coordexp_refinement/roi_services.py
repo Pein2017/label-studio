@@ -12,6 +12,9 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
+from src.label_studio_coco_refinement.geometry import (
+    norm1000_bbox_to_label_studio_xywh,
+)
 from src.label_studio_coco_refinement.runtime import AuthenticatedPrincipal
 
 from .roi_targets import (
@@ -525,13 +528,11 @@ def _validate_label_studio_result(
     observed_rectangle = tuple(
         _finite_number(rectangle[field], field=f'ROI rectangle {field}') for field in ('x', 'y', 'width', 'height')
     )
-    expected_rectangle = (
-        bbox[0] / 10.0,
-        bbox[1] / 10.0,
-        (bbox[2] - bbox[0]) / 10.0,
-        (bbox[3] - bbox[1]) / 10.0,
-    )
-    if observed_rectangle != expected_rectangle:
+    expected_rectangle = norm1000_bbox_to_label_studio_xywh(bbox)
+    if not all(
+        math.isclose(observed, expected, rel_tol=0.0, abs_tol=1e-9)
+        for observed, expected in zip(observed_rectangle, expected_rectangle, strict=True)
+    ):
         raise RoiServicesError('ROI rectangle does not match its normalized bbox')
     labels = rectangle['rectanglelabels']
     if labels != [category_name]:

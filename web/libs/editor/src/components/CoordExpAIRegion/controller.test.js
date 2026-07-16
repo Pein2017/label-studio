@@ -52,11 +52,11 @@ const target = {
   preexisting_draft_dirty: false,
 };
 
-const region = (key = `roi:${REQUEST_ID}:1`) => ({
+const region = (key = `roi:${REQUEST_ID}:1`, bbox = [100, 200, 400, 600]) => ({
   result_id: `${REQUEST_ID}:result-0`,
   category_name: "person",
   category_id: 1,
-  bbox_2d: [100, 200, 400, 600],
+  bbox_2d: bbox,
   request_id: REQUEST_ID,
   parser_object_span_id: "span-1",
   source_draft_revision: "revision-2",
@@ -70,10 +70,10 @@ const region = (key = `roi:${REQUEST_ID}:1`) => ({
     original_height: 600,
     image_rotation: 0,
     value: {
-      x: (100 * 100) / 999,
-      y: (200 * 100) / 999,
-      width: (300 * 100) / 999,
-      height: (400 * 100) / 999,
+      x: (bbox[0] * 100) / 999,
+      y: (bbox[1] * 100) / 999,
+      width: ((bbox[2] - bbox[0]) * 100) / 999,
+      height: ((bbox[3] - bbox[1]) * 100) / 999,
       rotation: 0,
       rectanglelabels: ["person"],
     },
@@ -339,6 +339,45 @@ describe("AI Region controller", () => {
         frozen,
       ),
     ).toThrow(/disagrees/);
+  });
+
+  it.each([
+    [
+      [100, 200, 300, 400],
+      [10000 / 999, 20000 / 999, 20000 / 999, 20000 / 999],
+    ],
+    [
+      [568, 4, 717, 153],
+      [56800 / 999, 400 / 999, 14900 / 999, 14900 / 999],
+    ],
+    [
+      [0, 0, 999, 999],
+      [0, 0, 100, 100],
+    ],
+  ])("validates exact norm1000 geometry %j through the inference response", (bbox, expected) => {
+    const candidate = region(undefined, bbox);
+    const payload = response({
+      insertion_payload: { target, mode: "append_one_undo_action", regions: [candidate] },
+    });
+
+    expect(validateInferenceResponse(payload, frozen).results[0].value).toMatchObject({
+      x: expected[0],
+      y: expected[1],
+      width: expected[2],
+      height: expected[3],
+    });
+  });
+
+  it("rejects legacy divide-by-ten Label Studio geometry", () => {
+    const candidate = region(undefined, [100, 200, 300, 400]);
+
+    Object.assign(candidate.label_studio_result.value, { x: 10, y: 20, width: 20, height: 20 });
+    expect(() =>
+      validateInferenceResponse(
+        response({ insertion_payload: { target, mode: "append_one_undo_action", regions: [candidate] } }),
+        frozen,
+      ),
+    ).toThrow(/disagrees with norm1000 geometry/);
   });
 
   it("uses stable-key greedy colors, exhaustion badges, and duplicate cues", () => {

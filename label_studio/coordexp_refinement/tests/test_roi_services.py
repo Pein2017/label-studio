@@ -15,6 +15,9 @@ from coordexp_refinement.roi_services import (
 )
 from coordexp_refinement.roi_targets import DjangoRoiTargetCatalog
 from django.test import SimpleTestCase
+from src.label_studio_coco_refinement.geometry import (
+    norm1000_bbox_to_label_studio_xywh,
+)
 
 
 class _ReceiptStore:
@@ -202,6 +205,44 @@ class DeferredCurrentTargetProviderTest(SimpleTestCase):
                 mutate(payload)
                 with self.assertRaises(RoiServicesError):
                     services.safe_infer_response(payload)
+
+    def test_safe_infer_response_accepts_parent_norm1000_geometry_golden_cases(self) -> None:
+        services = _services()
+        cases = (
+            (
+                (100, 200, 300, 400),
+                (10000 / 999, 20000 / 999, 30000 / 999 - 10000 / 999, 40000 / 999 - 20000 / 999),
+            ),
+            (
+                (568, 4, 717, 153),
+                (56800 / 999, 400 / 999, 71700 / 999 - 56800 / 999, 15300 / 999 - 400 / 999),
+            ),
+            ((0, 0, 999, 999), (0.0, 0.0, 100.0, 100.0)),
+        )
+
+        for bbox, expected in cases:
+            with self.subTest(bbox=bbox):
+                self.assertEqual(norm1000_bbox_to_label_studio_xywh(bbox), expected)
+                payload = _produced_response(bbox=bbox)
+                rectangle = payload['insertion_payload']['regions'][0]['label_studio_result']['value']
+                self.assertEqual(
+                    tuple(rectangle[field] for field in ('x', 'y', 'width', 'height')),
+                    expected,
+                )
+                self.assertEqual(services.safe_infer_response(payload), payload)
+
+    def test_safe_infer_response_rejects_legacy_divide_by_ten_geometry(self) -> None:
+        services = _services()
+        payload = _produced_response(bbox=(100, 200, 300, 400))
+        payload['insertion_payload']['regions'][0]['label_studio_result']['value'].update(
+            x=10.0,
+            y=20.0,
+            width=20.0,
+            height=20.0,
+        )
+
+        with self.assertRaisesRegex(RoiServicesError, 'normalized bbox'):
+            services.safe_infer_response(payload)
 
     def test_project_state_requires_exact_active_terminal_and_member_schema(self) -> None:
         services = _services()
@@ -485,12 +526,13 @@ def _empty_response(*, request_id=None):
     }
 
 
-def _produced_response(*, request_id=None):
+def _produced_response(*, request_id=None, bbox=(100, 200, 300, 400)):
     request_id = request_id or str(uuid4())
     receipt_id = f'roi-receipt:{request_id}'
     region_key = f'roi:{request_id}:1'
     result_id = 'result-1'
     revision = '2026-07-15T00:00:00.000000Z'
+    x, y, width, height = norm1000_bbox_to_label_studio_xywh(bbox)
     return {
         'receipt_id': receipt_id,
         'request_id': request_id,
@@ -520,7 +562,7 @@ def _produced_response(*, request_id=None):
                     'result_id': result_id,
                     'category_name': 'person',
                     'category_id': 1,
-                    'bbox_2d': [100, 200, 300, 400],
+                    'bbox_2d': list(bbox),
                     'request_id': request_id,
                     'parser_object_span_id': 'span-1',
                     'source_draft_revision': revision,
@@ -534,10 +576,10 @@ def _produced_response(*, request_id=None):
                         'original_height': 480,
                         'image_rotation': 0,
                         'value': {
-                            'x': 10.0,
-                            'y': 20.0,
-                            'width': 20.0,
-                            'height': 20.0,
+                            'x': x,
+                            'y': y,
+                            'width': width,
+                            'height': height,
                             'rotation': 0,
                             'rectanglelabels': ['person'],
                         },
