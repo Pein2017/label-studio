@@ -1,10 +1,21 @@
 from django.urls import path
 
-from .api import RefinementCommitAPI, RefinementSessionAPI, RefinementStatusAPI, json_csrf_protect
+from .api import (
+    RefinementCommitAPI,
+    RefinementProjectStateAPI,
+    RefinementSessionAPI,
+    RefinementStatusAPI,
+    RoiAbandonAPI,
+    RoiInferAPI,
+    RoiProfilesAPI,
+    json_csrf_protect,
+)
 
 app_name = 'coordexp_refinement'
 
 commit_view = json_csrf_protect(RefinementCommitAPI.as_view())
+roi_infer_view = json_csrf_protect(RoiInferAPI.as_view())
+roi_abandon_view = json_csrf_protect(RoiAbandonAPI.as_view())
 
 urlpatterns = [
     path(
@@ -21,5 +32,25 @@ urlpatterns = [
         'api/projects/<int:pk>/coordexp-refinement/session/',
         RefinementSessionAPI.as_view(),
         name='session',
+    ),
+    path(
+        'api/projects/<int:pk>/coordexp-refinement/project-state/',
+        RefinementProjectStateAPI.as_view(),
+        name='project-state',
+    ),
+    path(
+        'api/projects/<int:pk>/coordexp-refinement/roi/profiles/',
+        RoiProfilesAPI.as_view(),
+        name='roi-profiles',
+    ),
+    path(
+        'api/projects/<int:pk>/coordexp-refinement/roi/infer/',
+        roi_infer_view,
+        name='roi-infer',
+    ),
+    path(
+        'api/projects/<int:pk>/coordexp-refinement/roi/abandon/',
+        roi_abandon_view,
+        name='roi-abandon',
     ),
 ]

@@ -1,7 +1,8 @@
-"""Serve the explicit CoordExp refinement runtime on IPv4 localhost only."""
+"""Serve the explicit CoordExp refinement runtime on a loopback bind."""
 
 from __future__ import annotations
 
+import ipaddress
 from pathlib import Path
 
 from coordexp_refinement.runtime_factory import (
@@ -15,43 +16,42 @@ from organizations.models import Organization
 
 
 class Command(BaseCommand):
-    help = "Apply/attest and serve the CoordExp refinement runtime on 127.0.0.1 without Django autoreload."
+    help = 'Apply/attest and serve the CoordExp refinement runtime on its configured loopback without autoreload.'
 
     def add_arguments(self, parser):
-        parser.add_argument("--repo-root", required=True, type=Path)
-        parser.add_argument("--operator-user-id", required=True, type=int)
-        parser.add_argument("--organization-id", required=True, type=int)
-        parser.add_argument("--chunk-size", type=int, default=500)
-        parser.add_argument("--host", default="127.0.0.1")
-        parser.add_argument("--port", type=int, default=18083)
+        parser.add_argument('--repo-root', required=True, type=Path)
+        parser.add_argument('--operator-user-id', required=True, type=int)
+        parser.add_argument('--organization-id', required=True, type=int)
+        parser.add_argument('--roi-launch-config', required=True, type=Path)
+        parser.add_argument('--chunk-size', type=int, default=500)
 
     def handle(self, *args, **options):
-        host = _validate_host(options.get("host"))
-        port = _validate_port(options.get("port"))
+        if 'host' in options or 'port' in options:
+            raise CommandError('host/port overrides are not supported; use --roi-launch-config')
         service = None
         try:
-            user = get_user_model().objects.get(pk=options["operator_user_id"])
-            organization = Organization.objects.get(pk=options["organization_id"])
+            user = get_user_model().objects.get(pk=options['operator_user_id'])
+            organization = Organization.objects.get(pk=options['organization_id'])
             factory = ProductionRuntimeFactory(
-                repo_root=options["repo_root"],
+                repo_root=options['repo_root'],
+                roi_launch_config_path=options['roi_launch_config'],
                 operator_user=user,
                 organization=organization,
-                chunk_size=options["chunk_size"],
+                chunk_size=options['chunk_size'],
             )
             service = factory.start()
-            self.stdout.write(
-                self.style.SUCCESS(
-                    f"CoordExp refinement runtime serving on http://{host}:{port}"
-                )
-            )
+            bind = service.roi_manager.config.bind
+            host, port = bind.host, bind.port
+            addrport, use_ipv6 = _django_runserver_bind(host, port)
+            self.stdout.write(self.style.SUCCESS(f'CoordExp refinement runtime serving on http://{addrport}'))
             call_command(
-                "runserver",
-                f"{host}:{port}",
+                'runserver',
+                addrport,
                 use_reloader=False,
-                use_ipv6=False,
+                use_ipv6=use_ipv6,
             )
         except (get_user_model().DoesNotExist, Organization.DoesNotExist) as exc:
-            raise CommandError("operator user or organization does not exist") from exc
+            raise CommandError('operator user or organization does not exist') from exc
         except CommandError:
             raise
         except (RuntimeFactoryError, ValueError, TypeError) as exc:
@@ -61,16 +61,29 @@ class Command(BaseCommand):
                 service.close()
 
 
-def _validate_host(value) -> str:
-    if value != "127.0.0.1":
-        raise CommandError("host must be exactly 127.0.0.1")
-    return value
+def _django_runserver_bind(host, port) -> tuple[str, bool]:
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise CommandError('runtime returned an invalid loopback bind')
+    if not isinstance(host, str) or not host or host != host.strip():
+        raise CommandError('runtime returned an invalid loopback bind')
+
+    if host.casefold() in {'localhost', 'localhost.'}:
+        return f'localhost:{port}', False
+
+    candidate = host[1:-1] if host.startswith('[') and host.endswith(']') else host
+    if '%' in candidate:
+        raise CommandError('runtime returned an invalid loopback bind')
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        raise CommandError('runtime returned an invalid loopback bind') from None
+    if not address.is_loopback:
+        raise CommandError('runtime returned an invalid loopback bind')
+    if isinstance(address, ipaddress.IPv6Address):
+        if address != ipaddress.IPv6Address('::1'):
+            raise CommandError('runtime returned an invalid loopback bind')
+        return f'[{address.compressed}]:{port}', True
+    return f'{address}:{port}', False
 
 
-def _validate_port(value) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
-        raise CommandError("port must be an integer from 1 through 65535")
-    return value
-
-
-__all__ = ["Command"]
+__all__ = ['Command']

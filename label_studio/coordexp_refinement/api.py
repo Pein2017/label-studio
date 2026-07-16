@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import math
+import re
 from functools import wraps
 from typing import Any
 from uuid import UUID
@@ -35,12 +37,19 @@ from src.label_studio_coco_refinement.store import (
 )
 
 from .registry import ProjectRuntimeBinding, RuntimeBindingError, runtime_registry
+from .roi_finalization import DjangoRoiFinalizationError
+from .roi_services import RoiReceiptConflictError, RoiServicesError
+from .roi_targets import DjangoRoiTargetError
 
 logger = logging.getLogger(__name__)
 
 _ACTIVE_STATUSES = frozenset({BatchStatus.QUEUED.value, BatchStatus.RUNNING.value, BatchStatus.RECONCILING.value})
 _TERMINAL_STATUSES = frozenset({BatchStatus.SUCCEEDED.value, BatchStatus.FAILED.value})
 _ALL_STATUSES = _ACTIVE_STATUSES | _TERMINAL_STATUSES | {BatchStatus.NOT_FOUND.value}
+_ROI_INFER_FIELDS = frozenset({'request_id', 'task_id', 'roi', 'resolution', 'profile_selector'})
+_ROI_ABANDON_REASONS = frozenset({'user_cancelled', 'user_discarded', 'superseded'})
+_SAFE_SELECTOR = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z')
+_RECEIPT_ID = re.compile(r'roi-receipt:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z')
 
 
 class _JsonCsrfViewMiddleware(CsrfViewMiddleware):
@@ -113,6 +122,25 @@ class _NoStoreAPIView(APIView):
                 'Refinement runtime is unavailable for this project.',
                 503,
             )
+
+    @staticmethod
+    def _roi_services(binding: ProjectRuntimeBinding) -> tuple[Any | None, Response | None]:
+        if binding.services is None:
+            return None, _error(
+                'refinement_unavailable',
+                'ROI refinement is unavailable for this project.',
+                503,
+            )
+        return binding.services, None
+
+
+class _JsonBodyAPIView(_NoStoreAPIView):
+    parser_classes = (JSONParser,)
+
+    def handle_exception(self, exc):
+        if isinstance(exc, (ParseError, UnsupportedMediaType)):
+            return _error('invalid_request', 'Body must be valid JSON.', 400)
+        return super().handle_exception(exc)
 
 
 @method_decorator(enforce_csrf_checks, name='dispatch')
@@ -202,10 +230,188 @@ class RefinementSessionAPI(_NoStoreAPIView):
         return Response({'csrf_token': get_token(request)}, status=200)
 
 
+class RoiProfilesAPI(_NoStoreAPIView):
+    """Return only the launch manager's browser-safe profile projection."""
+
+    http_method_names = ('get',)
+
+    def get(self, request, pk: int) -> Response:
+        binding, failure = self._binding(request, pk)
+        if failure is not None:
+            return failure
+        assert binding is not None
+        services, failure = self._roi_services(binding)
+        if failure is not None:
+            return failure
+        try:
+            with services.request_admission():
+                profiles = list(services.safe_profiles())
+            return Response({'profiles': profiles}, status=200)
+        except Exception:
+            logger.exception('Unexpected CoordExp ROI profile failure for project_id=%s', pk)
+            return _error('refinement_unavailable', 'ROI refinement is unavailable.', 503)
+
+
+class RoiInferAPI(_JsonBodyAPIView):
+    """Infer from one Label Studio percent-xywh ROI on the source image."""
+
+    http_method_names = ('post',)
+
+    def post(self, request, pk: int) -> Response:
+        binding, failure = self._binding(request, pk)
+        if failure is not None:
+            return failure
+        body, failure = _parse_roi_infer_body(request.data)
+        if failure is not None:
+            return failure
+        assert binding is not None and body is not None
+        services, failure = self._roi_services(binding)
+        if failure is not None:
+            return failure
+        try:
+            with services.request_admission():
+                captured = services.targets.capture(
+                    user=request.user,
+                    project_pk=pk,
+                    task_pk=body['task_id'],
+                    request_id=body['request_id'],
+                    roi=body['roi'],
+                    resolution=body['resolution'],
+                    profile_selector=body['profile_selector'],
+                )
+                with captured:
+                    response = services.manager.infer(
+                        selector=body['profile_selector'],
+                        image=captured.image,
+                        target=captured.target,
+                        transform=captured.transform,
+                    )
+                payload = services.safe_infer_response(response)
+        except DjangoRoiTargetError:
+            return _error('invalid_roi_target', 'The ROI target is no longer valid.', 409)
+        except RoiServicesError:
+            return _error('refinement_unavailable', 'ROI inference is unavailable.', 503)
+        except Exception:
+            logger.exception('Unexpected CoordExp ROI inference failure for project_id=%s', pk)
+            return _error('refinement_unavailable', 'ROI inference is unavailable.', 503)
+        return Response(payload, status=200)
+
+
+class RoiAbandonAPI(_JsonBodyAPIView):
+    """Fence and permanently abandon one produced ROI receipt."""
+
+    http_method_names = ('post',)
+
+    def post(self, request, pk: int) -> Response:
+        binding, failure = self._binding(request, pk)
+        if failure is not None:
+            return failure
+        body, failure = _parse_roi_abandon_body(request.data)
+        if failure is not None:
+            return failure
+        assert binding is not None and body is not None
+        services, failure = self._roi_services(binding)
+        if failure is not None:
+            return failure
+        try:
+            with services.request_admission():
+                payload = services.abandon(
+                    user=request.user,
+                    receipt_id=body['receipt_id'],
+                    reason=body['reason'],
+                    expected_project_pk=pk,
+                    expected_split=binding.split,
+                )
+        except (DjangoRoiFinalizationError, RoiReceiptConflictError):
+            return _error('receipt_conflict', 'The ROI receipt cannot be abandoned.', 409)
+        except RoiServicesError:
+            return _error('refinement_unavailable', 'ROI refinement is unavailable.', 503)
+        except Exception:
+            logger.exception('Unexpected CoordExp ROI abandonment failure for project_id=%s', pk)
+            return _error('refinement_unavailable', 'ROI refinement is unavailable.', 503)
+        return Response(payload, status=200)
+
+
+class RefinementProjectStateAPI(_NoStoreAPIView):
+    """Read the authoritative managed Draft/batch overlay without enqueueing."""
+
+    http_method_names = ('get',)
+
+    def get(self, request, pk: int) -> Response:
+        binding, failure = self._binding(request, pk)
+        if failure is not None:
+            return failure
+        assert binding is not None
+        services, failure = self._roi_services(binding)
+        if failure is not None:
+            return failure
+        try:
+            with services.request_admission():
+                payload = services.project_state(
+                    project_pk=pk,
+                    split=binding.split,
+                    user_pk=request.user.pk,
+                )
+        except Exception:
+            logger.exception('Unexpected CoordExp project state failure for project_id=%s', pk)
+            return _error('refinement_unavailable', 'Refinement state is unavailable.', 503)
+        return Response(payload, status=200)
+
+
 def _parse_batch_body(data: Any) -> tuple[str | None, Response | None]:
     if not isinstance(data, dict) or set(data) != {'batch_id'}:
         return None, _error('invalid_request', 'Body must contain only batch_id.', 400)
     return _parse_batch_id(data['batch_id'])
+
+
+def _parse_roi_infer_body(data: Any) -> tuple[dict[str, Any] | None, Response | None]:
+    if not isinstance(data, dict) or set(data) != _ROI_INFER_FIELDS:
+        return None, _error('invalid_request', 'Body has an unsupported ROI inference shape.', 400)
+    request_id, failure = _parse_batch_id(data['request_id'])
+    if failure is not None:
+        return None, _error('invalid_request_id', 'request_id must be a canonical UUID.', 400)
+    task_id = data['task_id']
+    if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
+        return None, _error('invalid_task_id', 'task_id must be a positive integer.', 400)
+    roi = data['roi']
+    if not isinstance(roi, dict) or set(roi) != {'x', 'y', 'width', 'height'}:
+        return None, _error('invalid_roi', 'roi must contain x, y, width, and height.', 400)
+    if any(not _finite_number(roi[field]) for field in ('x', 'y', 'width', 'height')):
+        return None, _error('invalid_roi', 'roi values must be finite numbers.', 400)
+    resolution = data['resolution']
+    if not isinstance(resolution, dict) or set(resolution) != {'width', 'height'}:
+        return None, _error('invalid_resolution', 'resolution must contain width and height.', 400)
+    if any(
+        isinstance(resolution[field], bool) or not isinstance(resolution[field], int) or resolution[field] <= 0
+        for field in ('width', 'height')
+    ):
+        return None, _error('invalid_resolution', 'resolution values must be positive integers.', 400)
+    selector = data['profile_selector']
+    if not isinstance(selector, str) or _SAFE_SELECTOR.fullmatch(selector) is None:
+        return None, _error('invalid_profile_selector', 'profile_selector is invalid.', 400)
+    return {
+        'request_id': request_id,
+        'task_id': task_id,
+        'roi': dict(roi),
+        'resolution': dict(resolution),
+        'profile_selector': selector,
+    }, None
+
+
+def _parse_roi_abandon_body(data: Any) -> tuple[dict[str, str] | None, Response | None]:
+    if not isinstance(data, dict) or set(data) != {'receipt_id', 'reason'}:
+        return None, _error('invalid_request', 'Body must contain only receipt_id and reason.', 400)
+    receipt_id = data['receipt_id']
+    if not isinstance(receipt_id, str) or _RECEIPT_ID.fullmatch(receipt_id) is None:
+        return None, _error('invalid_receipt_id', 'receipt_id is invalid.', 400)
+    reason = data['reason']
+    if reason not in _ROI_ABANDON_REASONS:
+        return None, _error('invalid_reason', 'reason is invalid.', 400)
+    return {'receipt_id': receipt_id, 'reason': reason}, None
+
+
+def _finite_number(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
 
 
 def _parse_batch_query(data: Any) -> tuple[str | None, Response | None]:
@@ -295,4 +501,13 @@ def _error(code: str, message: str, status: int) -> Response:
     return Response({'error': {'code': code, 'message': message}}, status=status)
 
 
-__all__ = ['RefinementCommitAPI', 'RefinementSessionAPI', 'RefinementStatusAPI', 'json_csrf_protect']
+__all__ = [
+    'RefinementCommitAPI',
+    'RefinementProjectStateAPI',
+    'RefinementSessionAPI',
+    'RefinementStatusAPI',
+    'RoiAbandonAPI',
+    'RoiInferAPI',
+    'RoiProfilesAPI',
+    'json_csrf_protect',
+]

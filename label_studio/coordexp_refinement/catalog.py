@@ -29,6 +29,7 @@ from src.label_studio_coco_refinement.store import (
     AuthoritativeDraftIdentity,
     BatchMember,
     BatchRequest,
+    BatchStatus,
     DraftRestore,
     WorkingDatasetStore,
     canonical_json,
@@ -140,6 +141,117 @@ class DjangoDraftCatalog:
             raise
         except Exception as exc:
             raise DraftCatalogError('authoritative Draft capture failed closed') from exc
+
+    def project_state(
+        self,
+        *,
+        split: str,
+        principal: Any,
+    ) -> dict[str, Any]:
+        """Return a read-only authoritative Draft and active-batch projection."""
+
+        request = DraftCatalogRequest(
+            split=split,
+            project_id=str(self._project_ids.get(split, '')),
+            principal=principal,
+        )
+        split, project_pk, user_pk = self._validate_request(request)
+        store = self._stores[split]
+        try:
+            store_state_before = _store_project_state(store)
+            active_semantic_hashes = store_state_before['active_member_semantic_hashes']
+            terminal_semantic_hashes = store_state_before['last_terminal_member_semantic_hashes']
+            with transaction.atomic():
+                user = get_user_model().objects.get(pk=user_pk, is_active=True)
+                project = Project.objects.for_user(user).get(pk=project_pk)
+                drafts = list(
+                    AnnotationDraft.objects.select_for_update()
+                    .filter(
+                        user_id=user_pk,
+                        task__project_id=project.pk,
+                    )
+                    .order_by('task_id', 'pk')
+                )
+                locked = self._lock_and_validate_drafts(
+                    drafts=drafts,
+                    split=split,
+                    project_pk=project.pk,
+                    store=store,
+                )
+                locked.sort(key=lambda item: item.source_line)
+                baselines = store.restore_drafts(tuple(item.image_id for item in locked))
+                members: list[dict[str, Any]] = []
+                generation: int | None = None
+                pending_count = 0
+                for item, baseline in zip(locked, baselines, strict=True):
+                    _validate_baseline(
+                        baseline,
+                        split=split,
+                        image_id=item.image_id,
+                    )
+                    if generation is None:
+                        generation = baseline.generation
+                    elif generation != baseline.generation:
+                        raise DraftCatalogError('working store returned cross-generation project state')
+                    canonical = canonicalize_label_studio_draft(
+                        item.draft.result,
+                        split=split,
+                        image_id=item.image_id,
+                        image_width=_row_dimension(baseline, 'width'),
+                        image_height=_row_dimension(baseline, 'height'),
+                    )
+                    committed_hash = _baseline_semantic_hash(baseline)
+                    pending = canonical.semantic_hash != committed_hash
+                    pending_count += int(pending)
+                    task_key = f'{split}:{item.image_id}'
+                    active_batch_semantic_hash = active_semantic_hashes.get(task_key)
+                    terminal_batch_semantic_hash = terminal_semantic_hashes.get(task_key)
+                    members.append(
+                        {
+                            'task_id': item.task.pk,
+                            'task_key': task_key,
+                            'draft_id': item.draft.pk,
+                            'draft_updated_at': _timestamp(item.draft.updated_at),
+                            'draft_semantic_hash': canonical.semantic_hash,
+                            'committed_semantic_hash': committed_hash,
+                            'pending': pending,
+                            'draft_ahead_of_committed': pending,
+                            'active_batch_member': active_batch_semantic_hash is not None,
+                            'active_batch_semantic_hash': active_batch_semantic_hash,
+                            'draft_ahead_of_active_batch': (
+                                active_batch_semantic_hash is not None
+                                and canonical.semantic_hash != active_batch_semantic_hash
+                            ),
+                            'last_terminal_batch_member': terminal_batch_semantic_hash is not None,
+                            'last_terminal_batch_semantic_hash': terminal_batch_semantic_hash,
+                            'draft_matches_last_terminal_batch': (
+                                terminal_batch_semantic_hash is not None
+                                and canonical.semantic_hash == terminal_batch_semantic_hash
+                            ),
+                        }
+                    )
+
+            store_state_after = _store_project_state(store)
+            if store_state_before != store_state_after:
+                raise DraftCatalogError('project store state changed during capture')
+            store_generation = store_state_before['generation']
+            if generation is not None and generation != store_generation:
+                # A commit completed after the Draft snapshot.  Refuse a mixed
+                # projection and let the browser retry its read-only poll.
+                raise DraftCatalogError('project state changed during capture')
+            return {
+                'generation': store_generation,
+                'pending_draft_count': pending_count,
+                'members': members,
+                'active_batch_id': store_state_before['active_batch_id'],
+                'batch_state': store_state_before['batch_state'],
+                'active_batch': store_state_before['active_batch'],
+                'last_terminal_batch': store_state_before['last_terminal_batch'],
+            }
+        except DraftCatalogError:
+            raise
+        except Exception as exc:
+            raise DraftCatalogError('authoritative project state lookup failed closed') from exc
 
     def _validate_request(self, request: DraftCatalogRequest) -> tuple[str, int, int]:
         if not isinstance(request, DraftCatalogRequest):
@@ -375,6 +487,138 @@ def _normalize_project_map(
     return MappingProxyType(normalized)
 
 
+def _store_project_state(store: WorkingDatasetStore) -> dict[str, Any]:
+    """Read one queue/journal/manifest projection under store barriers."""
+
+    try:
+        with store._shared_lock():
+            with store._shared_queue_lock():
+                queue_records = store._read_queue_records()
+            reconciliation_reason = store._batch_reconciliation_reason(queue_records)
+            manifest = store._read_manifest()
+            generation = int(manifest['generation'])
+            journal_records = tuple(store._records)
+            active = store._active_queue_enqueue(queue_records)
+
+            active_batch = None
+            active_semantic_hashes: dict[str, str] = {}
+            if active is not None:
+                batch_id = active.get('batch_id')
+                if not isinstance(batch_id, str) or not batch_id:
+                    raise DraftCatalogError('working store active batch identity is invalid')
+                state, _, _ = store._queue_batch_state(active, queue_records)
+                state_value = BatchStatus.RECONCILING.value if reconciliation_reason is not None else state.value
+                active_semantic_hashes = _queued_member_semantic_hashes(
+                    active,
+                    field='active batch',
+                )
+                active_batch = {
+                    'batch_id': batch_id,
+                    'state': state_value,
+                    'member_count': int(active['member_count']),
+                    'base_generation': int(active['base_generation']),
+                    'payload_hash': active['payload_hash'],
+                }
+
+            last_terminal = None
+            last_terminal_semantic_hashes: dict[str, str] = {}
+            if reconciliation_reason is None:
+                last_terminal, last_terminal_semantic_hashes = _last_terminal_batch(
+                    queue_records=queue_records,
+                    journal_records=journal_records,
+                )
+        return {
+            'generation': generation,
+            'active_batch_id': None if active_batch is None else active_batch['batch_id'],
+            'batch_state': None if active_batch is None else active_batch['state'],
+            'active_batch': active_batch,
+            'active_member_semantic_hashes': dict(sorted(active_semantic_hashes.items())),
+            'last_terminal_batch': last_terminal,
+            'last_terminal_member_semantic_hashes': dict(sorted(last_terminal_semantic_hashes.items())),
+        }
+    except DraftCatalogError:
+        raise
+    except Exception as exc:
+        raise DraftCatalogError('working store project status is unavailable') from exc
+
+
+def _last_terminal_batch(
+    *,
+    queue_records: Sequence[Mapping[str, Any]],
+    journal_records: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, str]]:
+    terminals = [record for record in queue_records if record.get('kind') == 'queue_terminal']
+    for terminal in reversed(terminals):
+        matching = [
+            record
+            for record in journal_records
+            if record.get('kind') == 'batch_terminal'
+            and all(
+                record.get(field) == terminal.get(field)
+                for field in (
+                    'batch_id',
+                    'payload_hash',
+                    'status',
+                    'generation',
+                    'working_sha256',
+                    'error',
+                )
+            )
+        ]
+        if len(matching) != 1:
+            raise DraftCatalogError('working store terminal batch projection is ambiguous')
+        enqueue = [
+            record
+            for record in queue_records
+            if record.get('kind') == 'enqueue' and record.get('batch_id') == terminal.get('batch_id')
+        ]
+        if len(enqueue) != 1:
+            raise DraftCatalogError('working store terminal batch enqueue is ambiguous')
+        source = enqueue[0]
+        state = terminal.get('status')
+        if state not in {BatchStatus.SUCCEEDED.value, BatchStatus.FAILED.value}:
+            raise DraftCatalogError('working store terminal batch state is invalid')
+        semantic_hashes = _queued_member_semantic_hashes(
+            source,
+            field='terminal batch',
+        )
+        return {
+            'batch_id': terminal['batch_id'],
+            'state': state,
+            'member_count': int(source['member_count']),
+            'base_generation': int(source['base_generation']),
+            'generation': int(terminal['generation']),
+            'error': 'Batch processing failed.' if state == BatchStatus.FAILED.value else None,
+            'payload_hash': terminal['payload_hash'],
+            'member_task_keys': sorted(semantic_hashes),
+        }, semantic_hashes
+    return None, {}
+
+
+def _queued_member_semantic_hashes(
+    enqueue: Mapping[str, Any],
+    *,
+    field: str,
+) -> dict[str, str]:
+    payload = enqueue.get('payload')
+    if not isinstance(payload, Mapping):
+        raise DraftCatalogError(f'working store {field} payload is invalid')
+    members = payload.get('members')
+    if not isinstance(members, list) or len(members) != enqueue.get('member_count'):
+        raise DraftCatalogError(f'working store {field} members are invalid')
+    semantic_hashes: dict[str, str] = {}
+    for member in members:
+        if not isinstance(member, Mapping) or not isinstance(member.get('request'), Mapping):
+            raise DraftCatalogError(f'working store {field} member is invalid')
+        member_request = member['request']
+        task_key = member_request.get('task_id')
+        semantic = member_request.get('semantic_hash')
+        if not isinstance(task_key, str) or not task_key or not _is_sha256(semantic) or task_key in semantic_hashes:
+            raise DraftCatalogError(f'working store {field} member identity is invalid')
+        semantic_hashes[task_key] = semantic
+    return semantic_hashes
+
+
 def _normalize_store_map(
     stores: Mapping[str, WorkingDatasetStore], *, expected: Mapping[str, int]
 ) -> Mapping[str, WorkingDatasetStore]:
@@ -406,6 +650,10 @@ def _canonical_text_pk(value: Any, *, field: str) -> int:
     if not isinstance(value, str):
         raise DraftCatalogError(f'{field} must be canonical decimal text')
     return _canonical_pk(value, field=field)
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(character in '0123456789abcdef' for character in value)
 
 
 def _task_identity(task: Task, *, split: str) -> tuple[str, int, int]:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from src.label_studio_coco_refinement.runtime import (
     AuthenticatedPrincipal,
@@ -38,6 +38,7 @@ class ProjectRuntimeBinding:
     project_pk: int
     split: str
     runtime: RefinementRuntimeProtocol
+    services: Any | None = None
 
 
 class ProjectRuntimeRegistry:
@@ -53,6 +54,7 @@ class ProjectRuntimeRegistry:
         project_pk: int,
         split: str,
         runtime: RefinementRuntimeProtocol,
+        services: Any | None = None,
         replace: bool = False,
     ) -> ProjectRuntimeBinding:
         project_pk = _validate_project_pk(project_pk)
@@ -65,11 +67,20 @@ class ProjectRuntimeRegistry:
         project_ids = getattr(runtime, 'project_ids', None)
         if not isinstance(project_ids, Mapping) or project_ids.get(split) != str(project_pk):
             raise RuntimeBindingError('runtime project/split mapping does not match the binding')
-        binding = ProjectRuntimeBinding(project_pk=project_pk, split=split, runtime=runtime)
+        if services is not None:
+            for attribute in ('manager', 'targets', 'finalizer', 'receipt_store'):
+                if getattr(services, attribute, None) is None:
+                    raise RuntimeBindingError('ROI service bundle is incomplete')
+        binding = ProjectRuntimeBinding(
+            project_pk=project_pk,
+            split=split,
+            runtime=runtime,
+            services=services,
+        )
         with self._lock:
             current = self._bindings.get(project_pk)
             if current is not None:
-                if current.split == split and current.runtime is runtime:
+                if current.split == split and current.runtime is runtime and current.services is services:
                     return current
                 if not replace:
                     raise RuntimeBindingError('project runtime is already registered')
