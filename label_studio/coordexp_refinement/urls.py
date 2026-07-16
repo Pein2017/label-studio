@@ -5,6 +5,7 @@ from .api import (
     RefinementProjectStateAPI,
     RefinementSessionAPI,
     RefinementStatusAPI,
+    RefinementTaskLifecycleAPI,
     RoiAbandonAPI,
     RoiInferAPI,
     RoiProfilesAPI,
@@ -16,6 +17,7 @@ app_name = 'coordexp_refinement'
 commit_view = json_csrf_protect(RefinementCommitAPI.as_view())
 roi_infer_view = json_csrf_protect(RoiInferAPI.as_view())
 roi_abandon_view = json_csrf_protect(RoiAbandonAPI.as_view())
+task_lifecycle_view = json_csrf_protect(RefinementTaskLifecycleAPI.as_view())
 
 urlpatterns = [
     path(
@@ -37,6 +39,11 @@ urlpatterns = [
         'api/projects/<int:pk>/coordexp-refinement/project-state/',
         RefinementProjectStateAPI.as_view(),
         name='project-state',
+    ),
+    path(
+        'api/projects/<int:pk>/coordexp-refinement/task-lifecycle/',
+        task_lifecycle_view,
+        name='task-lifecycle',
     ),
     path(
         'api/projects/<int:pk>/coordexp-refinement/roi/profiles/',

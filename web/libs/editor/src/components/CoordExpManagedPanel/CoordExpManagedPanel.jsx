@@ -195,6 +195,7 @@ export const CoordExpManagedPanel = ({
   dataManagerOwner.current = dataManager;
   const pollOwner = useRef(null);
   const commitOwner = useRef(null);
+  const lifecycleOwner = useRef(null);
   const [statusState, setStatusState] = useState(() => ({
     owner: dataManager,
     value: dataManager.getManagedStatusState?.() ?? null,
@@ -208,6 +209,7 @@ export const CoordExpManagedPanel = ({
   const [pollError, setPollError] = useState(null);
   const [operationError, setOperationError] = useState(null);
   const [enqueueing, setEnqueueing] = useState(false);
+  const [discarding, setDiscarding] = useState(false);
 
   const updateStatus = useCallback(
     (next) => {
@@ -224,7 +226,7 @@ export const CoordExpManagedPanel = ({
   );
 
   const refreshProjectState = useCallback(
-    async (signal) => {
+    async (signal, { reconcileTerminal = true } = {}) => {
       const token = dataManager.beginManagedProjectStatePoll();
       const projectState = await client.projectState(signal);
       const next = dataManager.updateManagedProjectState(projectState, token);
@@ -235,6 +237,18 @@ export const CoordExpManagedPanel = ({
       if (trackedBatchId) writeBatchId(batchStorage, projectId, trackedBatchId);
 
       updateStatus(next ?? dataManager.getManagedStatusState?.());
+      const prepared = reconcileTerminal ? dataManager.lsf?.prepareManagedTaskLifecycle?.("reconcile") : null;
+
+      if (prepared) {
+        try {
+          const response = await client.taskLifecycle(prepared.request, signal);
+
+          dataManager.lsf.applyManagedTaskLifecycle(prepared, response);
+        } catch (error) {
+          if (error?.name === "AbortError") throw error;
+          dataManager.lsf?.failManagedTaskLifecycle?.(error, "reconcile");
+        }
+      }
       return projectState;
     },
     [batchStorage, client, dataManager, projectId, updateStatus],
@@ -343,6 +357,7 @@ export const CoordExpManagedPanel = ({
 
   useEffect(() => {
     setEnqueueing(false);
+    setDiscarding(false);
 
     return () => {
       const active = commitOwner.current;
@@ -350,6 +365,12 @@ export const CoordExpManagedPanel = ({
       if (active?.dataManager === dataManager && active.client === client && active.projectId === projectId) {
         active.controller.abort();
         commitOwner.current = null;
+      }
+      const lifecycle = lifecycleOwner.current;
+
+      if (lifecycle?.dataManager === dataManager && lifecycle.client === client && lifecycle.projectId === projectId) {
+        lifecycle.controller.abort();
+        lifecycleOwner.current = null;
       }
     };
   }, [client, dataManager, projectId]);
@@ -359,9 +380,19 @@ export const CoordExpManagedPanel = ({
   const pendingDraftCount = Number.isInteger(status?.pendingDraftCount) ? status.pendingDraftCount : 0;
   const hasPendingWork = pendingDraftCount > 0 || local.dirty === true;
   const batchActive = ACTIVE_BATCH_STATES.has(activeBatch?.state);
-  const commitDisabled =
-    enqueueing || batchActive || local.saveInFlight === true || local.roiRunning === true || !hasPendingWork;
   const member = currentTaskMember(status, dataManager.lsf?.task?.id);
+  const hasPersistedDraft =
+    Number.isInteger(Number(member?.draft_id ?? member?.draftId)) &&
+    Number(member?.draft_id ?? member?.draftId) > 0 &&
+    typeof (member?.draft_updated_at ?? member?.draftUpdatedAt) === "string" &&
+    typeof (member?.draft_semantic_hash ?? member?.draftSemanticHash) === "string";
+  const commitDisabled =
+    enqueueing ||
+    discarding ||
+    batchActive ||
+    local.saveInFlight === true ||
+    local.roiRunning === true ||
+    !hasPendingWork;
   const draftAheadOfActive = member?.draft_ahead_of_active_batch === true || member?.draftAheadOfActiveBatch === true;
   const draftAheadOfCommitted = member?.draft_ahead_of_committed === true || member?.draftAheadOfCommitted === true;
   const activeBatchMember = member?.active_batch_member === true || member?.activeBatchMember === true;
@@ -413,6 +444,60 @@ export const CoordExpManagedPanel = ({
       if (commitOwner.current === owner) {
         commitOwner.current = null;
         if (mounted.current && dataManagerOwner.current === dataManager) setEnqueueing(false);
+      }
+    }
+  };
+
+  const discard = async () => {
+    if (
+      discarding ||
+      enqueueing ||
+      local.saveInFlight === true ||
+      local.roiRunning === true ||
+      !hasPendingWork ||
+      !hasPersistedDraft
+    )
+      return;
+    if (
+      globalThis.confirm?.("Discard this task's persisted Draft and reset it to the committed dataset row?") === false
+    )
+      return;
+    const prepared = dataManager.lsf?.prepareManagedTaskLifecycle?.("discard");
+
+    if (!prepared) {
+      const error = new Error("The current persisted Draft token is unavailable. Refresh task state and retry.");
+
+      dataManager.lsf?.failManagedTaskLifecycle?.(error, "discard");
+      setOperationError(error);
+      return;
+    }
+    const controller = new AbortController();
+    const owner = { client, controller, dataManager, projectId };
+    const isCurrentOwner = () =>
+      mounted.current &&
+      dataManagerOwner.current === dataManager &&
+      lifecycleOwner.current === owner &&
+      !controller.signal.aborted;
+
+    lifecycleOwner.current?.controller.abort();
+    lifecycleOwner.current = owner;
+    setDiscarding(true);
+    setOperationError(null);
+    try {
+      const response = await client.taskLifecycle(prepared.request, controller.signal);
+      if (!isCurrentOwner()) return;
+      dataManager.lsf.applyManagedTaskLifecycle(prepared, response);
+      setReminder(null);
+      await refreshProjectState(controller.signal, { reconcileTerminal: false });
+    } catch (error) {
+      if (isCurrentOwner() && error?.name !== "AbortError") {
+        dataManager.lsf?.failManagedTaskLifecycle?.(error, "discard");
+        setOperationError(error);
+      }
+    } finally {
+      if (lifecycleOwner.current === owner) {
+        lifecycleOwner.current = null;
+        if (mounted.current && dataManagerOwner.current === dataManager) setDiscarding(false);
       }
     }
   };
@@ -485,6 +570,21 @@ export const CoordExpManagedPanel = ({
 
       <button className="coordexp-managed-panel__commit" type="button" disabled={commitDisabled} onClick={commit}>
         {enqueueing ? "Saving and queueing…" : batchActive ? `${batchLabel(activeBatch.state)}…` : "Commit Drafts"}
+      </button>
+      <button
+        className="coordexp-managed-panel__discard"
+        type="button"
+        disabled={
+          discarding ||
+          enqueueing ||
+          local.saveInFlight === true ||
+          local.roiRunning === true ||
+          !hasPendingWork ||
+          !hasPersistedDraft
+        }
+        onClick={discard}
+      >
+        {discarding ? "Resetting Draft…" : "Discard Draft and Reset"}
       </button>
       <div className="coordexp-managed-panel__hint">Annotate several images, then Commit once.</div>
     </aside>

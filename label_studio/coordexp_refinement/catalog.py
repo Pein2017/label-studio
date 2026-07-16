@@ -18,9 +18,12 @@ from django.contrib.auth import get_user_model
 from django.db import transaction
 from projects.models import Project
 from src.label_studio_coco_refinement.draft_adapter import (
+    DraftContractError,
     canonicalize_label_studio_draft,
 )
+from src.label_studio_coco_refinement.geometry import norm1000_bbox_to_label_studio_xywh
 from src.label_studio_coco_refinement.runtime import (
+    AuthenticatedPrincipal,
     AuthoritativeDraftSnapshot,
     DraftCatalogCapture,
     DraftCatalogError,
@@ -40,6 +43,10 @@ from src.label_studio_coco_refinement.store import (
 from tasks.models import Annotation, AnnotationDraft, Prediction, Task
 
 _SUPPORTED_SPLITS = frozenset({'train', 'val'})
+
+
+class DraftLifecycleConflict(DraftCatalogError):
+    """A persisted Draft changed before an explicit reset could apply."""
 
 
 @dataclass(frozen=True)
@@ -270,6 +277,148 @@ class DjangoDraftCatalog:
             raise
         except Exception as exc:
             raise DraftCatalogError('authoritative project state lookup failed closed') from exc
+
+    def current_task_lifecycle(
+        self,
+        *,
+        split: str,
+        principal: AuthenticatedPrincipal,
+        task_pk: int,
+        action: str,
+        expected_draft: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Resolve or atomically reset one user-owned task against committed truth.
+
+        The browser selects only the loaded task and an action. Annotation,
+        Draft, source-row, committed-row, and identity authorities are all
+        resolved under server locks. ``reconcile`` updates the durable Draft
+        only for an exact persisted token whose semantic hash already equals
+        committed truth; otherwise it returns metadata-only state. ``discard``
+        requires the same exact token and replaces that Draft with the current
+        committed Label Studio projection.
+        """
+
+        if split not in self._stores or split not in self._project_ids:
+            raise DraftCatalogError('unknown refinement split')
+        if principal.authenticated is not True:
+            raise DraftCatalogError('an authenticated server principal is required')
+        user_pk = _canonical_pk(principal.user_id, field='principal user id')
+        project_pk = self._project_ids[split]
+        task_pk = _canonical_pk(task_pk, field='task id')
+        if action not in {'inspect', 'reconcile', 'discard'}:
+            raise DraftCatalogError('unsupported Draft lifecycle action')
+        normalized_expected = _expected_draft_token(expected_draft)
+        store = self._stores[split]
+
+        try:
+            with transaction.atomic():
+                user = get_user_model().objects.select_for_update().get(pk=user_pk, is_active=True)
+                project = Project.objects.for_user(user).select_for_update().get(pk=project_pk)
+                if hasattr(project, 'summary'):
+                    from projects.models import ProjectSummary
+
+                    ProjectSummary.objects.select_for_update().get(pk=project.summary.pk)
+                task = Task.objects.select_for_update().get(pk=task_pk, project_id=project_pk)
+                task_split, image_id, source_line = _task_identity(task, split=split)
+                source_index = store.resolve_source_row_index(
+                    split=task_split,
+                    project_id=str(project_pk),
+                    task_id=f'{task_split}:{image_id}',
+                    image_id=image_id,
+                )
+                if source_index != source_line - 1:
+                    raise DraftCatalogError('task source_line does not match store authority')
+                annotations = list(
+                    Annotation.objects.select_for_update().filter(task_id=task.pk).order_by('pk')
+                )
+                annotation = _sole_editable_annotation(annotations)
+                if annotation.project_id != project_pk:
+                    raise DraftCatalogError('authoritative annotation project binding is invalid')
+                if Prediction.objects.select_for_update().filter(task_id=task.pk).exists():
+                    raise DraftCatalogError('refinement tasks cannot contain predictions')
+                drafts = list(
+                    AnnotationDraft.objects.select_for_update()
+                    .filter(task_id=task.pk, user_id=user_pk)
+                    .order_by('pk')
+                )
+                if len(drafts) != 1 or drafts[0].annotation_id != annotation.pk:
+                    raise DraftCatalogError('task must have exactly one current-user authoritative Draft')
+                draft = drafts[0]
+                store_state = _store_project_state(store)
+                baseline = store.restore_draft(image_id)
+                _validate_baseline(baseline, split=split, image_id=image_id)
+                if baseline.generation != store_state['generation']:
+                    raise DraftCatalogError('working store changed during task lifecycle capture')
+                committed_result = _committed_label_studio_result(baseline)
+                committed_hash = _baseline_semantic_hash(baseline)
+                current = canonicalize_label_studio_draft(
+                    draft.result,
+                    split=split,
+                    image_id=image_id,
+                    image_width=_row_dimension(baseline, 'width'),
+                    image_height=_row_dimension(baseline, 'height'),
+                )
+                token_matches = _draft_token_matches(
+                    draft=draft,
+                    semantic_hash=current.semantic_hash,
+                    expected=normalized_expected,
+                )
+                terminal_matches = False
+                if action == 'reconcile':
+                    terminal = store_state['last_terminal_batch']
+                    terminal_hash = store_state['last_terminal_member_semantic_hashes'].get(
+                        f'{split}:{image_id}'
+                    )
+                    terminal_matches = (
+                        terminal is not None
+                        and terminal.get('state') == BatchStatus.SUCCEEDED.value
+                        and terminal.get('generation') == baseline.generation
+                        and terminal_hash == normalized_expected['draft_semantic_hash']
+                    )
+                disposition = 'metadata_only'
+                if action == 'discard':
+                    if not token_matches:
+                        raise DraftLifecycleConflict('persisted Draft changed before reset')
+                    draft.result = committed_result
+                    draft.was_postponed = False
+                    draft.save(update_fields=['result', 'was_postponed', 'updated_at'])
+                    current_hash = committed_hash
+                    disposition = 'reset'
+                elif action == 'reconcile' and token_matches and terminal_matches:
+                    draft.result = committed_result
+                    draft.was_postponed = False
+                    draft.save(update_fields=['result', 'was_postponed', 'updated_at'])
+                    current_hash = committed_hash
+                    disposition = 'rebased'
+                else:
+                    current_hash = current.semantic_hash
+
+                if _store_project_state(store) != store_state:
+                    raise DraftCatalogError('working store changed during task lifecycle capture')
+
+                return {
+                    'action': action,
+                    'disposition': disposition,
+                    'task_id': task.pk,
+                    'annotation_id': annotation.pk,
+                    'draft': {
+                        'draft_id': draft.pk,
+                        'draft_updated_at': _timestamp(draft.updated_at),
+                        'draft_semantic_hash': current_hash,
+                    },
+                    'expected_draft_matches': token_matches,
+                    'committed': {
+                        'generation': baseline.generation,
+                        'semantic_hash': committed_hash,
+                        'result': committed_result,
+                    },
+                }
+        except DraftLifecycleConflict:
+            raise
+        except (DraftCatalogError, DraftContractError):
+            raise
+        except Exception as exc:
+            raise DraftCatalogError('authoritative task lifecycle lookup failed closed') from exc
 
     def _restore_project_state_baselines(
         self,
@@ -835,13 +984,133 @@ def _baseline_semantic_hash(baseline: DraftRestore) -> str:
     return semantic_hash(regions)
 
 
+def _expected_draft_token(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {
+        'draft_id',
+        'draft_updated_at',
+        'draft_semantic_hash',
+    }:
+        raise DraftCatalogError('expected Draft token has an unsupported shape')
+    draft_id = _canonical_pk(value['draft_id'], field='expected Draft id')
+    updated_at = value['draft_updated_at']
+    semantic = value['draft_semantic_hash']
+    if not isinstance(updated_at, str) or not updated_at:
+        raise DraftCatalogError('expected Draft revision must be non-empty text')
+    if not _is_sha256(semantic):
+        raise DraftCatalogError('expected Draft semantic hash must be sha256')
+    return {
+        'draft_id': draft_id,
+        'draft_updated_at': updated_at,
+        'draft_semantic_hash': semantic,
+    }
+
+
+def _draft_token_matches(
+    *,
+    draft: AnnotationDraft,
+    semantic_hash: str,
+    expected: Mapping[str, Any],
+) -> bool:
+    return (
+        draft.pk == expected['draft_id']
+        and _timestamp(draft.updated_at) == expected['draft_updated_at']
+        and semantic_hash == expected['draft_semantic_hash']
+    )
+
+
+def _committed_label_studio_result(baseline: DraftRestore) -> list[dict[str, Any]]:
+    row = baseline.row
+    objects = row.get('objects') if isinstance(row, Mapping) else None
+    width = _row_dimension(baseline, 'width')
+    height = _row_dimension(baseline, 'height')
+    if not isinstance(objects, list):
+        raise DraftCatalogError('working baseline objects are invalid')
+    inverse = {object_id: key for key, object_id in baseline.region_id_mapping.items()}
+    if len(inverse) != len(baseline.region_id_mapping):
+        raise DraftCatalogError('working baseline region mapping is ambiguous')
+
+    result: list[dict[str, Any]] = []
+    for ordinal, obj in enumerate(objects):
+        if not isinstance(obj, Mapping):
+            raise DraftCatalogError('working baseline object is invalid')
+        object_id = obj.get('coco_ann_id')
+        region_key = inverse.get(object_id)
+        bbox = obj.get('bbox_2d')
+        category_name = obj.get('category_name')
+        if region_key is None or not isinstance(category_name, str) or not category_name:
+            raise DraftCatalogError('working baseline object identity/class is invalid')
+        try:
+            x, y, rectangle_width, rectangle_height = norm1000_bbox_to_label_studio_xywh(bbox)
+        except Exception as exc:
+            raise DraftCatalogError('working baseline object geometry is invalid') from exc
+        meta: dict[str, Any] = {
+            'coordexp_region_key': region_key,
+            'last_committed_bbox': list(bbox),
+            'coco_ann_id': object_id,
+            'coordexp_creation_ordinal': ordinal,
+        }
+        raw_metadata = obj.get('metadata')
+        if raw_metadata is not None:
+            if not isinstance(raw_metadata, Mapping):
+                raise DraftCatalogError('working baseline object metadata is invalid')
+            metadata = dict(raw_metadata)
+            inference_origin = metadata.pop('inference_origin', None)
+            inference_fields = {
+                'coordexp_inference_receipt_id': metadata.pop('receipt_id', None),
+                'coordexp_inference_request_id': metadata.pop('request_id', None),
+                'coordexp_inference_result_id': metadata.pop('result_id', None),
+                'coordexp_inference_source_draft_revision': metadata.pop('draft_revision', None),
+            }
+            if inference_origin is True:
+                if any(not isinstance(value, str) or not value for value in inference_fields.values()):
+                    raise DraftCatalogError('working baseline inference provenance is incomplete')
+                meta.update(inference_fields)
+            elif inference_origin is not None or any(value is not None for value in inference_fields.values()):
+                raise DraftCatalogError('working baseline inference provenance is inconsistent')
+            if metadata:
+                meta['coordexp_training_metadata'] = metadata
+        result.append(
+            {
+                'id': region_key,
+                'type': 'rectanglelabels',
+                'from_name': 'bbox',
+                'to_name': 'image',
+                'original_width': width,
+                'original_height': height,
+                'image_rotation': 0,
+                'value': {
+                    'x': x,
+                    'y': y,
+                    'width': rectangle_width,
+                    'height': rectangle_height,
+                    'rotation': 0,
+                    'rectanglelabels': [category_name],
+                },
+                'meta': meta,
+            }
+        )
+    canonicalize_label_studio_draft(
+        result,
+        split=baseline.split,
+        image_id=baseline.image_id,
+        image_width=width,
+        image_height=height,
+    )
+    return result
+
+
 def _timestamp(value: Any) -> str:
     if value is None or not hasattr(value, 'isoformat'):
         raise DraftCatalogError('database revision timestamp is invalid')
     result = value.isoformat()
+    # DRF's DateTimeField renders aware UTC values with a trailing ``Z``.
+    # Project-state tokens must be byte-identical to the ordinary Draft-save
+    # response or a real browser can never satisfy the exact-token CAS.
+    if result.endswith('+00:00'):
+        result = f'{result[:-6]}Z'
     if not isinstance(result, str) or not result:
         raise DraftCatalogError('database revision timestamp is invalid')
     return result
 
 
-__all__ = ['DjangoAnnotationVerifier', 'DjangoDraftCatalog']
+__all__ = ['DjangoAnnotationVerifier', 'DjangoDraftCatalog', 'DraftLifecycleConflict']

@@ -74,8 +74,25 @@ const makeAnnotation = ({ pk = "77", id = "local-77", draftId = 0, initialResult
       to_name: "image",
       type: "rectanglelabels",
       value: { x: 1, y: 2, width: 3, height: 4, rectanglelabels: ["person"] },
+      meta: { coordexp_region_key: "region-1" },
     },
   ];
+  const resultAreas = () =>
+    new Map(
+      result.map((item, index) => {
+        const key = item.id ?? String(index);
+        const resultModel = {
+          meta: item.meta ?? {},
+          type: item.type,
+          setMetaValue(field, value) {
+            item.meta = { ...(item.meta ?? {}), [field]: clone(value) };
+            resultModel.meta = item.meta;
+          },
+        };
+
+        return [key, { id: key, cleanId: key, presentationRegionKey: key, results: [resultModel] }];
+      }),
+    );
   const annotation = {
     pk,
     id,
@@ -99,7 +116,7 @@ const makeAnnotation = ({ pk = "77", id = "local-77", draftId = 0, initialResult
         return wasFrozen;
       }),
     },
-    areas: new Map(),
+    areas: resultAreas(),
     trackedState: {},
     versions: { draft: [] },
     loadedDate: new Date("2026-07-15T00:00:00Z"),
@@ -125,7 +142,7 @@ const makeAnnotation = ({ pk = "77", id = "local-77", draftId = 0, initialResult
     deserializeResults: jest.fn((nextResult) => {
       result = clone(nextResult);
       annotation.versions.result = clone(nextResult);
-      annotation.areas = new Map(nextResult.map((item, index) => [item.id ?? String(index), item]));
+      annotation.areas = resultAreas();
     }),
     updateObjects: jest.fn(),
     reinitHistory: jest.fn(() => {
@@ -135,6 +152,7 @@ const makeAnnotation = ({ pk = "77", id = "local-77", draftId = 0, initialResult
     }),
     replaceResult(nextResult) {
       result = clone(nextResult);
+      annotation.areas = resultAreas();
       annotation.history.hasChanges = true;
       annotation.history.undoIdx += 1;
       annotation.history.lastAdditionTime = new Date().toISOString();
@@ -1426,6 +1444,269 @@ describe("managed authoritative status", () => {
     datamanager.apiCall.mockResolvedValueOnce(draftResponse());
     await wrapper.ensureDurableDraft();
     expect(wrapper.getManagedStatusState().error).toBeNull();
+    wrapper.destroy();
+  });
+});
+
+describe("managed terminal lifecycle", () => {
+  const terminalState = (draftUpdatedAt) =>
+    managedState({
+      generation: 1,
+      version: 2,
+      pending_draft_count: 0,
+      last_terminal_batch: {
+        batch_id: "11111111-1111-4111-8111-111111111111",
+        state: "succeeded",
+        generation: 1,
+      },
+      members: [
+        {
+          task_id: 10,
+          draft_id: 501,
+          draft_updated_at: draftUpdatedAt,
+          draft_semantic_hash: "a".repeat(64),
+          committed_semantic_hash: "a".repeat(64),
+          last_terminal_batch_member: true,
+        },
+      ],
+    });
+
+  const committedResult = () => [
+    {
+      id: "region-1",
+      from_name: "bbox",
+      to_name: "image",
+      type: "rectanglelabels",
+      value: { x: 10, y: 20, width: 30, height: 40, rectanglelabels: ["person"] },
+      meta: {
+        coordexp_region_key: "region-1",
+        coco_ann_id: -1,
+        last_committed_bbox: [100, 200, 400, 600],
+      },
+    },
+  ];
+
+  it("rehydrates and resets history only for the exact persisted and in-memory token", async () => {
+    const { annotation, datamanager, wrapper } = makeHarness();
+
+    annotation.replaceResult(annotation.serializeAnnotation());
+    datamanager.apiCall.mockResolvedValue(draftResponse());
+    await wrapper.ensureDurableDraft();
+    wrapper.updateManagedProjectState(terminalState("2026-07-15T00:00:00Z"));
+    const prepared = wrapper.prepareManagedTaskLifecycle("reconcile");
+
+    expect(prepared.request.action).toBe("reconcile");
+    wrapper.applyManagedTaskLifecycle(prepared, {
+      action: "reconcile",
+      disposition: "rebased",
+      task_id: 10,
+      annotation_id: 77,
+      draft: {
+        draft_id: 501,
+        draft_updated_at: "2026-07-15T00:00:02Z",
+        draft_semantic_hash: "a".repeat(64),
+      },
+      committed: { generation: 1, semantic_hash: "a".repeat(64), result: committedResult() },
+    });
+
+    expect(annotation.deserializeResults).toHaveBeenLastCalledWith(committedResult());
+    expect(annotation.reinitHistory).toHaveBeenCalledTimes(1);
+    expect(annotation.draftId).toBe(501);
+    expect(wrapper.hasManagedUnsavedWork()).toBe(false);
+    expect(wrapper.lastPersistedDraftResult).toMatchObject({
+      revision: "2026-07-15T00:00:02Z",
+      authoritative_semantic_hash: "a".repeat(64),
+    });
+    expect(wrapper.prepareManagedTaskLifecycle("reconcile")).toBeNull();
+    wrapper.destroy();
+  });
+
+  it("lets the server exact-token CAS decide a clean Draft loaded after browser restart", () => {
+    const annotation = makeAnnotation({ draftId: 501 });
+    const { wrapper } = makeHarness({ annotation });
+
+    wrapper.updateManagedProjectState(terminalState("2026-07-15T00:00:00Z"));
+    const prepared = wrapper.prepareManagedTaskLifecycle("reconcile");
+
+    expect(prepared.request).toMatchObject({
+      action: "reconcile",
+      expectedDraft: {
+        draftId: 501,
+        draftUpdatedAt: "2026-07-15T00:00:00Z",
+        draftSemanticHash: "a".repeat(64),
+      },
+    });
+    wrapper.destroy();
+  });
+
+  it("defers terminal lifecycle mutation while Draft save or editor history is active", () => {
+    const { annotation, wrapper } = makeHarness();
+
+    wrapper.updateManagedProjectState(terminalState("2026-07-15T00:00:00Z"));
+    annotation.isDraftSaving = true;
+    expect(wrapper.prepareManagedTaskLifecycle("reconcile")).toBeNull();
+
+    annotation.isDraftSaving = false;
+    annotation.history.isFrozen = true;
+    expect(wrapper.prepareManagedTaskLifecycle("reconcile")).toBeNull();
+
+    annotation.history.isFrozen = false;
+    expect(wrapper.prepareManagedTaskLifecycle("reconcile")).not.toBeNull();
+    wrapper.destroy();
+  });
+
+  it("merges only stable identity metadata when newer geometry, class, membership, and undo exist", async () => {
+    const { annotation, datamanager, wrapper } = makeHarness();
+
+    annotation.replaceResult(annotation.serializeAnnotation());
+    datamanager.apiCall.mockResolvedValue(draftResponse());
+    await wrapper.ensureDurableDraft();
+    wrapper.updateManagedProjectState(terminalState("2026-07-15T00:00:00Z"));
+    const prepared = wrapper.prepareManagedTaskLifecycle("reconcile");
+    const newer = [
+      {
+        id: "region-1",
+        from_name: "bbox",
+        to_name: "image",
+        type: "rectanglelabels",
+        value: { x: 70, y: 71, width: 10, height: 11, rectanglelabels: ["bicycle"] },
+        meta: {
+          coordexp_region_key: "region-1",
+          coordexp_creation_ordinal: 99,
+          coordexp_training_metadata: { reviewer: "newer" },
+          coordexp_inference_receipt_id: "newer-receipt",
+          coordexp_inference_request_id: "newer-request",
+          coordexp_inference_result_id: "newer-result",
+          coordexp_inference_source_draft_revision: "newer-revision",
+          visual_policy_v1: { color: "#005A9C" },
+        },
+      },
+      {
+        id: "newer-region",
+        value: { x: 1, y: 1, width: 2, height: 2, rectanglelabels: ["dog"] },
+        meta: { coordexp_region_key: "newer-region" },
+      },
+    ];
+
+    annotation.replaceResult(newer);
+    const undoBefore = annotation.history.undoIdx;
+    wrapper.applyManagedTaskLifecycle(prepared, {
+      action: "reconcile",
+      disposition: "rebased",
+      task_id: 10,
+      annotation_id: 77,
+      draft: {
+        draft_id: 501,
+        draft_updated_at: "2026-07-15T00:00:02Z",
+        draft_semantic_hash: "a".repeat(64),
+      },
+      committed: {
+        generation: 1,
+        semantic_hash: "a".repeat(64),
+        result: [
+          {
+            ...committedResult()[0],
+            meta: {
+              ...committedResult()[0].meta,
+              coordexp_creation_ordinal: 1,
+              coordexp_training_metadata: { reviewer: "captured" },
+              coordexp_inference_receipt_id: "captured-receipt",
+              coordexp_inference_request_id: "captured-request",
+              coordexp_inference_result_id: "captured-result",
+              coordexp_inference_source_draft_revision: "captured-revision",
+            },
+          },
+        ],
+      },
+    });
+
+    const after = annotation.serializeAnnotation();
+    expect(after).toHaveLength(2);
+    expect(after[0].value).toEqual(newer[0].value);
+    expect(after[0].meta).toMatchObject({
+      coordexp_region_key: "region-1",
+      coco_ann_id: -1,
+      last_committed_bbox: [100, 200, 400, 600],
+      visual_policy_v1: { color: "#005A9C" },
+      coordexp_creation_ordinal: 99,
+      coordexp_training_metadata: { reviewer: "newer" },
+      coordexp_inference_receipt_id: "newer-receipt",
+      coordexp_inference_request_id: "newer-request",
+      coordexp_inference_result_id: "newer-result",
+      coordexp_inference_source_draft_revision: "newer-revision",
+    });
+    expect(after[1]).toEqual(newer[1]);
+    expect(annotation.deserializeResults).not.toHaveBeenCalled();
+    expect(annotation.reinitHistory).not.toHaveBeenCalled();
+    expect(annotation.history.undoIdx).toBe(undoBefore);
+    expect(wrapper.hasManagedUnsavedWork()).toBe(true);
+    wrapper.destroy();
+  });
+
+  it.each([
+    "Draft save",
+    "history freeze",
+  ])("defers a terminal response that becomes busy during %s without metadata or undo mutation", (busyKind) => {
+    const { annotation, wrapper } = makeHarness();
+
+    wrapper.updateManagedProjectState(terminalState("2026-07-15T00:00:00Z"));
+    const prepared = wrapper.prepareManagedTaskLifecycle("reconcile");
+    const before = annotation.serializeAnnotation();
+    const undoBefore = annotation.history.undoIdx;
+
+    if (busyKind === "Draft save") annotation.isDraftSaving = true;
+    else annotation.history.isFrozen = true;
+    wrapper.applyManagedTaskLifecycle(prepared, {
+      action: "reconcile",
+      disposition: "metadata_only",
+      task_id: 10,
+      annotation_id: 77,
+      draft: {
+        draft_id: 501,
+        draft_updated_at: "2026-07-15T00:00:02Z",
+        draft_semantic_hash: "a".repeat(64),
+      },
+      committed: { generation: 1, semantic_hash: "a".repeat(64), result: committedResult() },
+    });
+
+    expect(annotation.serializeAnnotation()).toEqual(before);
+    expect(annotation.history.undoIdx).toBe(undoBefore);
+    expect(annotation.history.freeze).not.toHaveBeenCalled();
+
+    annotation.isDraftSaving = false;
+    annotation.history.isFrozen = false;
+    const retry = wrapper.prepareManagedTaskLifecycle("reconcile");
+    expect(retry).not.toBeNull();
+    wrapper.applyManagedTaskLifecycle(retry, {
+      action: "inspect",
+      disposition: "metadata_only",
+      task_id: 10,
+      annotation_id: 77,
+      draft: {
+        draft_id: 501,
+        draft_updated_at: "2026-07-15T00:00:02Z",
+        draft_semantic_hash: "a".repeat(64),
+      },
+      committed: { generation: 1, semantic_hash: "a".repeat(64), result: committedResult() },
+    });
+    expect(annotation.serializeAnnotation()[0].meta).toMatchObject({
+      coordexp_region_key: "region-1",
+      coco_ann_id: -1,
+      last_committed_bbox: [100, 200, 400, 600],
+    });
+    expect(annotation.history.undoIdx).toBe(undoBefore);
+    wrapper.destroy();
+  });
+
+  it("keeps discard failures observable without mutating the loaded Draft", () => {
+    const { annotation, wrapper } = makeHarness();
+    const before = annotation.serializeAnnotation();
+
+    const error = wrapper.failManagedTaskLifecycle(new Error("conflict"), "discard");
+
+    expect(error).toMatchObject({ code: "DRAFT_DISCARD_FAILED" });
+    expect(wrapper.getManagedStatusState().error).toMatchObject({ domain: "discard" });
+    expect(annotation.serializeAnnotation()).toEqual(before);
     wrapper.destroy();
   });
 });

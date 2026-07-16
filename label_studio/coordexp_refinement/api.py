@@ -36,6 +36,7 @@ from src.label_studio_coco_refinement.store import (
     ValidationError,
 )
 
+from .catalog import DraftLifecycleConflict
 from .registry import ProjectRuntimeBinding, RuntimeBindingError, runtime_registry
 from .roi_finalization import DjangoRoiFinalizationError
 from .roi_services import RoiReceiptConflictError, RoiServicesError
@@ -358,10 +359,83 @@ class RefinementProjectStateAPI(_NoStoreAPIView):
         return Response(payload, status=200)
 
 
+class RefinementTaskLifecycleAPI(_JsonBodyAPIView):
+    """Resolve committed task state and perform exact-token Draft reset/CAS."""
+
+    http_method_names = ('post',)
+
+    def post(self, request, pk: int) -> Response:
+        binding, failure = self._binding(request, pk)
+        if failure is not None:
+            return failure
+        body, failure = _parse_task_lifecycle_body(request.data)
+        if failure is not None:
+            return failure
+        assert binding is not None and body is not None
+        services, failure = self._roi_services(binding)
+        if failure is not None:
+            return failure
+        try:
+            with services.request_admission():
+                payload = services.draft_catalog.current_task_lifecycle(
+                    split=binding.split,
+                    principal=AuthenticatedPrincipal(str(request.user.pk), True),
+                    task_pk=body['task_id'],
+                    action=body['action'],
+                    expected_draft=body['expected_draft'],
+                )
+        except DraftLifecycleConflict:
+            return _error('draft_token_conflict', 'The persisted Draft changed before reset.', 409)
+        except (DraftCatalogError, ValidationError):
+            return _error('invalid_task_lifecycle', 'The current task lifecycle request is invalid.', 400)
+        except (ManifestDriftError, RecoveryError, StoreBusyError):
+            return _error('refinement_unavailable', 'Refinement state requires recovery.', 503)
+        except Exception:
+            logger.exception('Unexpected CoordExp task lifecycle failure for project_id=%s', pk)
+            return _error('refinement_unavailable', 'Refinement state is unavailable.', 503)
+        return Response(payload, status=200)
+
+
 def _parse_batch_body(data: Any) -> tuple[str | None, Response | None]:
     if not isinstance(data, dict) or set(data) != {'batch_id'}:
         return None, _error('invalid_request', 'Body must contain only batch_id.', 400)
     return _parse_batch_id(data['batch_id'])
+
+
+def _parse_task_lifecycle_body(data: Any) -> tuple[dict[str, Any] | None, Response | None]:
+    if not isinstance(data, dict) or set(data) != {'action', 'task_id', 'expected_draft'}:
+        return None, _error('invalid_request', 'Body has an unsupported task lifecycle shape.', 400)
+    action = data['action']
+    if action not in {'inspect', 'reconcile', 'discard'}:
+        return None, _error('invalid_action', 'action is invalid.', 400)
+    task_id = data['task_id']
+    if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
+        return None, _error('invalid_task_id', 'task_id must be a positive integer.', 400)
+    expected = data['expected_draft']
+    if not isinstance(expected, dict) or set(expected) != {
+        'draft_id',
+        'draft_updated_at',
+        'draft_semantic_hash',
+    }:
+        return None, _error('invalid_draft_token', 'expected_draft has an unsupported shape.', 400)
+    draft_id = expected['draft_id']
+    if isinstance(draft_id, bool) or not isinstance(draft_id, int) or draft_id <= 0:
+        return None, _error('invalid_draft_token', 'expected Draft id must be a positive integer.', 400)
+    revision = expected['draft_updated_at']
+    semantic = expected['draft_semantic_hash']
+    if not isinstance(revision, str) or not revision:
+        return None, _error('invalid_draft_token', 'expected Draft revision is invalid.', 400)
+    if not isinstance(semantic, str) or re.fullmatch(r'[0-9a-f]{64}', semantic) is None:
+        return None, _error('invalid_draft_token', 'expected Draft semantic hash is invalid.', 400)
+    return {
+        'action': action,
+        'task_id': task_id,
+        'expected_draft': {
+            'draft_id': draft_id,
+            'draft_updated_at': revision,
+            'draft_semantic_hash': semantic,
+        },
+    }, None
 
 
 def _parse_roi_infer_body(data: Any) -> tuple[dict[str, Any] | None, Response | None]:
@@ -506,6 +580,7 @@ __all__ = [
     'RefinementProjectStateAPI',
     'RefinementSessionAPI',
     'RefinementStatusAPI',
+    'RefinementTaskLifecycleAPI',
     'RoiAbandonAPI',
     'RoiInferAPI',
     'RoiProfilesAPI',

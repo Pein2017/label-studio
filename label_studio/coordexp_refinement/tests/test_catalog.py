@@ -6,11 +6,16 @@ from dataclasses import replace
 from typing import Any
 from unittest.mock import patch
 
-from coordexp_refinement.catalog import DjangoAnnotationVerifier, DjangoDraftCatalog
+from coordexp_refinement.catalog import (
+    DjangoAnnotationVerifier,
+    DjangoDraftCatalog,
+    DraftLifecycleConflict,
+)
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from organizations.models import Organization, OrganizationMember
 from projects.models import Project
+from src.label_studio_coco_refinement.draft_adapter import canonicalize_label_studio_draft
 from src.label_studio_coco_refinement.geometry import (
     norm1000_bbox_to_label_studio_xywh,
 )
@@ -30,6 +35,7 @@ from src.label_studio_coco_refinement.store import (
     sha256_json,
 )
 from tasks.models import Annotation, AnnotationDraft, Prediction, Task
+from tasks.serializers import AnnotationDraftSerializer
 
 
 class FakeStore:
@@ -80,6 +86,10 @@ class FakeStore:
     def restore_drafts(self, image_ids: tuple[int, ...]) -> tuple[DraftRestore, ...]:
         self.restore_calls.append(tuple(image_ids))
         return tuple(copy.deepcopy(self.restores[image_id]) for image_id in image_ids)
+
+    def restore_draft(self, image_id: int) -> DraftRestore:
+        self.restore_calls.append((image_id,))
+        return copy.deepcopy(self.restores[image_id])
 
 
 class CatalogTestCase(TestCase):
@@ -166,6 +176,170 @@ class CatalogTestCase(TestCase):
                 ),
             )
 
+    def lifecycle(self, task: Task, draft: AnnotationDraft, *, action: str, expected=None):
+        canonical = canonicalize_label_studio_draft(
+            draft.result,
+            split='train',
+            image_id=task.data['image_id'],
+            image_width=640,
+            image_height=480,
+        )
+        token = expected or {
+            'draft_id': draft.pk,
+            'draft_updated_at': AnnotationDraftSerializer(draft).data['updated_at'],
+            'draft_semantic_hash': canonical.semantic_hash,
+        }
+        terminal_state = {
+            'generation': self.store.generation,
+            'working_sha256': 'a' * 64,
+            'working_line_count': 1,
+            'active_batch_id': None,
+            'batch_state': None,
+            'active_batch': None,
+            'active_member_semantic_hashes': {},
+            'last_terminal_batch': {
+                'batch_id': 'terminal-batch',
+                'state': 'succeeded',
+                'member_count': 1,
+                'base_generation': self.store.generation - 1,
+                'generation': self.store.generation,
+                'error': None,
+                'payload_hash': 'b' * 64,
+                'member_task_keys': [f"train:{task.data['image_id']}"],
+            },
+            'last_terminal_member_semantic_hashes': {
+                f"train:{task.data['image_id']}": token['draft_semantic_hash']
+            },
+        }
+        with patch(
+            'coordexp_refinement.catalog._store_project_state',
+            return_value=terminal_state,
+        ):
+            return self.catalog.current_task_lifecycle(
+                split='train',
+                principal=AuthenticatedPrincipal(user_id=str(self.user.pk), authenticated=True),
+                task_pk=task.pk,
+                action=action,
+                expected_draft=token,
+            )
+
+    def test_exact_terminal_reconcile_resets_the_persisted_result_to_committed_truth(self) -> None:
+        task, _, draft, _ = self.make_task(41, source_line=1, bbox=(100, 120, 300, 420))
+        prior_updated_at = draft.updated_at
+
+        payload = self.lifecycle(task, draft, action='reconcile')
+        draft.refresh_from_db()
+
+        self.assertEqual(payload['disposition'], 'rebased')
+        self.assertTrue(payload['expected_draft_matches'])
+        self.assertEqual(payload['committed']['generation'], 7)
+        self.assertEqual(draft.result, payload['committed']['result'])
+        self.assertGreater(draft.updated_at, prior_updated_at)
+        self.assertEqual(draft.result[0]['meta']['coco_ann_id'], 411)
+
+    def test_newer_semantics_receive_metadata_only_without_replacing_the_draft(self) -> None:
+        task, _, draft, result = self.make_task(42, source_line=1, bbox=(101, 120, 300, 420))
+        original = copy.deepcopy(result)
+
+        payload = self.lifecycle(task, draft, action='inspect')
+        draft.refresh_from_db()
+
+        self.assertEqual(payload['disposition'], 'metadata_only')
+        self.assertTrue(payload['expected_draft_matches'])
+        self.assertEqual(draft.result, original)
+        self.assertNotEqual(payload['committed']['result'], original)
+
+    def test_exact_terminal_reconcile_accepts_newly_allocated_negative_identity(self) -> None:
+        task, _, draft, result = self.make_task(45, source_line=1, bbox=(100, 120, 300, 420))
+        result[0]['id'] = 'new-region'
+        result[0]['meta'] = {'coordexp_region_key': 'new-region'}
+        draft.result = result
+        draft.save(update_fields=['result', 'updated_at'])
+        committed = copy.deepcopy(self.store.restores[45])
+        committed_row = copy.deepcopy(committed.row)
+        committed_row['objects'][0]['coco_ann_id'] = -1
+        self.store.restores[45] = replace(
+            committed,
+            row=committed_row,
+            row_hash=sha256_json(committed_row),
+            region_id_mapping={'new-region': -1},
+        )
+
+        payload = self.lifecycle(task, draft, action='reconcile')
+        draft.refresh_from_db()
+
+        self.assertEqual(payload['disposition'], 'rebased')
+        self.assertEqual(draft.result[0]['meta']['coco_ann_id'], -1)
+        self.assertEqual(draft.result[0]['meta']['coordexp_region_key'], 'new-region')
+
+    def test_explicit_discard_atomically_resets_the_exact_persisted_draft(self) -> None:
+        task, _, draft, result = self.make_task(43, source_line=1, bbox=(102, 120, 300, 420))
+
+        payload = self.lifecycle(task, draft, action='discard')
+        draft.refresh_from_db()
+
+        self.assertEqual(payload['disposition'], 'reset')
+        self.assertNotEqual(draft.result, result)
+        self.assertEqual(draft.result, payload['committed']['result'])
+        self.assertEqual(
+            payload['draft']['draft_semantic_hash'],
+            payload['committed']['semantic_hash'],
+        )
+
+    def test_explicit_discard_rejects_a_stale_draft_token_without_mutation(self) -> None:
+        task, _, draft, result = self.make_task(44, source_line=1, bbox=(102, 120, 300, 420))
+        stale = {
+            'draft_id': draft.pk,
+            'draft_updated_at': '2026-07-15T00:00:00Z',
+            'draft_semantic_hash': '0' * 64,
+        }
+
+        with self.assertRaises(DraftLifecycleConflict):
+            self.lifecycle(task, draft, action='discard', expected=stale)
+        draft.refresh_from_db()
+        self.assertEqual(draft.result, result)
+
+    def test_task_lifecycle_rolls_back_when_working_authority_changes_mid_request(self) -> None:
+        task, _, draft, result = self.make_task(46, source_line=1, bbox=(102, 120, 300, 420))
+        canonical = canonicalize_label_studio_draft(
+            draft.result,
+            split='train',
+            image_id=46,
+            image_width=640,
+            image_height=480,
+        )
+        token = {
+            'draft_id': draft.pk,
+            'draft_updated_at': AnnotationDraftSerializer(draft).data['updated_at'],
+            'draft_semantic_hash': canonical.semantic_hash,
+        }
+        stable = {
+            'generation': 7,
+            'working_sha256': 'a' * 64,
+            'working_line_count': 1,
+            'active_batch_id': None,
+            'batch_state': None,
+            'active_batch': None,
+            'active_member_semantic_hashes': {},
+            'last_terminal_batch': None,
+            'last_terminal_member_semantic_hashes': {},
+        }
+        changed = {**stable, 'generation': 8, 'working_sha256': 'b' * 64}
+
+        with patch(
+            'coordexp_refinement.catalog._store_project_state',
+            side_effect=[stable, changed],
+        ), self.assertRaisesRegex(DraftCatalogError, 'working store changed'):
+            self.catalog.current_task_lifecycle(
+                split='train',
+                principal=AuthenticatedPrincipal(user_id=str(self.user.pk), authenticated=True),
+                task_pk=task.pk,
+                action='discard',
+                expected_draft=token,
+            )
+        draft.refresh_from_db()
+        self.assertEqual(draft.result, result)
+
     def test_project_state_with_zero_drafts_never_scans_working_jsonl(self) -> None:
         state = self.project_state()
 
@@ -189,7 +363,7 @@ class CatalogTestCase(TestCase):
                     'task_id': task.pk,
                     'task_key': 'train:10',
                     'draft_id': draft.pk,
-                    'draft_updated_at': draft.updated_at.isoformat(),
+                    'draft_updated_at': AnnotationDraftSerializer(draft).data['updated_at'],
                     'draft_semantic_hash': first['members'][0]['draft_semantic_hash'],
                     'committed_semantic_hash': first['members'][0]['committed_semantic_hash'],
                     'pending': True,

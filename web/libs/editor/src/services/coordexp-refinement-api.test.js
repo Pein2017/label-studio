@@ -58,6 +58,8 @@ describe("CoordExpRefinementClient", () => {
       .fn()
       .mockResolvedValueOnce(response(200, { csrf_token: "commit-token" }))
       .mockResolvedValueOnce(response(202, { batch_id: "batch", status: "queued" }))
+      .mockResolvedValueOnce(response(200, { csrf_token: "lifecycle-token" }))
+      .mockResolvedValueOnce(response(200, { disposition: "metadata_only" }))
       .mockResolvedValueOnce(response(200, { csrf_token: "infer-token" }))
       .mockResolvedValueOnce(response(200, { request_state: "produced" }))
       .mockResolvedValueOnce(response(200, { csrf_token: "abandon-token" }))
@@ -65,6 +67,15 @@ describe("CoordExpRefinementClient", () => {
     const client = new CoordExpRefinementClient(7, fetchImpl);
 
     await expect(client.commit("11111111-1111-4111-8111-111111111111")).resolves.toMatchObject({ status: 202 });
+    await client.taskLifecycle({
+      action: "reconcile",
+      taskId: 19,
+      expectedDraft: {
+        draftId: 501,
+        draftUpdatedAt: "2026-07-16T00:00:00Z",
+        draftSemanticHash: "a".repeat(64),
+      },
+    });
     await client.infer({
       requestId: "22222222-2222-4222-8222-222222222222",
       taskId: 19,
@@ -85,10 +96,27 @@ describe("CoordExpRefinementClient", () => {
       }),
     );
     expect(fetchImpl.mock.calls[0][0]).toBe("/api/projects/7/coordexp-refinement/session/");
-    expect(fetchImpl.mock.calls[2][0]).toBe("/api/projects/7/coordexp-refinement/session/");
-    expect(fetchImpl.mock.calls[4][0]).toBe("/api/projects/7/coordexp-refinement/session/");
     expect(fetchImpl).toHaveBeenNthCalledWith(
       4,
+      "/api/projects/7/coordexp-refinement/task-lifecycle/",
+      expect.objectContaining({
+        headers: expect.objectContaining({ "X-CSRFToken": "lifecycle-token" }),
+        body: JSON.stringify({
+          action: "reconcile",
+          task_id: 19,
+          expected_draft: {
+            draft_id: 501,
+            draft_updated_at: "2026-07-16T00:00:00Z",
+            draft_semantic_hash: "a".repeat(64),
+          },
+        }),
+      }),
+    );
+    expect(fetchImpl.mock.calls[2][0]).toBe("/api/projects/7/coordexp-refinement/session/");
+    expect(fetchImpl.mock.calls[4][0]).toBe("/api/projects/7/coordexp-refinement/session/");
+    expect(fetchImpl.mock.calls[6][0]).toBe("/api/projects/7/coordexp-refinement/session/");
+    expect(fetchImpl).toHaveBeenNthCalledWith(
+      6,
       "/api/projects/7/coordexp-refinement/roi/infer/",
       expect.objectContaining({
         headers: expect.objectContaining({ "X-CSRFToken": "infer-token" }),
@@ -102,7 +130,7 @@ describe("CoordExpRefinementClient", () => {
       }),
     );
     expect(fetchImpl).toHaveBeenNthCalledWith(
-      6,
+      8,
       "/api/projects/7/coordexp-refinement/roi/abandon/",
       expect.objectContaining({
         headers: expect.objectContaining({ "X-CSRFToken": "abandon-token" }),

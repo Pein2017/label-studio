@@ -48,6 +48,9 @@ const makeDataManager = (initialStatus = makeStatus()) => {
       isManagedRefinementProject: true,
       lsfInstance: { store: null },
       task: { id: 11 },
+      prepareManagedTaskLifecycle: jest.fn(() => null),
+      applyManagedTaskLifecycle: jest.fn(),
+      failManagedTaskLifecycle: jest.fn(),
     },
     on: jest.fn((name, callback) => {
       const values = listeners.get(name) ?? new Set();
@@ -101,6 +104,20 @@ const makeClient = (overrides = {}) => ({
       member_count: 2,
       base_generation: 4,
       generation: null,
+    },
+  }),
+  taskLifecycle: jest.fn().mockResolvedValue({
+    status: 200,
+    payload: {
+      disposition: "reset",
+      task_id: 11,
+      annotation_id: 91,
+      draft: {
+        draft_id: 10,
+        draft_updated_at: "2026-07-16T00:00:01Z",
+        draft_semantic_hash: "a".repeat(64),
+      },
+      committed: { generation: 4, semantic_hash: "a".repeat(64), result: [] },
     },
   }),
   ...overrides,
@@ -359,6 +376,45 @@ describe("CoordExpManagedPanel", () => {
     expect(client.status).toHaveBeenCalledWith(ACTIVE_BATCH_ID, expect.any(AbortSignal));
   });
 
+  it("runs one terminal lifecycle reconciliation after authoritative success", async () => {
+    const dataManager = makeDataManager();
+    const prepared = {
+      action: "reconcile",
+      request: {
+        action: "inspect",
+        taskId: 11,
+        expectedDraft: {
+          draftId: 10,
+          draftUpdatedAt: "2026-07-16T00:00:00Z",
+          draftSemanticHash: "b".repeat(64),
+        },
+      },
+    };
+    const terminalState = {
+      ...PROJECT_STATE,
+      version: 2,
+      generation: 5,
+      pending_draft_count: 1,
+      last_terminal_batch: {
+        batch_id: TERMINAL_BATCH_ID,
+        state: "succeeded",
+        member_count: 1,
+        base_generation: 4,
+        generation: 5,
+      },
+    };
+    const client = makeClient({ projectState: jest.fn().mockResolvedValue(terminalState) });
+
+    dataManager.lsf.prepareManagedTaskLifecycle.mockReturnValueOnce(prepared).mockReturnValue(null);
+    renderPanel({ client, dataManager });
+
+    await waitFor(() => expect(client.taskLifecycle).toHaveBeenCalledWith(prepared.request, expect.any(AbortSignal)));
+    expect(dataManager.lsf.applyManagedTaskLifecycle).toHaveBeenCalledWith(
+      prepared,
+      expect.objectContaining({ payload: expect.objectContaining({ disposition: "reset" }) }),
+    );
+  });
+
   it("keeps resolved request failures visible and Drafts available", async () => {
     const client = makeClient({
       commit: jest.fn().mockRejectedValue(new CoordExpHttpError("Queue fsync failed.", { status: 503 })),
@@ -385,6 +441,104 @@ describe("CoordExpManagedPanel", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("reconciling by batch ID");
     expect(screen.getByLabelText("Active batch")).toHaveTextContent("State: Reconciling");
     expect(screen.getByRole("button", { name: "Reconciling…" })).toBeDisabled();
+  });
+
+  it("explicitly discards the persisted Draft through the exact-token lifecycle endpoint", async () => {
+    const dataManager = makeDataManager(
+      makeStatus({
+        authority: {
+          ...PROJECT_STATE,
+          members: [
+            {
+              task_id: 11,
+              draft_id: 10,
+              draft_updated_at: "2026-07-16T00:00:00Z",
+              draft_semantic_hash: "b".repeat(64),
+            },
+          ],
+        },
+      }),
+    );
+    const prepared = {
+      action: "discard",
+      request: {
+        action: "discard",
+        taskId: 11,
+        expectedDraft: {
+          draftId: 10,
+          draftUpdatedAt: "2026-07-16T00:00:00Z",
+          draftSemanticHash: "b".repeat(64),
+        },
+      },
+    };
+    const client = makeClient();
+    const confirm = jest.spyOn(globalThis, "confirm").mockReturnValue(true);
+
+    dataManager.lsf.prepareManagedTaskLifecycle.mockImplementation((action) =>
+      action === "discard" ? prepared : null,
+    );
+    try {
+      renderPanel({ client, dataManager });
+      fireEvent.click(screen.getByRole("button", { name: "Discard Draft and Reset" }));
+
+      await waitFor(() => expect(client.taskLifecycle).toHaveBeenCalledWith(prepared.request, expect.any(AbortSignal)));
+      await waitFor(() =>
+        expect(dataManager.lsf.applyManagedTaskLifecycle).toHaveBeenCalledWith(
+          prepared,
+          expect.objectContaining({ payload: expect.objectContaining({ disposition: "reset" }) }),
+        ),
+      );
+      expect(dataManager.ensureDurableDraft).not.toHaveBeenCalled();
+    } finally {
+      confirm.mockRestore();
+    }
+  });
+
+  it("keeps a failed discard visible and reports it to the managed lifecycle owner", async () => {
+    const dataManager = makeDataManager(
+      makeStatus({
+        authority: {
+          ...PROJECT_STATE,
+          members: [
+            {
+              task_id: 11,
+              draft_id: 10,
+              draft_updated_at: "2026-07-16T00:00:00Z",
+              draft_semantic_hash: "b".repeat(64),
+            },
+          ],
+        },
+      }),
+    );
+    const prepared = {
+      action: "discard",
+      request: {
+        action: "discard",
+        taskId: 11,
+        expectedDraft: {
+          draftId: 10,
+          draftUpdatedAt: "2026-07-16T00:00:00Z",
+          draftSemanticHash: "b".repeat(64),
+        },
+      },
+    };
+    const failure = new CoordExpHttpError("Persisted Draft changed before reset.", { status: 409 });
+    const client = makeClient({ taskLifecycle: jest.fn().mockRejectedValue(failure) });
+    const confirm = jest.spyOn(globalThis, "confirm").mockReturnValue(true);
+
+    dataManager.lsf.prepareManagedTaskLifecycle.mockImplementation((action) =>
+      action === "discard" ? prepared : null,
+    );
+    try {
+      renderPanel({ client, dataManager });
+      fireEvent.click(screen.getByRole("button", { name: "Discard Draft and Reset" }));
+
+      expect(await screen.findByRole("alert")).toHaveTextContent("Persisted Draft changed before reset.");
+      expect(dataManager.lsf.failManagedTaskLifecycle).toHaveBeenCalledWith(failure, "discard");
+      expect(screen.getByRole("button", { name: "Discard Draft and Reset" })).toBeEnabled();
+    } finally {
+      confirm.mockRestore();
+    }
   });
 
   it("uses explicit member flags for a durable dirty-false Draft ahead of the active batch", () => {

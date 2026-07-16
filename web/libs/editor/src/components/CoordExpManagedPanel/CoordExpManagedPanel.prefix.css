@@ -96,6 +96,25 @@
   background: #a1a1aa;
 }
 
+.coordexp-managed-panel__discard {
+  width: 100%;
+  min-height: 30px;
+  margin-top: 6px;
+  color: #991b1b;
+  cursor: pointer;
+  background: #fff;
+  border: 1px solid #fca5a5;
+  border-radius: 4px;
+  font-weight: 600;
+}
+
+.coordexp-managed-panel__discard:disabled {
+  color: #71717a;
+  cursor: not-allowed;
+  background: #f4f4f5;
+  border-color: #d4d4d8;
+}
+
 .coordexp-managed-panel__hint {
   margin-top: 6px;
   color: var(--color-neutral-content-subtle, #71717a);

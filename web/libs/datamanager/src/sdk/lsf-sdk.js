@@ -84,6 +84,7 @@ export const COORDEXP_MANAGED_PROJECT_PREFIX = "coordexp-refinement-project-iden
 
 const MANAGED_DRAFT_MAX_SAVE_ATTEMPTS = 4;
 const MANAGED_DRAFT_DETACHED_RESULT = Object.freeze({ detached: true, reason: "destroyed", status: "cancelled" });
+const MANAGED_COMMITTED_META_FIELDS = Object.freeze(["coordexp_region_key", "coco_ann_id", "last_committed_bbox"]);
 
 // These fields are deliberately persisted with a Draft so inference colors can
 // be reconstructed after reload, but they are presentation-only.  Excluding
@@ -134,6 +135,8 @@ const stableHash = (value) => {
 
   return `fnv1a32:${(hash >>> 0).toString(16).padStart(8, "0")}`;
 };
+
+const cloneManagedJson = (value) => JSON.parse(stableSerialize(value));
 
 const managedSemanticProjection = (value, parentKey = null) => {
   if (value === null || typeof value !== "object") return value;
@@ -231,6 +234,7 @@ export class LSFWrapper {
     this._managedSelectionReplay = false;
     this._managedRoiRunning = false;
     this._managedAuthoritativeState = null;
+    this._managedTerminalLifecycleKeys = new Set();
     this._managedPersistentError = null;
     this.managedStatusState = null;
     this.lastPersistedDraftResult = null;
@@ -568,7 +572,7 @@ export class LSFWrapper {
   _isManagedDraftSaving(annotation = this.currentAnnotation) {
     const identity = this._managedAnnotationIdentity(annotation);
 
-    return Boolean(identity && this._managedDraftSaves.has(identity));
+    return Boolean(annotation?.isDraftSaving || (identity && this._managedDraftSaves.has(identity)));
   }
 
   hasManagedUnsavedWork = () => {
@@ -816,6 +820,205 @@ export class LSFWrapper {
 
     this.datamanager.invoke("managedPendingDraftsChanged", this._managedPendingDraftPayload());
     return status;
+  };
+
+  prepareManagedTaskLifecycle = (requestedAction = "reconcile") => {
+    if (!this.isManagedRefinementProject) return null;
+    if (!new Set(["reconcile", "discard"]).has(requestedAction)) {
+      throw new TypeError("managed task lifecycle action must be reconcile or discard");
+    }
+    const annotation = this.currentAnnotation;
+    const taskId = this.task?.id;
+    const member = this._managedAuthoritativeMember(taskId);
+    const identity = this._managedAnnotationIdentity(annotation);
+    const baseline = identity ? this._managedDraftBaselines.get(identity) : null;
+    const draftId = member?.draft_id ?? member?.draftId;
+    const draftUpdatedAt = member?.draft_updated_at ?? member?.draftUpdatedAt;
+    const draftSemanticHash = member?.draft_semantic_hash ?? member?.draftSemanticHash;
+
+    if (
+      !annotation ||
+      !identity ||
+      this._isManagedDraftSaving(annotation) ||
+      annotation.history?.isFrozen === true ||
+      !Number.isInteger(Number(draftId)) ||
+      Number(draftId) <= 0 ||
+      typeof draftUpdatedAt !== "string" ||
+      !draftUpdatedAt ||
+      typeof draftSemanticHash !== "string" ||
+      !/^[0-9a-f]{64}$/.test(draftSemanticHash)
+    ) {
+      return null;
+    }
+
+    const terminal =
+      this._managedAuthoritativeState?.last_terminal_batch ?? this._managedAuthoritativeState?.lastTerminalBatch;
+    if (requestedAction === "reconcile") {
+      const terminalState = terminal?.state ?? terminal?.status;
+      const terminalMember = member?.last_terminal_batch_member === true || member?.lastTerminalBatchMember === true;
+
+      if (terminalState !== "succeeded" || !terminalMember) return null;
+    }
+
+    const loadedDraftTokenMatches = baseline?.receipt
+      ? this._managedMemberDraftTokenMatches(member, { receipt: baseline.receipt })
+      : identitiesEqual(annotation.draftId, draftId);
+    const localExact =
+      loadedDraftTokenMatches &&
+      !this._isManagedDraftSaving(annotation) &&
+      baseline?.serialized === stableSerialize(this._managedSemanticProjection(annotation));
+    const action = requestedAction === "discard" ? "discard" : localExact ? "reconcile" : "inspect";
+    const lifecycleKey =
+      requestedAction === "reconcile"
+        ? [
+            terminal?.batch_id ?? terminal?.batchId,
+            terminal?.generation,
+            taskId,
+            draftId,
+            draftUpdatedAt,
+            draftSemanticHash,
+          ].join(":")
+        : null;
+
+    if (lifecycleKey && this._managedTerminalLifecycleKeys.has(lifecycleKey)) return null;
+    return Object.freeze({
+      action: requestedAction,
+      lifecycleKey,
+      request: Object.freeze({
+        action,
+        taskId: Number(taskId),
+        expectedDraft: Object.freeze({
+          draftId: Number(draftId),
+          draftUpdatedAt,
+          draftSemanticHash,
+        }),
+      }),
+      source: this._captureManagedSource(annotation),
+      sourceBrowserSemanticSerialized: stableSerialize(this._managedSemanticProjection(annotation)),
+    });
+  };
+
+  _mergeManagedCommittedMetadata(annotation, committedResult) {
+    const committedByKey = new Map(
+      committedResult
+        .filter((item) => item && typeof item.id === "string" && item.meta && typeof item.meta === "object")
+        .map((item) => [item.id, item.meta]),
+    );
+
+    const history = annotation?.history;
+    const freezeKey = Symbol("coordexp-managed-identity-merge");
+    let mergeError = null;
+    let releaseError = null;
+
+    history?.freeze?.(freezeKey);
+    try {
+      for (const area of annotation?.areas?.values?.() ?? []) {
+        const key = area?.presentationRegionKey ?? area?.id ?? area?.cleanId;
+        const committedMeta = committedByKey.get(key);
+
+        if (!committedMeta) continue;
+        for (const result of area.results ?? []) {
+          if (result?.type !== "rectanglelabels" || typeof result?.setMetaValue !== "function") continue;
+          for (const field of MANAGED_COMMITTED_META_FIELDS) {
+            if (Object.hasOwn(committedMeta, field)) {
+              result.setMetaValue(field, cloneManagedJson(committedMeta[field]));
+            }
+          }
+        }
+      }
+    } catch (error) {
+      mergeError = error;
+    } finally {
+      try {
+        const aborted = history?.abortFreeze?.(freezeKey, true) === true;
+
+        if (!aborted) history?.safeUnfreeze?.(freezeKey);
+      } catch (error) {
+        history?.abortFreeze?.(freezeKey, true);
+        releaseError = error;
+      }
+    }
+    if (mergeError) throw mergeError;
+    if (releaseError) throw releaseError;
+  }
+
+  applyManagedTaskLifecycle = (prepared, response) => {
+    if (!prepared || !response || typeof response !== "object") {
+      throw this._managedDraftError("INVALID_TASK_LIFECYCLE", "Managed task state returned an invalid response.");
+    }
+    const payload = response.payload ?? response;
+    const committedResult = payload?.committed?.result;
+    const responseDraft = payload?.draft;
+    const annotation = prepared.source?.annotation;
+    const stillAttached =
+      !this._managedCoordinatorDestroyed &&
+      annotation === this.currentAnnotation &&
+      identitiesEqual(payload.task_id, prepared.source.taskId) &&
+      identitiesEqual(payload.annotation_id, annotation?.pk ?? annotation?.id);
+
+    if (!Array.isArray(committedResult) || !responseDraft || !stillAttached) {
+      throw this._managedDraftError(
+        "TASK_LIFECYCLE_DETACHED",
+        "Managed task state no longer matches the loaded annotation.",
+      );
+    }
+    if (this._isManagedDraftSaving(annotation) || annotation.history?.isFrozen === true) {
+      // The response crossed an async boundary after prepare. Never fold
+      // identity metadata into a Draft save or the user's active undo
+      // transaction. Leaving the lifecycle key unconsumed makes the next idle
+      // project-state poll re-read authority and retry safely.
+      return this._publishManagedStatus();
+    }
+    const exactLocal =
+      prepared.sourceBrowserSemanticSerialized === stableSerialize(this._managedSemanticProjection(annotation));
+    const exactDisposition = payload.disposition === "rebased" || payload.disposition === "reset";
+
+    if (exactDisposition && exactLocal) {
+      annotation.deserializeResults(committedResult);
+      annotation.reinitHistory?.();
+      annotation.setDraftId?.(responseDraft.draft_id);
+      annotation.setDraftSaved?.(responseDraft.draft_updated_at);
+      const projection = this._managedSemanticProjection(annotation);
+      const receipt = Object.freeze({
+        task_id: prepared.source.taskId,
+        annotation_id: payload.annotation_id,
+        draft_id: responseDraft.draft_id,
+        status: 200,
+        revision: responseDraft.draft_updated_at,
+        serialized_hash: stableHash(committedResult),
+        browser_semantic_projection_hash: stableHash(projection),
+        authoritative_semantic_hash: responseDraft.draft_semantic_hash,
+      });
+
+      this._managedDraftBaselines.set(prepared.source.annotationIdentity, {
+        browserSemanticHash: receipt.browser_semantic_projection_hash,
+        serialized: stableSerialize(projection),
+        hydrated: true,
+        receipt,
+      });
+      this.lastPersistedDraftResult = receipt;
+      this._managedLocalPendingDrafts.delete(String(prepared.source.taskId));
+    } else {
+      this._mergeManagedCommittedMetadata(annotation, committedResult);
+    }
+    if (prepared.lifecycleKey) this._managedTerminalLifecycleKeys.add(prepared.lifecycleKey);
+    this._clearManagedPersistentError(prepared.action === "discard" ? "discard" : "terminal");
+    return this._publishManagedStatus();
+  };
+
+  failManagedTaskLifecycle = (error, action = "reconcile") => {
+    const managedError =
+      error instanceof CoordExpDraftSaveError
+        ? error
+        : this._managedDraftError(
+            action === "discard" ? "DRAFT_DISCARD_FAILED" : "TERMINAL_RECONCILIATION_FAILED",
+            action === "discard"
+              ? "Draft reset failed. The current Draft and local edits were preserved."
+              : "Committed task state could not be reconciled. The current Draft was preserved.",
+          );
+
+    this._setManagedPersistentError(managedError, action === "discard" ? "discard" : "terminal");
+    return managedError;
   };
 
   _managedPendingDraftPayload() {
@@ -2743,6 +2946,7 @@ export class LSFWrapper {
     this._managedAnnotationHydrations.clear();
     this._managedLocalPendingDrafts.clear();
     this._managedAuthoritativeState = null;
+    this._managedTerminalLifecycleKeys.clear();
     this._managedPersistentError = null;
     this.managedStatusState = null;
 

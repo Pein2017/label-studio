@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from uuid import uuid4
 
 from coordexp_refinement.registry import RuntimeBindingError, runtime_registry
@@ -56,6 +57,41 @@ class FakeRuntime:
             generation=8 if terminal else None,
             error=self.error,
         )
+
+
+class FakeLifecycleCatalog:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def current_task_lifecycle(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        expected = kwargs['expected_draft']
+        return {
+            'action': kwargs['action'],
+            'disposition': 'metadata_only',
+            'task_id': kwargs['task_pk'],
+            'annotation_id': 91,
+            'draft': dict(expected),
+            'expected_draft_matches': True,
+            'committed': {
+                'generation': 7,
+                'semantic_hash': expected['draft_semantic_hash'],
+                'result': [],
+            },
+        }
+
+
+class FakeLifecycleServices:
+    def __init__(self) -> None:
+        self.manager = object()
+        self.targets = object()
+        self.finalizer = object()
+        self.receipt_store = object()
+        self.draft_catalog = FakeLifecycleCatalog()
+
+    @contextmanager
+    def request_admission(self):
+        yield
 
 
 class RefinementAPITestCase(TestCase):
@@ -151,6 +187,73 @@ class RefinementAPITestCase(TestCase):
             HTTP_X_CSRFTOKEN=token,
         )
         self.assertEqual(accepted.status_code, 202)
+
+    def test_task_lifecycle_is_csrf_protected_and_derives_server_authority(self) -> None:
+        services = FakeLifecycleServices()
+        runtime_registry.register(
+            project_pk=self.project.pk,
+            split='train',
+            runtime=self.runtime,
+            services=services,
+            replace=True,
+        )
+        url = f'/api/projects/{self.project.pk}/coordexp-refinement/task-lifecycle/'
+        body = {
+            'action': 'reconcile',
+            'task_id': 17,
+            'expected_draft': {
+                'draft_id': 23,
+                'draft_updated_at': '2026-07-16T00:00:00Z',
+                'draft_semantic_hash': 'a' * 64,
+            },
+        }
+
+        missing = self.client.post(url, body, format='json')
+        self.assertEqual(missing.status_code, 403)
+        self.assertEqual(missing.json()['error']['code'], 'csrf_failed')
+        self.assertEqual(services.draft_catalog.calls, [])
+
+        token = self.csrf_token()
+        accepted = self.client.post(url, body, format='json', HTTP_X_CSRFTOKEN=token)
+
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(accepted['Cache-Control'], 'no-store')
+        self.assertEqual(len(services.draft_catalog.calls), 1)
+        call = services.draft_catalog.calls[0]
+        self.assertEqual(call['split'], 'train')
+        self.assertEqual(call['task_pk'], 17)
+        self.assertEqual(call['action'], 'reconcile')
+        self.assertEqual(call['expected_draft'], body['expected_draft'])
+        self.assertEqual(call['principal'].user_id, str(self.user.pk))
+        self.assertTrue(call['principal'].authenticated)
+
+    def test_task_lifecycle_rejects_extra_browser_authority(self) -> None:
+        services = FakeLifecycleServices()
+        runtime_registry.register(
+            project_pk=self.project.pk,
+            split='train',
+            runtime=self.runtime,
+            services=services,
+            replace=True,
+        )
+        token = self.csrf_token()
+        url = f'/api/projects/{self.project.pk}/coordexp-refinement/task-lifecycle/'
+        body = {
+            'action': 'discard',
+            'task_id': 17,
+            'annotation_id': 91,
+            'expected_draft': {
+                'draft_id': 23,
+                'draft_updated_at': '2026-07-16T00:00:00Z',
+                'draft_semantic_hash': 'a' * 64,
+            },
+        }
+
+        response = self.client.post(url, body, format='json', HTTP_X_CSRFTOKEN=token)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['error']['code'], 'invalid_request')
+        self.assertEqual(services.draft_catalog.calls, [])
 
     def test_foreign_organization_project_is_hidden_before_registry_access(self) -> None:
         other = _user('foreign@example.test')

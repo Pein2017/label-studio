@@ -144,6 +144,22 @@ export class CoordExpRefinementClient {
     return this.postWithCsrf("/commit/", { batch_id: batchId }, signal);
   }
 
+  taskLifecycle({ action, taskId, expectedDraft }, signal) {
+    return this.postWithCsrf(
+      "/task-lifecycle/",
+      {
+        action,
+        task_id: taskId,
+        expected_draft: {
+          draft_id: expectedDraft?.draftId,
+          draft_updated_at: expectedDraft?.draftUpdatedAt,
+          draft_semantic_hash: expectedDraft?.draftSemanticHash,
+        },
+      },
+      signal,
+    );
+  }
+
   infer({ requestId, taskId, roi, resolution, profileSelector }, signal) {
     return this.postWithCsrf(
       "/roi/infer/",
