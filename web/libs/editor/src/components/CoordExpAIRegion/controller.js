@@ -9,11 +9,11 @@ export const VISUAL_PALETTE = Object.freeze([
   "#005A9C",
   "#A64073",
   "#007A5E",
-  "#B85C00",
-  "#6B4C9A",
-  "#006E90",
-  "#9C2F2F",
-  "#4D7000",
+  "#B24C00",
+  "#5B4BB7",
+  "#8A5A00",
+  "#006B73",
+  "#A32D2D",
 ]);
 
 const isRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -645,17 +645,27 @@ export const buildVisualPolicy = (descriptors, palette = VISUAL_PALETTE, compari
   const presentations = [];
 
   ordered.forEach((item, index) => {
-    const usedColors = new Set(
-      presentations
-        .filter((_entry, priorIndex) => expandedNeighbors(item.bbox, ordered[priorIndex].bbox))
-        .map((entry) => entry.color),
-    );
-    const availableColor = palette.find((color) => !usedColors.has(color));
+    const coloredNeighborIndices = presentations
+      .map((entry, priorIndex) => ({ entry, priorIndex }))
+      .filter(({ priorIndex }) => expandedNeighbors(item.bbox, ordered[priorIndex].bbox))
+      .map(({ entry }) => entry.palette_index);
+    const usedPaletteIndices = new Set(coloredNeighborIndices);
+    const availablePaletteIndex = palette.findIndex((_color, paletteIndex) => !usedPaletteIndices.has(paletteIndex));
+    const paletteIndex =
+      availablePaletteIndex >= 0
+        ? availablePaletteIndex
+        : palette.reduce((bestIndex, _color, candidateIndex) => {
+            const candidateCount = coloredNeighborIndices.filter((value) => value === candidateIndex).length;
+            const bestCount = coloredNeighborIndices.filter((value) => value === bestIndex).length;
+
+            return candidateCount < bestCount ? candidateIndex : bestIndex;
+          }, 0);
 
     presentations.push({
       stable_region_key: item.stableRegionKey,
-      color: availableColor ?? palette[index % palette.length],
-      numeric_badge: availableColor ? null : index + 1,
+      color: palette[paletteIndex],
+      palette_index: paletteIndex,
+      numeric_badge: availablePaletteIndex >= 0 ? null : index + 1,
       advisory_conflict_keys: [...new Set(duplicateKeys.get(item.stableRegionKey))].sort(),
     });
   });

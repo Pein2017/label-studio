@@ -11,8 +11,10 @@ import {
   validateDurableDraftReceipt,
   validateInferenceResponse,
   validateProfilesResponse,
+  VISUAL_PALETTE,
   visualPolicyConflictCount,
 } from "./controller";
+import visualPolicyGolden from "./visual-policy.golden.json";
 
 const REQUEST_ID = "11111111-1111-4111-8111-111111111111";
 const frozen = {
@@ -121,6 +123,33 @@ const abandoned = (reason = "user_cancelled") => ({
   failure: { stage: "insertion", code: reason },
   counts: { parsed: 1, inserted: 0, rejected: 0 },
 });
+
+const visualGoldenVector = (name) => visualPolicyGolden.visual_policy.find((vector) => vector.name === name);
+const visualDescriptor = (item) => ({
+  stableRegionKey: item.stable_region_key,
+  categoryName: item.canonical_name,
+  bbox: item.bbox_2d,
+});
+const goldenPresentations = (policy) =>
+  policy.presentations.map(({ stable_region_key, color, palette_index, numeric_badge }) => ({
+    stable_region_key,
+    color,
+    palette_index,
+    numeric_badge,
+  }));
+const goldenNeighborPairs = (input) => {
+  const inferenceInput = input.filter((item) => item.is_uncommitted_inference);
+  const pairs = [];
+
+  inferenceInput.forEach((left, leftIndex) => {
+    inferenceInput.slice(leftIndex + 1).forEach((right) => {
+      if (expandedNeighbors(left.bbox_2d, right.bbox_2d)) {
+        pairs.push([left.stable_region_key, right.stable_region_key]);
+      }
+    });
+  });
+  return pairs;
+};
 
 describe("AI Region controller", () => {
   const retirementStatus = (updates = {}) => ({
@@ -410,6 +439,41 @@ describe("AI Region controller", () => {
     expect(visualPolicyConflictCount(policy)).toBe(6);
     expect(expandedNeighbors([0, 0, 10, 10], [34, 0, 40, 10])).toBe(true);
     expect(intersectionOverUnion([0, 0, 10, 10], [0, 0, 10, 10])).toBe(1);
+  });
+
+  it.each(["neighbor_gap_24_bins", "neighbor_gap_25_bins"])("matches the parent visual-policy golden at %s", (name) => {
+    const vector = visualGoldenVector(name);
+    const inferenceDescriptors = vector.input.filter((item) => item.is_uncommitted_inference).map(visualDescriptor);
+    const policy = buildVisualPolicy(inferenceDescriptors);
+
+    expect(visualPolicyGolden.schema_version).toBe("coordexp-editor-policy-golden-v1");
+    expect(VISUAL_PALETTE).toEqual(vector.expected.palette);
+    expect(goldenNeighborPairs(vector.input)).toEqual(vector.expected.neighbor_pairs);
+    expect(goldenPresentations(policy)).toEqual(vector.expected.presentations);
+  });
+
+  it("matches the parent 10-region palette-exhaustion golden", () => {
+    const vector = visualGoldenVector("palette_clique_exhaustion");
+    const inferenceDescriptors = vector.input.filter((item) => item.is_uncommitted_inference).map(visualDescriptor);
+    const neighborPairs = goldenNeighborPairs(vector.input);
+    const policy = buildVisualPolicy(inferenceDescriptors);
+
+    expect(VISUAL_PALETTE).toEqual(vector.expected.palette);
+    expect(neighborPairs).toHaveLength(vector.expected.neighbor_pair_count);
+    expect(goldenPresentations(policy)).toEqual(vector.expected.presentations);
+  });
+
+  it("matches the parent duplicate golden at IoU exactly 0.5", () => {
+    const vector = visualGoldenVector("duplicate_exact_iou_half");
+    const inferenceDescriptors = vector.input.filter((item) => item.is_uncommitted_inference).map(visualDescriptor);
+    const comparisonDescriptors = vector.input.map(visualDescriptor);
+    const policy = buildVisualPolicy(inferenceDescriptors, undefined, comparisonDescriptors);
+    const [left, right] = vector.input;
+
+    expect(intersectionOverUnion(left.bbox_2d, right.bbox_2d)).toBe(0.5);
+    expect(policy.advisory_conflict_pair_count).toBe(vector.expected.duplicate_pairs.length);
+    expect(policy.presentations[0].advisory_conflict_keys).toEqual([left.stable_region_key]);
+    expect(goldenPresentations(policy)).toEqual(vector.expected.presentations);
   });
 
   it("marks an inferred region that duplicates an existing human region without coloring the human region", () => {
