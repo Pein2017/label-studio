@@ -64,20 +64,15 @@ const RegionsMixin = types
 
     get presentationRegionKey() {
       const meta = self.results?.find((result) => result?.meta)?.meta;
-      return meta?.stable_region_key ?? meta?.coordexp?.stable_region_key ?? self.id;
+      return meta?.coordexp_region_key ?? self.id;
     },
 
     get inferencePresentation() {
-      const meta = self.results?.find((result) => result?.meta)?.meta;
       if (self.parent?.isInferenceRegionPresentationRetired?.(self.presentationRegionKey)) return null;
-      const policy = meta?.visual_policy_v1 ?? meta?.coordexp_visual_presentation ?? meta?.visual_policy_presentation;
-      const policyPresentation = Array.isArray(policy?.presentations)
-        ? policy.presentations.find((entry) => entry?.stable_region_key === self.presentationRegionKey)
-        : policy;
-      const volatilePresentation =
+      const presentation =
         self.parent?.getRegionPresentation?.(self.presentationRegionKey) ??
         self.parent?.getRegionPresentation?.(self.id);
-      const presentation = volatilePresentation ?? policyPresentation;
+      if (!presentation) return null;
       const color = presentation?.color;
       const numericBadge = presentation?.numeric_badge;
 

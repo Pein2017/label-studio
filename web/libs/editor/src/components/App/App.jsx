@@ -39,6 +39,7 @@ import { ToastProvider, ToastViewport } from "@humansignal/ui/lib/toast/toast";
  */
 import { Annotation } from "./Annotation";
 import { BottomBar } from "../BottomBar/BottomBar";
+import { CoordExpManagedPanelMount } from "../CoordExpManagedPanel";
 import Debug from "../Debug";
 import { InstructionsModal } from "../InstructionsModal/InstructionsModal";
 import Settings from "../Settings/Settings";
@@ -262,6 +263,8 @@ class App extends Component {
                 {store.description}
               </InstructionsModal>
 
+              <CoordExpManagedPanelMount store={store} />
+
               {isDefined(store) && store.hasInterface("topbar") && <TopBar store={store} />}
               <div
                 className={cn("wrapper")
@@ -299,7 +302,6 @@ class App extends Component {
       </div>
     );
   }
-
 }
 
 export default observer(App);

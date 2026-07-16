@@ -23,6 +23,8 @@ import { fixRectToFit, mapKonvaBrightness } from "../../utils/image";
 import { FF_DEV_1442, FF_LSDV_4930, FF_ZOOM_OPTIM, isFF } from "../../utils/feature-flags";
 import { Pagination } from "../../common/Pagination/Pagination";
 import { Image } from "./Image";
+import { CoordExpAIRegionMount } from "../CoordExpAIRegion";
+import { roiFromDrag } from "../CoordExpAIRegion/controller";
 
 Konva.showWarnings = false;
 
@@ -117,6 +119,15 @@ export const AIRegionOverlay = observer(({ item }) => {
     </Layer>
   );
 });
+
+export const aiRegionPointFromCanvas = (item, x, y) => {
+  const [canvasX, canvasY] = item.fixZoomedCoords([x, y]);
+
+  return {
+    x: Math.max(0, Math.min(100, item.canvasToInternalX(canvasX))),
+    y: Math.max(0, Math.min(100, item.canvasToInternalY(canvasY))),
+  };
+};
 
 const DrawingRegion = observer(({ item }) => {
   const { drawingRegion } = item;
@@ -551,6 +562,7 @@ export default observer(
     skipNextMouseUp = false;
     mouseDownPoint = null;
     mouseDown = false;
+    aiRegionDragStart = null;
 
     constructor(props) {
       super(props);
@@ -561,6 +573,8 @@ export default observer(
 
     handleOnClick = (e) => {
       const { item } = this.props;
+
+      if (item.aiRegionDrawEnabled) return;
 
       if (isFF(FF_DEV_1442)) {
         this.handleDeferredMouseDown?.(true);
@@ -643,6 +657,16 @@ export default observer(
     handleMouseDown = (e) => {
       this.mouseDown = true;
       const { item } = this.props;
+
+      if (item.aiRegionDrawEnabled) {
+        if (item.aiRegionRunning || e.evt.button !== 0) return true;
+        this.aiRegionDragStart = aiRegionPointFromCanvas(item, e.evt.offsetX, e.evt.offsetY);
+        window.addEventListener("mousemove", this.handleGlobalMouseMove);
+        window.addEventListener("mouseup", this.handleGlobalMouseUp);
+        e.cancelBubble = true;
+        e.evt.preventDefault?.();
+        return true;
+      }
       const isPanTool = item.getToolsManager().findSelectedTool()?.fullName === "ZoomPanTool";
       const isMoveTool = item.getToolsManager().findSelectedTool()?.fullName === "MoveTool";
 
@@ -753,6 +777,12 @@ export default observer(
       window.removeEventListener("mousemove", this.handleGlobalMouseMove);
       window.removeEventListener("mouseup", this.handleGlobalMouseUp);
 
+      if (this.aiRegionDragStart) {
+        const { left, top } = this.props.item.containerRef.getBoundingClientRect();
+
+        return this.finishAIRegionDrag(e.clientX - left, e.clientY - top);
+      }
+
       if (e.target && e.target.tagName === "CANVAS") return;
 
       const { item } = this.props;
@@ -764,6 +794,12 @@ export default observer(
     };
 
     handleGlobalMouseMove = (e) => {
+      if (this.aiRegionDragStart) {
+        const { left, top } = this.props.item.containerRef.getBoundingClientRect();
+
+        this.updateAIRegionDrag(e.clientX - left, e.clientY - top);
+        return;
+      }
       if (e.target && e.target.tagName === "CANVAS") return;
 
       const { item } = this.props;
@@ -778,6 +814,13 @@ export default observer(
     handleMouseUp = (e) => {
       this.mouseDown = false;
       const { item } = this.props;
+
+      if (this.aiRegionDragStart) {
+        window.removeEventListener("mousemove", this.handleGlobalMouseMove);
+        window.removeEventListener("mouseup", this.handleGlobalMouseUp);
+        e.cancelBubble = true;
+        return this.finishAIRegionDrag(e.evt.offsetX, e.evt.offsetY);
+      }
 
       if (isFF(FF_DEV_1442)) {
         this.resetDeferredClickTimeout();
@@ -800,6 +843,12 @@ export default observer(
 
     handleMouseMove = (e) => {
       const { item } = this.props;
+
+      if (this.aiRegionDragStart) {
+        this.updateAIRegionDrag(e.evt.offsetX, e.evt.offsetY);
+        e.cancelBubble = true;
+        return;
+      }
 
       item.freezeHistory();
 
@@ -866,6 +915,23 @@ export default observer(
         const { x, y } = e.currentTarget.getPointerPosition();
         this.crosshairRef.current.updatePointer(...this.props.item.fixZoomedCoords([x, y]));
       }
+    };
+
+    updateAIRegionDrag = (x, y) => {
+      const { item } = this.props;
+      const region = roiFromDrag(this.aiRegionDragStart, aiRegionPointFromCanvas(item, x, y));
+
+      if (region) item.setAIRegion(region);
+    };
+
+    finishAIRegionDrag = (x, y) => {
+      const { item } = this.props;
+      const region = roiFromDrag(this.aiRegionDragStart, aiRegionPointFromCanvas(item, x, y));
+
+      this.aiRegionDragStart = null;
+      this.mouseDown = false;
+      if (region) item.setAIRegion(region);
+      return true;
     };
 
     handleError = () => {
@@ -1083,6 +1149,7 @@ export default observer(
 
       return (
         <ObjectTag item={item} className={wrapperClasses.join(" ")}>
+          <CoordExpAIRegionMount store={store} image={item} annotation={item.annotation} />
           {paginationEnabled ? (
             <div
               className={styles.pagination}

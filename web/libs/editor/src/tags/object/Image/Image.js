@@ -218,6 +218,7 @@ const Model = types
     supportSuggestions: true,
     aiRegion: null,
     aiRegionRunning: false,
+    aiRegionDrawEnabled: false,
     _regionPresentationMode: "show_all",
     focusedRegionKeys: [],
     inferenceRegionPresentations: {},
@@ -758,6 +759,26 @@ const Model = types
       self.aiRegionRunning = running;
     }
 
+    function finishAIRegion({ clear }) {
+      if (typeof clear !== "boolean") {
+        throw new TypeError("AI Region terminal clear state must be boolean");
+      }
+      if (!self.aiRegionRunning) {
+        throw new Error("AI Region terminal action requires an active inference lock");
+      }
+      if (clear) self.aiRegion = null;
+      self.aiRegionDrawEnabled = false;
+      self.aiRegionRunning = false;
+    }
+
+    function setAIRegionDrawEnabled(enabled) {
+      if (typeof enabled !== "boolean") {
+        throw new TypeError("AI Region draw mode must be boolean");
+      }
+      assertAIRegionEditable();
+      self.aiRegionDrawEnabled = enabled;
+    }
+
     function restoreRegionPresentation() {
       self._regionPresentationMode = "show_all";
       self.focusedRegionKeys = [];
@@ -852,17 +873,12 @@ const Model = types
     }
 
     function getKnownInferencePresentationKeys() {
-      const knownKeys = new Set(Object.keys(self.inferenceRegionPresentations));
-      self.regs.forEach((region) => {
-        const regionKey = region.presentationRegionKey;
-        if (
-          typeof regionKey === "string" &&
-          (region.inferencePresentation?.color || self.retiredInferencePresentationKeys[regionKey])
-        ) {
-          knownKeys.add(regionKey);
-        }
-      });
-      return [...knownKeys];
+      return [
+        ...new Set([
+          ...Object.keys(self.inferenceRegionPresentations),
+          ...Object.keys(self.retiredInferencePresentationKeys),
+        ]),
+      ];
     }
 
     function clearInferenceRegionPresentations(regionKeys) {
@@ -892,6 +908,8 @@ const Model = types
       setAIRegion,
       clearAIRegion,
       setAIRegionRunning,
+      finishAIRegion,
+      setAIRegionDrawEnabled,
       setRegionPresentation,
       restoreRegionPresentation,
       removeFocusedRegionKey,

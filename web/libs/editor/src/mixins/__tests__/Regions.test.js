@@ -1,7 +1,7 @@
 /**
  * Unit tests for Regions mixin (mixins/Regions.js)
  */
-import { getEnv, getRoot, getParent, getSnapshot, types } from "mobx-state-tree";
+import { getSnapshot, types } from "mobx-state-tree";
 
 jest.mock("../../utils/feature-flags", () => ({
   isFF: () => false,
@@ -191,31 +191,32 @@ describe("Regions mixin", () => {
       expect(region.presentationOpacity).toBe(1);
     });
 
-    it("gets inference color and exhaustion badge from volatile state or result meta", () => {
+    it("gets inference color and exhaustion badge only from volatile state", () => {
       const { root, region } = createStore();
       region.setResults([
         {
           from_name: { smartEnabled: false },
           meta: {
+            coordexp_region_key: "stable-1",
             stable_region_key: "stable-1",
             visual_policy_v1: { color: "#A64073", numeric_badge: 9 },
+            coordexp_visual_presentation: { color: "#A64073", numeric_badge: 9 },
+            visual_policy_presentation: { color: "#A64073", numeric_badge: 9 },
           },
         },
       ]);
 
       expect(region.presentationRegionKey).toBe("stable-1");
-      expect(region.inferencePresentation).toEqual({ color: "#A64073", numericBadge: 9 });
-
-      const persistedPolicy = region.results[0].meta.visual_policy_v1;
-      const semanticSnapshot = getSnapshot(region);
-      root.clearInferencePresentations(["stable-1"]);
       expect(region.inferencePresentation).toBeNull();
-      expect(getSnapshot(region)).toEqual(semanticSnapshot);
-      expect(region.results[0].meta.visual_policy_v1).toBe(persistedPolicy);
 
+      const semanticSnapshot = getSnapshot(region);
       root.setInferencePresentation("stable-1", { color: "#007A5E", numeric_badge: 10 });
       expect(region.inferencePresentation).toEqual({ color: "#007A5E", numericBadge: 10 });
       expect(root.isInferenceRegionPresentationRetired("stable-1")).toBe(false);
+
+      root.clearInferencePresentations(["stable-1"]);
+      expect(region.inferencePresentation).toBeNull();
+      expect(getSnapshot(region)).toEqual(semanticSnapshot);
     });
 
     it("inSelection uses regionStore.isSelected", () => {

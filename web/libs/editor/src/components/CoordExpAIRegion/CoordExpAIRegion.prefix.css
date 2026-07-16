@@ -1,0 +1,50 @@
+.coordexp-ai-region {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--color-neutral-border, #d9d9d9);
+  border-radius: 4px;
+  background: var(--color-neutral-background, #fff);
+  font-size: 12px;
+}
+
+.coordexp-ai-region__row {
+  display: flex;
+  align-items: end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.coordexp-ai-region label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.coordexp-ai-region input {
+  width: 84px;
+}
+
+.coordexp-ai-region select {
+  min-width: 140px;
+}
+
+.coordexp-ai-region__roi {
+  color: var(--color-neutral-content-subtlest, #666);
+}
+
+.coordexp-ai-region__error,
+.coordexp-ai-region__message--profile_failure,
+.coordexp-ai-region__message--response_failure,
+.coordexp-ai-region__message--runtime_failure,
+.coordexp-ai-region__message--timeout_failure,
+.coordexp-ai-region__message--transport_failure,
+.coordexp-ai-region__message--save_failure {
+  color: var(--color-negative-content, #b42318);
+}
+
+.coordexp-ai-region__message {
+  min-height: 16px;
+}

@@ -1,0 +1,103 @@
+.coordexp-managed-panel {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 1200;
+  width: min(360px, calc(100vw - 32px));
+  padding: 12px;
+  color: var(--color-neutral-content, #27272a);
+  background: var(--color-neutral-background, #fff);
+  border: 1px solid var(--color-neutral-border, #d4d4d8);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 18%);
+  font-size: 12px;
+}
+
+.coordexp-managed-panel__header,
+.coordexp-managed-panel__metrics,
+.coordexp-managed-panel__local,
+.coordexp-managed-panel__batch {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.coordexp-managed-panel__header {
+  justify-content: space-between;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.coordexp-managed-panel__metrics {
+  color: var(--color-neutral-content-subtle, #52525b);
+}
+
+.coordexp-managed-panel__state,
+.coordexp-managed-panel__local span {
+  padding: 2px 6px;
+  background: var(--color-neutral-surface, #f4f4f5);
+  border-radius: 999px;
+}
+
+.coordexp-managed-panel__state--draft {
+  color: #92400e;
+  background: #fef3c7;
+}
+
+.coordexp-managed-panel__state--committed {
+  color: #166534;
+  background: #dcfce7;
+}
+
+.coordexp-managed-panel__notice,
+.coordexp-managed-panel__reminder,
+.coordexp-managed-panel__error,
+.coordexp-managed-panel__local,
+.coordexp-managed-panel__batch {
+  margin-top: 8px;
+}
+
+.coordexp-managed-panel__batch {
+  padding: 6px 8px;
+  background: var(--color-neutral-surface, #f4f4f5);
+  border-radius: 4px;
+}
+
+.coordexp-managed-panel__notice,
+.coordexp-managed-panel__reminder {
+  padding: 6px 8px;
+  color: #1e3a8a;
+  background: #dbeafe;
+  border-radius: 4px;
+}
+
+.coordexp-managed-panel__error {
+  padding: 6px 8px;
+  color: #991b1b;
+  background: #fee2e2;
+  border-radius: 4px;
+}
+
+.coordexp-managed-panel__commit {
+  width: 100%;
+  min-height: 32px;
+  margin-top: 10px;
+  color: #fff;
+  cursor: pointer;
+  background: #3b82f6;
+  border: 0;
+  border-radius: 4px;
+  font-weight: 600;
+}
+
+.coordexp-managed-panel__commit:disabled {
+  cursor: not-allowed;
+  background: #a1a1aa;
+}
+
+.coordexp-managed-panel__hint {
+  margin-top: 6px;
+  color: var(--color-neutral-content-subtle, #71717a);
+  text-align: center;
+}

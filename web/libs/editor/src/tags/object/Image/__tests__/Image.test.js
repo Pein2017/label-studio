@@ -200,15 +200,36 @@ describe("Image model", () => {
 
     it("locks AI Region edits while inference is running", () => {
       const image = createStore().annotation.image;
+      image.setAIRegionDrawEnabled(true);
       image.setAIRegionRunning(true);
 
       expect(image.aiRegionReadonly).toBe(true);
       expect(image.canEditAIRegion).toBe(false);
       expect(() => image.setAIRegion({ x: 1, y: 1, width: 2, height: 2 })).toThrow(/read-only/);
       expect(() => image.clearAIRegion()).toThrow(/read-only/);
+      expect(() => image.setAIRegionDrawEnabled(false)).toThrow(/read-only/);
 
       image.setAIRegionRunning(false);
       expect(image.canEditAIRegion).toBe(true);
+      image.setAIRegionDrawEnabled(false);
+      expect(image.aiRegionDrawEnabled).toBe(false);
+    });
+
+    it.each([
+      [true, null],
+      [false, { x: 1, y: 2, width: 3, height: 4 }],
+    ])("atomically finishes a locked AI Region with clear=%s", (clear, expectedRegion) => {
+      const image = createStore().annotation.image;
+
+      image.setAIRegion({ x: 1, y: 2, width: 3, height: 4 });
+      image.setAIRegionDrawEnabled(true);
+      image.setAIRegionRunning(true);
+      image.finishAIRegion({ clear });
+
+      expect(image.aiRegion).toEqual(expectedRegion);
+      expect(image.aiRegionDrawEnabled).toBe(false);
+      expect(image.aiRegionRunning).toBe(false);
+      expect(() => image.finishAIRegion({ clear })).toThrow(/active inference lock/);
     });
 
     it("keeps ROI, presentation, and focus state out of snapshots and history", () => {
@@ -298,6 +319,30 @@ describe("Image model", () => {
       expect(image.getRegionPresentation("runtime-1")).toEqual({ color: "#A64073", numeric_badge: null });
     });
 
+    it("switches and restores dense presentation modes without changing annotation payload", () => {
+      const annotation = createStore().annotation;
+      const image = annotation.image;
+
+      annotation.setRegionFixtures([
+        { object: image, id: "runtime-1", presentationRegionKey: "stable-1", inferencePresentation: null },
+        { object: image, id: "runtime-2", presentationRegionKey: "stable-2", inferencePresentation: null },
+      ]);
+      const imageSnapshot = getSnapshot(image);
+      const serializedResult = JSON.stringify(annotation.serialized);
+
+      image.setRegionPresentation("dim_non_selected", ["stable-1"]);
+      expect(image.regionPresentationMode).toBe("dim_non_selected");
+      expect(image.focusedRegionKeys).toEqual(["stable-1"]);
+      image.setRegionPresentation("hide_non_selected", ["stable-2"]);
+      expect(image.regionPresentationMode).toBe("hide_non_selected");
+      expect(image.focusedRegionKeys).toEqual(["stable-2"]);
+      image.restoreRegionPresentation();
+      expect(image.regionPresentationMode).toBe("show_all");
+      expect(image.focusedRegionKeys).toEqual([]);
+      expect(getSnapshot(image)).toEqual(imageSnapshot);
+      expect(JSON.stringify(annotation.serialized)).toBe(serializedResult);
+    });
+
     it("retires both aliases on deletion and restores show-all for the focused stable key", () => {
       const annotation = createStore().annotation;
       const image = annotation.image;
@@ -308,6 +353,8 @@ describe("Image model", () => {
         inferencePresentation: { color: "#005A9C", numericBadge: 9 },
       };
       annotation.setRegionFixtures([region]);
+      const imageSnapshot = getSnapshot(image);
+      const serializedResult = JSON.stringify(annotation.serialized);
       image.setInferenceRegionPresentation("runtime-1", { color: "#005A9C", numeric_badge: 9 });
       image.setRegionPresentation("hide_non_selected", ["stable-1"]);
 
@@ -319,6 +366,8 @@ describe("Image model", () => {
       expect(image.isInferenceRegionPresentationRetired("runtime-1")).toBe(true);
       expect(image.getRegionPresentation("stable-1")).toBeNull();
       expect(image.getRegionPresentation("runtime-1")).toBeNull();
+      expect(getSnapshot(image)).toEqual(imageSnapshot);
+      expect(JSON.stringify(annotation.serialized)).toBe(serializedResult);
     });
   });
 

@@ -3,7 +3,7 @@
  */
 import React from "react";
 import { render, screen, fireEvent } from "@testing-library/react";
-import ImageView, { AIRegionOverlay, splitRegions } from "../ImageView";
+import ImageView, { AIRegionOverlay, aiRegionPointFromCanvas, splitRegions } from "../ImageView";
 
 jest.mock("../../../utils/feature-flags", () => ({
   isFF: jest.fn(() => false),
@@ -194,8 +194,15 @@ function createItem(overrides = {}) {
     smoothingEnabled: true,
     naturalWidth: 400,
     aiRegion: null,
+    aiRegionDrawEnabled: false,
+    aiRegionRunning: false,
+    setAIRegion: jest.fn(),
+    setAIRegionRunning: jest.fn(),
+    setAIRegionDrawEnabled: jest.fn(),
     internalToCanvasX: (value) => value * 4,
     internalToCanvasY: (value) => value * 3,
+    canvasToInternalX: (value) => value / 4,
+    canvasToInternalY: (value) => value / 3,
     images: ["https://example.com/img.png"],
     ...overrides,
   };
@@ -255,6 +262,13 @@ describe("splitRegions", () => {
 });
 
 describe("AIRegionOverlay", () => {
+  it("maps stage coordinates into clipped percentage points", () => {
+    const item = createItem();
+
+    expect(aiRegionPointFromCanvas(item, 200, 150)).toEqual({ x: 50, y: 50 });
+    expect(aiRegionPointFromCanvas(item, 500, -20)).toEqual({ x: 100, y: 0 });
+  });
+
   it("renders one non-listening dashed ROI using current percent-to-canvas scaling", () => {
     const item = createItem({ aiRegion: { x: 10, y: 20, width: 30, height: 40 } });
     const { getByTestId } = render(<AIRegionOverlay item={item} />);
@@ -284,6 +298,33 @@ describe("ImageView", () => {
     jest.clearAllMocks();
     const { isAlive } = require("mobx-state-tree");
     isAlive.mockImplementation((x) => !!x);
+  });
+
+  it("draws, clips, and replaces one temporary ROI without native annotation events", () => {
+    const store = createStore();
+    const item = createItem({ aiRegionDrawEnabled: true });
+
+    item.store = store;
+    const { container } = render(<ImageView item={item} store={store} />);
+    const stage = container.querySelector('[data-testid="konva-stage"]');
+    const down = new MouseEvent("mousedown", { bubbles: true, button: 0 });
+
+    Object.defineProperty(down, "offsetX", { value: 40 });
+    Object.defineProperty(down, "offsetY", { value: 30 });
+    stage.dispatchEvent(down);
+    const move = new MouseEvent("mousemove", { bubbles: true, buttons: 1 });
+
+    Object.defineProperty(move, "offsetX", { value: 200 });
+    Object.defineProperty(move, "offsetY", { value: 150 });
+    stage.dispatchEvent(move);
+    const up = new MouseEvent("mouseup", { bubbles: true, button: 0 });
+
+    Object.defineProperty(up, "offsetX", { value: 200 });
+    Object.defineProperty(up, "offsetY", { value: 150 });
+    stage.dispatchEvent(up);
+
+    expect(item.setAIRegion).toHaveBeenLastCalledWith({ x: 10, y: 10, width: 40, height: 40 });
+    expect(item.event).not.toHaveBeenCalled();
   });
 
   it("places the AI Region after annotation layers and before selection handles", () => {
