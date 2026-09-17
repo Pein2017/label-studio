@@ -65,6 +65,7 @@ class ServeCommandTest(SimpleTestCase):
             'organization_id': 9,
             'chunk_size': 123,
             'roi_launch_config': Path('/operator/roi-launch.json'),
+            'auto_login': False,
         }
         values.update(updates)
         return values
@@ -136,10 +137,11 @@ class ServeCommandTest(SimpleTestCase):
             patch.object(serve_coordexp_refinement, 'call_command') as runserver,
         ):
             with self.assertRaisesRegex(CommandError, 'loopback bind'):
-                command.handle(**self.options())
+                command.handle(**self.options(auto_login=True))
 
         runserver.assert_not_called()
         self.assertEqual(FakeFactory.service.closes, 1)
+        self.assertNotIn(serve_coordexp_refinement.AUTO_LOGIN_ENV, serve_coordexp_refinement.os.environ)
 
     def test_runserver_exception_still_closes_runtime(self) -> None:
         command = serve_coordexp_refinement.Command()
@@ -190,3 +192,17 @@ class ServeCommandTest(SimpleTestCase):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(CommandError, 'overrides are not supported'):
                     command.handle(**self.options(port=value))
+
+    def test_auto_login_is_enabled_only_for_the_loopback_server(self) -> None:
+        command = serve_coordexp_refinement.Command()
+        user_patch, org_patch, factory_patch = self.patches()
+        with (
+            user_patch,
+            org_patch,
+            factory_patch,
+            patch.object(serve_coordexp_refinement, 'call_command') as runserver,
+        ):
+            command.handle(**self.options(auto_login=True))
+
+        runserver.assert_called_once()
+        self.assertNotIn(serve_coordexp_refinement.AUTO_LOGIN_ENV, serve_coordexp_refinement.os.environ)

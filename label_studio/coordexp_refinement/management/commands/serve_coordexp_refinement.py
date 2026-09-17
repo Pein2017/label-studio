@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 from pathlib import Path
 
+from django.conf import settings
 from coordexp_refinement.runtime_factory import (
     ProductionRuntimeFactory,
     RuntimeFactoryError,
@@ -13,6 +15,9 @@ from django.contrib.auth import get_user_model
 from django.core.management import call_command
 from django.core.management.base import BaseCommand, CommandError
 from organizations.models import Organization
+
+AUTO_LOGIN_ENV = 'COORDEXP_AUTO_LOGIN_USER_ID'
+AUTO_LOGIN_MIDDLEWARE = 'coordexp_refinement.middleware.CoordExpAutoLoginMiddleware'
 
 
 class Command(BaseCommand):
@@ -24,11 +29,18 @@ class Command(BaseCommand):
         parser.add_argument('--organization-id', required=True, type=int)
         parser.add_argument('--roi-launch-config', required=True, type=Path)
         parser.add_argument('--chunk-size', type=int, default=500)
+        parser.add_argument(
+            '--auto-login',
+            action='store_true',
+            help='Automatically authenticate the operator for this loopback-only refinement service.',
+        )
 
     def handle(self, *args, **options):
         if 'host' in options or 'port' in options:
             raise CommandError('host/port overrides are not supported; use --roi-launch-config')
         service = None
+        previous_auto_login = os.environ.get(AUTO_LOGIN_ENV)
+        auto_login_middleware_added = False
         try:
             user = get_user_model().objects.get(pk=options['operator_user_id'])
             organization = Organization.objects.get(pk=options['organization_id'])
@@ -43,6 +55,13 @@ class Command(BaseCommand):
             bind = service.roi_manager.config.bind
             host, port = bind.host, bind.port
             addrport, use_ipv6 = _django_runserver_bind(host, port)
+            if options.get('auto_login'):
+                os.environ[AUTO_LOGIN_ENV] = str(user.pk)
+                if AUTO_LOGIN_MIDDLEWARE not in settings.MIDDLEWARE:
+                    settings.MIDDLEWARE.append(AUTO_LOGIN_MIDDLEWARE)
+                    auto_login_middleware_added = True
+            else:
+                os.environ.pop(AUTO_LOGIN_ENV, None)
             self.stdout.write(self.style.SUCCESS(f'CoordExp refinement runtime serving on http://{addrport}'))
             call_command(
                 'runserver',
@@ -57,6 +76,12 @@ class Command(BaseCommand):
         except (RuntimeFactoryError, ValueError, TypeError) as exc:
             raise CommandError(str(exc)) from exc
         finally:
+            if previous_auto_login is None:
+                os.environ.pop(AUTO_LOGIN_ENV, None)
+            else:
+                os.environ[AUTO_LOGIN_ENV] = previous_auto_login
+            if auto_login_middleware_added:
+                settings.MIDDLEWARE.remove(AUTO_LOGIN_MIDDLEWARE)
             if service is not None:
                 service.close()
 
