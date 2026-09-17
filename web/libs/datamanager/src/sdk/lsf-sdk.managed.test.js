@@ -231,6 +231,12 @@ beforeEach(() => {
 });
 
 describe("managed project detection", () => {
+  it("passes the Data Manager project identity into the editor", () => {
+    const { project } = makeHarness();
+
+    expect(FakeLabelStudio.settings.project).toBe(project);
+  });
+
   it("uses only the exact project description prefix", () => {
     const managed = makeHarness();
     const ordinary = makeHarness({ managed: false });
