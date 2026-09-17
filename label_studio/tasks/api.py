@@ -2,6 +2,7 @@
 
 import logging
 
+from coordexp_refinement.gt_export import GTExportError, export_project_gt
 from coordexp_refinement.guards import (
     ManagedAnnotationWriteGuardMixin,
     reject_managed_annotation_entity_write,
@@ -71,6 +72,12 @@ class _ManagedDraftTransitionUnavailable(APIException):
     status_code = 503
     default_detail = 'Managed Draft finalization is temporarily unavailable.'
     default_code = 'coordexp_draft_finalization_unavailable'
+
+
+class _CoordExpGTExportUnavailable(APIException):
+    status_code = 503
+    default_detail = 'The current refinement annotations could not be published as GT.'
+    default_code = 'coordexp_gt_export_unavailable'
 
 
 # TODO: fix after switch to api/tasks from api/dm/tasks
@@ -743,6 +750,11 @@ class AnnotationAPI(
 
         task.update_is_labeled()
         task.save(update_fields=['updated_at'])  # refresh task metrics
+        try:
+            export_project_gt(task.project_id)
+        except GTExportError as exc:
+            logger.exception('CoordExp GT export failed for project_id=%s', task.project_id)
+            raise _CoordExpGTExportUnavailable() from exc
         return result
 
     def get(self, request, *args, **kwargs):
