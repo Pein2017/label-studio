@@ -336,6 +336,9 @@ export class LSFWrapper {
       queueTotal,
       queuePosition,
       commentClassificationConfig,
+      // Keep the editor's project identity aligned with the Data Manager.
+      // The refinement editor uses it to disable legacy project-specific UI.
+      project: this.datamanager.store.project,
 
       /* EVENTS */
       onSubmitDraft: this.onSubmitDraft,
