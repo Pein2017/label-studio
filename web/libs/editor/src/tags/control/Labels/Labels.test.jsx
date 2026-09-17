@@ -25,6 +25,7 @@ import "../../object/Image";
 import "../../visual/View";
 import "../RectangleLabels";
 import AppStore from "../../../stores/AppStore";
+import ToolsManager from "../../../tools/Manager";
 
 import {
   COCO80_CANONICAL_NAMES,
@@ -33,6 +34,7 @@ import {
   isManagedCoco80StaticConfig,
   managedTaskIdentity,
   normalizeClassSearchText,
+  sortLabelsByUsage,
   searchCanonicalCoco80,
 } from "./Labels";
 
@@ -186,6 +188,45 @@ const managedItem = ({ taskData = managedTaskData(), item = {}, onToggle } = {})
 };
 
 describe("managed COCO-80 class search policy", () => {
+  it("orders refinement labels by usage while preserving tied and zero-count source order", () => {
+    const labels = [
+      { value: "person" },
+      { value: "car" },
+      { value: "dog", visible: false },
+      { value: "cat" },
+      { value: "bus" },
+    ];
+    const sourceOrder = [...labels];
+
+    expect(sortLabelsByUsage(labels, [2, 5, 0, 5, 0]).map((label) => label.value)).toEqual([
+      "car",
+      "cat",
+      "person",
+      "dog",
+      "bus",
+    ]);
+    expect(labels).toEqual(sourceOrder);
+  });
+
+  it("renders draw-over labels in usage order without changing the model children", () => {
+    const labels = [
+      { type: "label", value: "person", usedAlready: () => 1 },
+      { type: "label", value: "car", usedAlready: () => 3 },
+      { type: "label", value: "dog", usedAlready: () => 0 },
+    ];
+    const item = managedItem({ item: { children: labels } });
+    const renderItemSpy = jest.spyOn(Tree, "renderItem").mockImplementation((label) => label.value);
+    const managerSpy = jest.spyOn(ToolsManager, "getInstance").mockReturnValue({ obj: { drawover: true } });
+
+    render(<HtxLabels item={item} />);
+
+    expect(renderItemSpy.mock.calls.map(([label]) => label.value)).toEqual(["car", "person", "dog"]);
+    expect(item.children).toEqual(labels);
+
+    renderItemSpy.mockRestore();
+    managerSpy.mockRestore();
+  });
+
   it("freezes the official canonical order and matches the parent golden rankings", () => {
     expect(COCO80_CANONICAL_NAMES).toHaveLength(80);
     expect(createHash("sha256").update(JSON.stringify(COCO80_CANONICAL_NAMES)).digest("hex")).toBe(

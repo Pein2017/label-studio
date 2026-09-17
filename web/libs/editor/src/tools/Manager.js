@@ -69,6 +69,8 @@ class ToolsManager {
   }
 
   get obj() {
+    if (!root?.annotationStore) return undefined;
+
     if (ff.isActive(FF_DEV_3391)) {
       return root.annotationStore.selected?.names.get(this.name);
     }
@@ -123,6 +125,16 @@ class ToolsManager {
   }
 
   selectTool(tool, selected, isInitial = false) {
+    const managedObject = this.obj;
+    const editOnly = managedObject?.drawover === true && managedObject?.interactionMode === "edit";
+
+    if (editOnly && tool?.isDrawingTool) {
+      const moveTool = this.allTools().find((candidate) => candidate.fullName === "MoveTool");
+
+      if (moveTool && moveTool !== tool) return this.selectTool(moveTool, true, isInitial);
+      return;
+    }
+
     const currentTool = this.findSelectedTool();
     const newSelection = tool?.group;
 

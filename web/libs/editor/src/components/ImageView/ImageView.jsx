@@ -9,10 +9,12 @@ import ObjectTag from "../../components/Tags/Object";
 import Tree from "../../core/Tree";
 import styles from "./ImageView.module.css";
 import { errorBuilder } from "../../core/DataValidator/ConfigValidator";
-import { chunks, findClosestParent } from "../../utils/utilities";
+import { chunks, findClosestParent, isMacOS } from "../../utils/utilities";
 import Konva from "konva";
 import { LoadingOutlined } from "@ant-design/icons";
 import { Toolbar } from "../Toolbar/Toolbar";
+import { Tool } from "../Toolbar/Tool";
+import { ToolbarProvider } from "../Toolbar/ToolbarContext";
 import { ImageViewProvider } from "./ImageViewContext";
 import { Hotkey } from "../../core/Hotkey";
 import { useObserver } from "mobx-react";
@@ -25,6 +27,8 @@ import { Pagination } from "../../common/Pagination/Pagination";
 import { Image } from "./Image";
 import { CoordExpAIRegionMount } from "../CoordExpAIRegion";
 import { roiFromDrag } from "../CoordExpAIRegion/controller";
+import { IconBoundingBox, IconMoveTool } from "@humansignal/icons";
+import { cn } from "../../utils/bem";
 
 Konva.showWarnings = false;
 
@@ -246,17 +250,54 @@ const isDrawOverExisting = (item) => {
   if (item.drawover !== true) return false;
   const selectedTool = item.getToolsManager().findSelectedTool();
 
-  return selectedTool?.isDrawingTool === true && selectedTool?.isDrawing !== true;
+  return item.interactionMode !== "edit" && selectedTool?.isDrawingTool === true && selectedTool?.isDrawing !== true;
 };
+
+const isRefinementAnnotationMode = (item) => item.drawover === true && item.interactionMode !== "edit";
+
+const refinementModeShortcut = (key) => (isMacOS() ? `⌘${key}` : `Ctrl+${key}`);
+
+const InteractionModeToolbar = observer(({ item }) => {
+  if (item.drawover !== true) return null;
+
+  return (
+    <ToolbarProvider value={{ expanded: false, alignment: "right" }}>
+      <div
+        className={cn("toolbar").mod({ alignment: "right" }).toClassName()}
+        role="group"
+        aria-label="Interaction mode"
+        data-testid="interaction-mode-toolbar"
+      >
+        <div className={cn("toolbar").elem("group").toClassName()}>
+          <Tool
+            ariaLabel="annotation-mode"
+            active={item.interactionMode !== "edit"}
+            icon={<IconBoundingBox />}
+            label={`标注 (${refinementModeShortcut(2)})`}
+            onClick={() => item.setInteractionMode("annotate")}
+          />
+          <Tool
+            ariaLabel="edit-mode"
+            active={item.interactionMode === "edit"}
+            icon={<IconMoveTool />}
+            label={`修改 (${refinementModeShortcut(1)})`}
+            onClick={() => item.setInteractionMode("edit")}
+          />
+        </div>
+      </div>
+    </ToolbarProvider>
+  );
+});
 
 const TransformerBack = observer(({ item }) => {
   const { selectedRegionsBBox } = item;
   const singleNodeMode = item.selectedRegions.length === 1;
   const dragStartPointRef = useRef({ x: 0, y: 0 });
   const drawOverExisting = isDrawOverExisting(item);
+  const annotationMode = isRefinementAnnotationMode(item);
 
   return (
-    <Layer listening={!drawOverExisting}>
+    <Layer listening={!annotationMode && !drawOverExisting}>
       {selectedRegionsBBox && !singleNodeMode && (
         <Rect
           id={TRANSFORMER_BACK_ID}
@@ -338,6 +379,7 @@ const SelectionLayer = observer(({ item, selectionArea }) => {
   const [shift, setShift] = useState(false);
   const isPanTool = item.getToolsManager().findSelectedTool()?.fullName === "ZoomPanTool";
   const drawOverExisting = isDrawOverExisting(item);
+  const annotationMode = isRefinementAnnotationMode(item);
 
   const dragHandler = (e) => setIsMouseWheelClick(e.buttons === 4);
 
@@ -374,7 +416,7 @@ const SelectionLayer = observer(({ item, selectionArea }) => {
       ((item.useTransformer || item.selectedShape?.preferTransformer) && item.selectedShape?.useTransformer));
 
   return (
-    <Layer scaleX={scale} scaleY={scale} listening={!drawOverExisting}>
+    <Layer scaleX={scale} scaleY={scale} listening={!annotationMode && !drawOverExisting}>
       {selectionArea.isActive ? (
         <SelectionRect item={selectionArea} />
       ) : !supportsTransform && item.selectedRegions.length > 1 ? (
@@ -618,6 +660,9 @@ export default observer(
       const hasSelected = item.selectedRegions.some((r) => r.type.match(allowedHoverTypes) !== null);
       const tool = item.getToolsManager().findSelectedTool();
       const isAllowedTool = tool?.toolName?.match?.(allowedHoverTypes) !== null ?? false;
+      const annotationMode = isRefinementAnnotationMode(item);
+
+      if (annotationMode && !tool?.isDrawingTool && tool?.fullName !== "ZoomPanTool") return;
 
       const hoveredRegion = item.regs.find((reg) => {
         if (reg.selected || tool?.mode === "drawing") return false;
@@ -679,6 +724,7 @@ export default observer(
       const selectedTool = item.getToolsManager().findSelectedTool();
       const isPanTool = selectedTool?.fullName === "ZoomPanTool";
       const isMoveTool = selectedTool?.fullName === "MoveTool";
+      const annotationMode = isRefinementAnnotationMode(item);
       const drawOverExisting = isDrawOverExisting(item);
 
       this.skipNextMouseDown = this.skipNextMouseUp = this.skipNextClick = false;
@@ -691,6 +737,7 @@ export default observer(
       const p = e.target.getParent();
 
       if (item.annotation.isReadOnly() && !isPanTool) return;
+      if (annotationMode && !selectedTool?.isDrawingTool && !isPanTool) return true;
       if (p && p.className === "Transformer") return;
 
       const handleMouseDown = () => {
@@ -1120,7 +1167,12 @@ export default observer(
 
       const tools = item.getToolsManager().allTools();
 
-      return <Toolbar tools={tools} />;
+      return (
+        <>
+          <Toolbar tools={tools} />
+          <InteractionModeToolbar item={item} />
+        </>
+      );
     }
 
     render() {

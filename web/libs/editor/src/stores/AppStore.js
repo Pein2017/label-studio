@@ -475,6 +475,25 @@ export default types
         });
       }
 
+      const setActiveRefinementMode = (mode) => {
+        const annotation = self.annotationStore.selected;
+        if (!annotation) return;
+
+        const image = ToolsManager.allInstances()
+          .map((manager) => manager.obj)
+          .find(
+            (object) =>
+              object?.annotation === annotation &&
+              object?.drawover === true &&
+              typeof object.setInteractionMode === "function",
+          );
+
+        image?.setInteractionMode(mode);
+      };
+
+      hotkeys.addNamed("image:mode-edit", () => setActiveRefinementMode("edit"));
+      hotkeys.addNamed("image:mode-annotate", () => setActiveRefinementMode("annotate"));
+
       /**
        * Hotkey for delete
        */

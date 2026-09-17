@@ -79,6 +79,18 @@ jest.mock("../../Toolbar/Toolbar", () => ({
   Toolbar: () => <div data-testid="toolbar">Toolbar</div>,
 }));
 
+jest.mock("../../Toolbar/Tool", () => ({
+  Tool: ({ ariaLabel, active, label, onClick }) => (
+    <button type="button" aria-label={ariaLabel} data-active={active} onClick={onClick}>
+      {label}
+    </button>
+  ),
+}));
+
+jest.mock("../../Toolbar/ToolbarContext", () => ({
+  ToolbarProvider: ({ children }) => children,
+}));
+
 jest.mock("../Image", () => ({
   __esModule: true,
   Image: () => <div data-testid="image">Image</div>,
@@ -295,6 +307,25 @@ describe("AIRegionOverlay", () => {
 });
 
 describe("ImageView", () => {
+  it("shows explicit refinement modes only for draw-over images", () => {
+    const setInteractionMode = jest.fn();
+    const refinementItem = createItem({ drawover: true, interactionMode: "annotate", setInteractionMode });
+    const refinementStore = createStore();
+    refinementItem.store = refinementStore;
+    const { rerender } = render(<ImageView item={refinementItem} store={refinementStore} />);
+
+    expect(screen.getByTestId("interaction-mode-toolbar")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "annotation-mode" })).toHaveAttribute("data-active", "true");
+    fireEvent.click(screen.getByRole("button", { name: "edit-mode" }));
+    expect(setInteractionMode).toHaveBeenCalledWith("edit");
+
+    const regularItem = createItem();
+    const regularStore = createStore();
+    regularItem.store = regularStore;
+    rerender(<ImageView item={regularItem} store={regularStore} />);
+    expect(screen.queryByTestId("interaction-mode-toolbar")).not.toBeInTheDocument();
+  });
+
   beforeEach(() => {
     jest.clearAllMocks();
     const { isAlive } = require("mobx-state-tree");

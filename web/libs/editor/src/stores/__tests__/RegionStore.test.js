@@ -109,6 +109,39 @@ function createStoreWithOneRectRegionViaInit() {
   return { store, annotation: ann, env };
 }
 
+function createStoreWithRectRegions({ drawOver = false, scores = [3, 1, 2] } = {}) {
+  const env = createTestEnv();
+  const task = {
+    id: 1,
+    data: JSON.stringify({ img: "https://example.com/img.jpg" }),
+  };
+  const config = `<View><Image name="img" value="$img" drawOver="${drawOver}" /><Rectangle name="rect" toName="img" /></View>`;
+  const store = AppStore.create(
+    {
+      config,
+      task,
+      interfaces: ["basic"],
+    },
+    env,
+  );
+  store.initializeStore({
+    annotations: [
+      {
+        result: scores.map((score, index) => ({
+          id: `region-${index}`,
+          from_name: "rect",
+          to_name: "img",
+          type: "rectangle",
+          score,
+          value: { x: index * 10, y: 0, width: 20, height: 20 },
+        })),
+      },
+    ],
+  });
+  const ann = store.annotationStore.selected;
+  return { store, annotation: ann, env };
+}
+
 describe("RegionStore", () => {
   beforeEach(() => {
     const storage = {};
@@ -622,6 +655,66 @@ describe("RegionStore", () => {
       annotation.regionStore.clearSelection();
       expect(annotation.regionStore.selection.size).toBe(0);
       expect(annotation.regionStore.hasSelection).toBe(false);
+    });
+  });
+
+  describe("drawOver recent edit order", () => {
+    it("preserves date order until edits, then re-pushes A after B", () => {
+      const { annotation } = createStoreWithRectRegions({ drawOver: true });
+      const [a, b, c] = annotation.regionStore.regions;
+
+      expect(annotation.regionStore.sortedRegions).toEqual([a, b, c]);
+      annotation.regionStore.markRecentEdit(b);
+      expect(annotation.regionStore.sortedRegions).toEqual([b, a, c]);
+      annotation.regionStore.markRecentEdit(a);
+      expect(annotation.regionStore.sortedRegions).toEqual([a, b, c]);
+    });
+
+    it("puts a newly committed region at the top", () => {
+      const { annotation } = createStoreWithRectRegions({ drawOver: true });
+      annotation.deserializeResults([
+        {
+          id: "new-region",
+          from_name: "rect",
+          to_name: "img",
+          type: "rectangle",
+          value: { x: 40, y: 0, width: 20, height: 20 },
+        },
+      ]);
+      const newRegion = annotation.regionStore.regions.find((region) => region.cleanId === "new-region");
+
+      newRegion.notifyDrawingFinished();
+      expect(annotation.regionStore.sortedRegions[0]).toBe(newRegion);
+    });
+
+    it("does not reorder for non-edit actions", () => {
+      const { annotation } = createStoreWithRectRegions({ drawOver: true });
+      const [, b] = annotation.regionStore.regions;
+      annotation.regionStore.markRecentEdit(b);
+      const order = annotation.regionStore.sortedRegions;
+
+      b.toggleHidden();
+      b.setLocked(true);
+      b.setHighlight(true);
+
+      expect(annotation.regionStore.sortedRegions).toEqual(order);
+    });
+
+    it("lets explicit score sorting win", () => {
+      const { annotation } = createStoreWithRectRegions({ drawOver: true });
+      const [a, b, c] = annotation.regionStore.regions;
+      annotation.regionStore.markRecentEdit(a);
+      annotation.regionStore.setSort("score");
+
+      expect(annotation.regionStore.sortedRegions).toEqual([b, c, a]);
+    });
+
+    it("leaves ordinary non-drawOver projects unchanged", () => {
+      const { annotation } = createStoreWithRectRegions();
+      const [a, b, c] = annotation.regionStore.regions;
+
+      annotation.regionStore.markRecentEdit(b);
+      expect(annotation.regionStore.sortedRegions).toEqual([a, b, c]);
     });
   });
 });

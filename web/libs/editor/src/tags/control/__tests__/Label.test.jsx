@@ -13,6 +13,7 @@ import "../Labels/Labels";
 import { HtxLabelView, LabelModel } from "../Label";
 
 const mockAddErrors = jest.fn();
+let mockManagedImage = null;
 const mockRegions = [{ hasLabel: (v) => v === "A" }, { hasLabel: (v) => v === "B" }];
 const mockRegionStore = { regions: mockRegions };
 const mockAnnotation = {
@@ -59,6 +60,7 @@ jest.mock("../../../tools/Manager", () => ({
   __esModule: true,
   default: {
     getInstance: jest.fn(() => ({
+      obj: mockManagedImage,
       findSelectedTool: jest.fn(() => null),
       selectTool: jest.fn(),
     })),
@@ -83,6 +85,7 @@ function createLabelNode(storeRef = { task: { dataObj: { text: "Hello" } } }) {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  mockManagedImage = null;
   window.STORE_INIT_OK = true;
 });
 afterEach(() => {
@@ -247,6 +250,18 @@ describe("Label model", () => {
     expect(label.selected).toBe(true);
     mockAnnotation.selectedRegions = [];
     mockAnnotation.selectedDrawingRegions = [];
+  });
+
+  it("does not activate a new label in edit mode without a selected region", () => {
+    mockManagedImage = { drawover: true, interactionMode: "edit" };
+    mockAnnotation.selectedRegions = [];
+    mockAnnotation.selectedDrawingRegions = [];
+    const label = createLabelNode();
+
+    label.toggleSelected();
+
+    expect(label.selected).toBe(false);
+    mockManagedImage = null;
   });
 
   it("toggleSelected in multiple choice mode toggles only this label", () => {

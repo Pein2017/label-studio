@@ -16,6 +16,8 @@ const localStorageKeys = {
   view: "regionstore:view",
 };
 
+const supportsRecentEditOrder = (region) => region?.object?.drawover === true && region?.isRealRegion !== false;
+
 const SelectionMap = types
   .model({
     selected: types.optional(types.map(types.safeReference(AllRegionsType)), {}),
@@ -157,6 +159,10 @@ export default types
     ),
     selection: types.optional(SelectionMap, {}),
   })
+  .volatile(() => ({
+    recentEditSequence: 0,
+    recentEditOrder: {},
+  }))
   .views((self) => {
     let lastClickedItem;
     const getShiftClickSelectedRange = (item, tree) => {
@@ -254,7 +260,13 @@ export default types
 
         const sorted = sorts[self.sort](self.sortOrder === "desc");
 
-        return sorted;
+        if (self.sort !== "date" || !self.filteredRegions.some(supportsRecentEditOrder)) return sorted;
+
+        return sorted.sort(
+          (a, b) =>
+            (supportsRecentEditOrder(b) ? (self.recentEditOrder[b.id] ?? 0) : 0) -
+            (supportsRecentEditOrder(a) ? (self.recentEditOrder[a.id] ?? 0) : 0),
+        );
       },
 
       get regionIndexMap() {
@@ -468,6 +480,13 @@ export default types
     addRegion(region) {
       self.regions.push(region);
       getEnv(self).events.invoke("entityCreate", region);
+    },
+
+    markRecentEdit(region) {
+      if (!supportsRecentEditOrder(region)) return;
+
+      self.recentEditSequence += 1;
+      self.recentEditOrder = { ...self.recentEditOrder, [region.id]: self.recentEditSequence };
     },
 
     toggleSortOrder() {

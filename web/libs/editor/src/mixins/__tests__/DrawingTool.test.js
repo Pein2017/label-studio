@@ -363,6 +363,19 @@ describe("DrawingTool mixin", () => {
   });
 
   describe("finishDrawing and commitDrawingRegion", () => {
+    it("keeps the active label selected for the next refinement region", () => {
+      const { tool, obj } = createStore();
+      const activeLabel = { selected: true };
+      obj.activeStates.mockReturnValue([activeLabel]);
+      mockDrawingRegion.setValue = jest.fn();
+
+      tool.startDrawing(0, 0);
+      tool.finishDrawing();
+
+      expect(activeLabel.selected).toBe(true);
+      expect(obj.activeStates).toHaveBeenCalled();
+    });
+
     it("finishDrawing commits and resets when beforeCommitDrawing returns true", () => {
       const { tool, annotation } = createStore();
       tool.startDrawing(0, 0);

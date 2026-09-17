@@ -12,6 +12,7 @@ import { AnnotationMixin } from "../../../mixins/AnnotationMixin";
 import DynamicChildrenMixin from "../../../mixins/DynamicChildrenMixin";
 import LabelMixin from "../../../mixins/LabelMixin";
 import SelectedModelMixin from "../../../mixins/SelectedModel";
+import ToolsManager from "../../../tools/Manager";
 import { cn } from "../../../utils/bem";
 import ControlBase from "../Base";
 import "../Label";
@@ -132,6 +133,21 @@ const MANAGED_RECTANGLE_LABELS_ATTRIBUTES = Object.freeze({
   toName: "image",
   canRotate: "false",
 });
+
+/**
+ * Return a presentation-only copy. The model children stay in configuration
+ * order so hotkeys, exports, and serialization keep their existing identity.
+ */
+const sortLabelsByUsage = (labels, usageCounts = []) => {
+  return labels
+    .map((label, index) => ({
+      label,
+      index,
+      count: Number.isFinite(Number(usageCounts[index])) ? Number(usageCounts[index]) : 0,
+    }))
+    .sort((left, right) => right.count - left.count || left.index - right.index)
+    .map(({ label }) => label);
+};
 
 let lastManagedConfigXml = null;
 let lastManagedConfigResult = false;
@@ -666,11 +682,28 @@ const HtxLabels = observer(({ item }) => {
   const taskData = taskDataForControl(item);
   const taskIdentity = managedTaskIdentity(taskData);
   const showCocoSearch = taskIdentity && isManagedCoco80Control(item, taskData);
+  const image = ToolsManager.getInstance({ name: item.toname })?.obj;
+  const sortableRefinementLabels =
+    image?.drawover === true && Array.isArray(item.children) && item.children.every((child) => child?.type === "label");
+  const children = sortableRefinementLabels
+    ? sortLabelsByUsage(
+        item.children,
+        item.children.map((label) => {
+          try {
+            return label.usedAlready?.() ?? 0;
+          } catch {
+            return 0;
+          }
+        }),
+      )
+    : null;
 
   return (
     <div className={cn("labels").mod({ hidden: !item.visible, inline: item.showinline }).toClassName()}>
       {showCocoSearch && <ManagedCocoClassSearch key={taskIdentity} labels={item.children} />}
-      {Tree.renderChildren(item, item.annotation)}
+      {children
+        ? children.map((child) => Tree.renderItem(child, item.annotation))
+        : Tree.renderChildren(item, item.annotation)}
     </div>
   );
 });
@@ -686,5 +719,6 @@ export {
   isManagedCoco80StaticConfig,
   managedTaskIdentity,
   normalizeClassSearchText,
+  sortLabelsByUsage,
   searchCanonicalCoco80,
 };

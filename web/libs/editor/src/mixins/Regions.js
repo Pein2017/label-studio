@@ -285,6 +285,8 @@ const RegionsMixin = types
       notifyDrawingFinished({ destroy = false } = {}) {
         self.updateOriginOnEdit();
 
+        if (!destroy) self.annotation?.regionStore.markRecentEdit?.(self);
+
         // everything below is related to dynamic preannotations
         if (!self.shouldNotifyDrawingFinished) return;
 

@@ -123,6 +123,9 @@ const Model = types
      * Select label
      */
     toggleSelected() {
+      const labels = self.parent;
+      const manager = ToolsManager.getInstance({ name: labels.toname });
+      const image = manager?.obj;
       let sameObjectSelectedRegions = [];
 
       // here we check if you click on label from labels group
@@ -143,6 +146,10 @@ const Model = types
         });
       }
 
+      const editOnly = image?.drawover === true && image?.interactionMode === "edit";
+
+      if (editOnly && sameObjectSelectedRegions.length === 0) return;
+
       const affectedRegions = sameObjectSelectedRegions.filter((region) => {
         return !region.isReadOnly();
       });
@@ -161,8 +168,6 @@ const Model = types
         InfoModal.warning(`You can't use ${self.value} more than ${self.maxUsages} time(s)`);
         return;
       }
-
-      const labels = self.parent;
 
       // check if there is a region selected and if it is and user
       // is changing the label we need to make sure that region is
@@ -195,9 +200,8 @@ const Model = types
       if (sameObjectSelectedRegions.length > 0 && applicableRegions.length === 0) return;
 
       // if we are going to select label and it would be the first in this labels group
-      if (!labels.selectedLabels.length && !self.selected) {
+      if (!editOnly && !labels.selectedLabels.length && !self.selected) {
         // unselect other tools if they exist and selected
-        const manager = ToolsManager.getInstance({ name: self.parent.toname });
         const tool = Object.values(self.parent?.tools || {})[0];
 
         const selectedTool = manager.findSelectedTool();

@@ -367,6 +367,25 @@ describe("OutlinerTree", () => {
     expect(selectArea).toHaveBeenCalledWith(items[0]);
   });
 
+  it("onSelect ignores region rows in refinement annotation mode", async () => {
+    const selectArea = jest.fn();
+    const items = [
+      {
+        ...defaultItem,
+        annotation: { selectArea, regionStore: {} },
+        object: { drawover: true, interactionMode: "annotate" },
+      },
+    ];
+    const regions = createMockRegions({}, items);
+    const { container } = render(<OutlinerTree regions={regions} footer={null} />);
+
+    await waitFor(() => {
+      expect(container.querySelector(".dm-tree-node-content-wrapper")).toBeInTheDocument();
+    });
+    fireEvent.click(container.querySelector(".dm-tree-node-content-wrapper")!, { bubbles: true });
+    expect(selectArea).not.toHaveBeenCalled();
+  });
+
   it("onSelect unselects when clicking selected node", async () => {
     const unselectAll = jest.fn();
     const items = [

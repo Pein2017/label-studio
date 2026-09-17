@@ -275,6 +275,30 @@ describe("ToolsManager", () => {
   });
 
   describe("selectTool", () => {
+    it("keeps edit-only refinement images on MoveTool", () => {
+      const moveTool = { fullName: "MoveTool", setSelected: jest.fn(), group: "control" };
+      const drawingTool = {
+        fullName: "RectangleTool",
+        isDrawingTool: true,
+        setSelected: jest.fn(),
+        group: "segmentation",
+      };
+      ToolsManager.setRoot({
+        annotationStore: {
+          names: new Map([["sel", { drawover: true, interactionMode: "edit" }]]),
+          selected: null,
+        },
+      });
+      const m = ToolsManager.getInstance({ name: "sel" });
+      m.tools["k#move"] = moveTool;
+      m.tools["k#draw"] = drawingTool;
+
+      m.selectTool(drawingTool, true);
+
+      expect(drawingTool.setSelected).not.toHaveBeenCalled();
+      expect(moveTool.setSelected).toHaveBeenCalledWith(true, false);
+    });
+
     it("when selected=true calls unselectAll and tool.setSelected(true, isInitial)", () => {
       const m = ToolsManager.getInstance({ name: "sel" });
       const tool = { setSelected: jest.fn(), group: "default" };

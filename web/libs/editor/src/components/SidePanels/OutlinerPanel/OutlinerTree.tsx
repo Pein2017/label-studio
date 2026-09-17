@@ -256,6 +256,9 @@ const useEventHandlers = () => {
     if (!self?.annotation) return;
 
     const annotation = self.annotation;
+    const annotationMode = self.object?.drawover === true && self.object?.interactionMode !== "edit";
+
+    if (annotationMode) return;
 
     if (multi) {
       annotation.toggleRegionSelection(self);

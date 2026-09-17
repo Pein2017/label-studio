@@ -219,6 +219,7 @@ const Model = types
   })
   .volatile(() => ({
     currentImage: undefined,
+    interactionMode: "annotate",
     supportSuggestions: true,
     aiRegion: null,
     aiRegionRunning: false,
@@ -1296,6 +1297,23 @@ const Model = types
      */
     setMode(mode) {
       self.mode = mode;
+    },
+
+    setInteractionMode(mode) {
+      if (mode !== "annotate" && mode !== "edit") return;
+
+      self.interactionMode = mode;
+      self.annotation?.unselectAll?.();
+      self.activeStates()?.forEach((state) => state.unselectAll?.());
+
+      const manager = self.getToolsManager();
+      if (mode === "edit") {
+        const moveTool = manager.allTools().find((tool) => tool.fullName === "MoveTool");
+
+        if (moveTool) manager.selectTool(moveTool, true);
+      } else if (manager.findSelectedTool()?.fullName === "MoveTool") {
+        manager.unselectAll?.();
+      }
     },
 
     setImageRef(ref) {

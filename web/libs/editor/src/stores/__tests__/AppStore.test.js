@@ -18,6 +18,7 @@ jest.mock("../../core/Hotkey", () => {
     unbindAll: jest.fn(),
     addNamed: jest.fn(),
   };
+  globalThis.__appStoreMockHotkey = mockHotkey;
   const HotkeyFn = () => mockHotkey;
   HotkeyFn.setScope = jest.fn();
   HotkeyFn.DEFAULT_SCOPE = "default";
@@ -28,6 +29,8 @@ jest.mock("../../core/Hotkey", () => {
     unbindAll: jest.fn(),
   };
 });
+
+const getMockHotkey = () => globalThis.__appStoreMockHotkey;
 
 jest.mock("../../tools/Manager", () => ({
   __esModule: true,
@@ -54,6 +57,7 @@ import "../../tags/visual/View";
 import "../../tags/object/RichText";
 import Tree from "../../core/Tree";
 import Registry from "../../core/Registry";
+import ToolsManager from "../../tools/Manager";
 import AppStore from "../AppStore";
 
 const MINIMAL_CONFIG = `<View><Text name="t1" value="$text" /></View>`;
@@ -91,10 +95,13 @@ function createStore(snapshot = {}, envOverrides) {
 describe("AppStore", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    getMockHotkey()?.addNamed.mockClear();
+    getMockHotkey()?.unbindAll.mockClear();
     mockHasEvent.mockReturnValue(false);
     localStorage.setItem("autoAnnotation", "false");
     localStorage.setItem("autoAcceptSuggestions", "false");
     window.APP_SETTINGS = undefined;
+    ToolsManager.allInstances.mockReturnValue([]);
   });
 
   describe("creation and preProcessSnapshot", () => {
@@ -142,6 +149,50 @@ describe("AppStore", () => {
       );
       expect(store.users.length).toBe(1);
       expect(store.users[0].id).toBe(42);
+    });
+  });
+
+  describe("refinement mode shortcuts", () => {
+    it("registers named mode shortcuts and routes them to the active draw-over image", () => {
+      const store = createStore();
+      store.initializeStore({ annotations: [{ result: [] }] });
+      const annotation = store.annotationStore.selected;
+      const image = {
+        annotation,
+        drawover: true,
+        setInteractionMode: jest.fn(),
+      };
+      ToolsManager.allInstances.mockReturnValue([{ obj: image }]);
+
+      store.attachHotkeys();
+
+      const editHandler = getMockHotkey().addNamed.mock.calls.find(([name]) => name === "image:mode-edit")?.[1];
+      const annotateHandler = getMockHotkey().addNamed.mock.calls.find(([name]) => name === "image:mode-annotate")?.[1];
+      expect(editHandler).toEqual(expect.any(Function));
+      expect(annotateHandler).toEqual(expect.any(Function));
+
+      editHandler();
+      annotateHandler();
+
+      expect(image.setInteractionMode).toHaveBeenNthCalledWith(1, "edit");
+      expect(image.setInteractionMode).toHaveBeenNthCalledWith(2, "annotate");
+    });
+
+    it("does nothing for a non-refinement image", () => {
+      const store = createStore();
+      store.initializeStore({ annotations: [{ result: [] }] });
+      const image = {
+        annotation: store.annotationStore.selected,
+        drawover: false,
+        setInteractionMode: jest.fn(),
+      };
+      ToolsManager.allInstances.mockReturnValue([{ obj: image }]);
+      store.attachHotkeys();
+
+      const editHandler = getMockHotkey().addNamed.mock.calls.find(([name]) => name === "image:mode-edit")?.[1];
+      editHandler();
+
+      expect(image.setInteractionMode).not.toHaveBeenCalled();
     });
   });
 

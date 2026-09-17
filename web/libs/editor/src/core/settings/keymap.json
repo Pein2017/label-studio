@@ -214,6 +214,16 @@
     "mac": "command+right",
     "description": "Next Image"
   },
+  "image:mode-edit": {
+    "key": "ctrl+1",
+    "mac": "command+1",
+    "description": "Enter edit mode"
+  },
+  "image:mode-annotate": {
+    "key": "ctrl+2",
+    "mac": "command+2",
+    "description": "Enter annotation mode"
+  },
 
   "tool:zoom-in": {
     "key": "ctrl+plus",
