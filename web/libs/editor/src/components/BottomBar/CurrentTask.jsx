@@ -45,6 +45,14 @@ export const CurrentTask = observer(({ store }) => {
   const showCounter = store.hasInterface("topbar:task-counter");
 
   const task = store.task;
+  const taskData = task?.dataObj ?? task?.data ?? {};
+  const split = taskData.split ?? taskData.source_split;
+  const imageId = taskData.image_id;
+  const numericImageId = Number(imageId);
+  const imageIdentifier =
+    split && imageId !== undefined && imageId !== null && imageId !== "" && Number.isInteger(numericImageId)
+      ? `${split}_${numericImageId}`
+      : null;
   const isEnterprise = window.APP_SETTINGS?.billing?.enterprise;
   const skipDisabled = isEnterprise ? task?.allow_skip === false : false;
   const userRole = window.APP_SETTINGS?.user?.role;
@@ -101,6 +109,11 @@ export const CurrentTask = observer(({ store }) => {
       <div className={cn("current-task").mod({ "with-history": historyEnabled }).toClassName()}>
         <div className={cn("current-task").elem("task-id").toClassName()}>
           {store.task.id ?? guidGenerator()}
+          {imageIdentifier && (
+            <span className={cn("current-task").elem("image-id").toClassName()} data-testid="task-image-id">
+              {imageIdentifier}
+            </span>
+          )}
           {historyEnabled &&
             showCounter &&
             (isFF(FF_TASK_COUNT_FIX) ? (

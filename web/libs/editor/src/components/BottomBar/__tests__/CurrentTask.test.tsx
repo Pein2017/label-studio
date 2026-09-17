@@ -134,6 +134,14 @@ describe("CurrentTask", () => {
     expect(getByTestId("next-task").disabled).toBe(true);
   });
 
+  it("shows the source image identifier next to the task ID", () => {
+    store.task = { id: 122223, image_id: 309264, dataObj: { split: "train", image_id: 309264 } };
+
+    const { getByTestId } = render(<CurrentTask store={store} />);
+
+    expect(getByTestId("task-image-id")).toHaveTextContent("train_309264");
+  });
+
   it("does NOT disable postpone button when allow_skip=false in LSO (non-enterprise)", () => {
     // In LSO (non-enterprise), allow_skip field doesn't exist/affect behavior
     setupAppSettings({ enterprise: false });

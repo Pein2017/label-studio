@@ -44,6 +44,12 @@
     user-select: none;
   }
 
+  &__image-id {
+    margin-left: var(--spacing-tight);
+    color: var(--color-neutral-content);
+    user-select: text;
+  }
+
   &__history-controls {
     display: flex;
     grid-area: buttons;
