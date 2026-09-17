@@ -185,6 +185,25 @@ describe("DetailsPanel", () => {
         expect(screen.getByText("组 (1)")).toBeInTheDocument();
       });
     });
+
+    it("hides the legacy group panel for the four-image refinement project", () => {
+      render(
+        <Relations
+          currentEntity={{
+            ...mockCurrentEntityWithRelations,
+            store: {
+              project: {
+                id: 3,
+                title: "CoordExp COCO refinement - 4-image subproject",
+              },
+            },
+          }}
+        />,
+      );
+
+      expect(screen.queryByTestId("groups-component")).not.toBeInTheDocument();
+      expect(screen.queryByText("组 (1)")).not.toBeInTheDocument();
+    });
   });
 
   describe("Info", () => {

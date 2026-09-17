@@ -242,13 +242,21 @@ const SelectionRect = observer(({ item }) => {
 
 const TRANSFORMER_BACK_ID = "transformer_back";
 
+const isDrawOverExisting = (item) => {
+  if (item.drawover !== true) return false;
+  const selectedTool = item.getToolsManager().findSelectedTool();
+
+  return selectedTool?.isDrawingTool === true && selectedTool?.isDrawing !== true;
+};
+
 const TransformerBack = observer(({ item }) => {
   const { selectedRegionsBBox } = item;
   const singleNodeMode = item.selectedRegions.length === 1;
   const dragStartPointRef = useRef({ x: 0, y: 0 });
+  const drawOverExisting = isDrawOverExisting(item);
 
   return (
-    <Layer>
+    <Layer listening={!drawOverExisting}>
       {selectedRegionsBBox && !singleNodeMode && (
         <Rect
           id={TRANSFORMER_BACK_ID}
@@ -329,6 +337,7 @@ const SelectionLayer = observer(({ item, selectionArea }) => {
   const [isMouseWheelClick, setIsMouseWheelClick] = useState(false);
   const [shift, setShift] = useState(false);
   const isPanTool = item.getToolsManager().findSelectedTool()?.fullName === "ZoomPanTool";
+  const drawOverExisting = isDrawOverExisting(item);
 
   const dragHandler = (e) => setIsMouseWheelClick(e.buttons === 4);
 
@@ -365,7 +374,7 @@ const SelectionLayer = observer(({ item, selectionArea }) => {
       ((item.useTransformer || item.selectedShape?.preferTransformer) && item.selectedShape?.useTransformer));
 
   return (
-    <Layer scaleX={scale} scaleY={scale}>
+    <Layer scaleX={scale} scaleY={scale} listening={!drawOverExisting}>
       {selectionArea.isActive ? (
         <SelectionRect item={selectionArea} />
       ) : !supportsTransform && item.selectedRegions.length > 1 ? (
@@ -667,8 +676,10 @@ export default observer(
         e.evt.preventDefault?.();
         return true;
       }
-      const isPanTool = item.getToolsManager().findSelectedTool()?.fullName === "ZoomPanTool";
-      const isMoveTool = item.getToolsManager().findSelectedTool()?.fullName === "MoveTool";
+      const selectedTool = item.getToolsManager().findSelectedTool();
+      const isPanTool = selectedTool?.fullName === "ZoomPanTool";
+      const isMoveTool = selectedTool?.fullName === "MoveTool";
+      const drawOverExisting = isDrawOverExisting(item);
 
       this.skipNextMouseDown = this.skipNextMouseUp = this.skipNextClick = false;
       if (isFF(FF_LSDV_4930)) {
@@ -710,9 +721,17 @@ export default observer(
           return false;
         };
 
+        // A refinement project's active rectangle tool is an explicit draw
+        // mode. Konva normally dispatches a rectangle's own interaction
+        // before the stage sees the event, which makes an overlapping old box
+        // win over a new drag. Route that gesture to the drawing tool first
+        // and suppress the later region click for this pointer sequence.
+        if (drawOverExisting) item.setSkipInteractions(true);
+
         if (
           // create regions over another regions with Cmd/Ctrl pressed
           item.getSkipInteractions() ||
+          drawOverExisting ||
           e.target === item.stageRef ||
           findClosestParent(e.target, isRightElementToCatchToolInteractions)
         ) {
@@ -734,7 +753,6 @@ export default observer(
         }
       };
 
-      const selectedTool = item.getToolsManager().findSelectedTool();
       const eligibleToolForDeselect = [
         undefined,
         "EllipseTool",

@@ -16,6 +16,20 @@ interface DetailsPanelProps extends PanelProps {
   selection: any;
 }
 
+// Project 3 is the four-image COCO refinement subproject.  It intentionally
+// keeps the historical single-image annotation workflow, without the legacy
+// pair-relation/group UI used by older projects.
+const RELATION_HIDDEN_PROJECT_ID = 3;
+const RELATION_HIDDEN_PROJECT_TITLE = "CoordExp COCO refinement - 4-image subproject";
+
+const shouldShowPairGroups = (store: any): boolean => {
+  const project = store?.project;
+  return (
+    Number(project?.id) !== RELATION_HIDDEN_PROJECT_ID &&
+    project?.title !== RELATION_HIDDEN_PROJECT_TITLE
+  );
+};
+
 const DetailsPanelComponent: FC<DetailsPanelProps> = ({ currentEntity, regions, ...props }) => {
   const selectedRegions = regions.selection;
 
@@ -72,6 +86,10 @@ const CommentsTab: FC<any> = inject("store")(
 
 const RelationsTab: FC<any> = inject("store")(
   observer(function RelationsTab({ currentEntity }: any): JSX.Element {
+    if (!shouldShowPairGroups(currentEntity?.store)) {
+      return <></>;
+    }
+
     const { relationStore } = currentEntity;
 
     return (
@@ -164,6 +182,7 @@ const GeneralPanel: FC<any> = inject("store")(
   observer(function GeneralPanel({ store, currentEntity }: any): JSX.Element {
     const { relationStore } = currentEntity;
     const showAnnotationHistory = store.hasInterface("annotations:history");
+    const showPairGroups = shouldShowPairGroups(store);
     return (
       <>
         <div className={cn("details").elem("section").toClassName()}>
@@ -178,21 +197,23 @@ const GeneralPanel: FC<any> = inject("store")(
             }
           />
         </div>
-        <div className={cn("details").elem("section").toClassName()}>
-          <div className={cn("details").elem("view-control").toClassName()}>
-            <div className={cn("details").elem("section-head").toClassName()}>
-              组 ({relationStore.pairRelations.length})
+        {showPairGroups && (
+          <div className={cn("details").elem("section").toClassName()}>
+            <div className={cn("details").elem("view-control").toClassName()}>
+              <div className={cn("details").elem("section-head").toClassName()}>
+                组 ({relationStore.pairRelations.length})
+              </div>
+            </div>
+            <div className={cn("details").elem("section-content").toClassName()}>
+              <GroupsComponent
+                relationStore={relationStore}
+                selection={currentEntity.regionStore.selection}
+                regionStore={currentEntity.regionStore}
+                store={store}
+              />
             </div>
           </div>
-          <div className={cn("details").elem("section-content").toClassName()}>
-            <GroupsComponent
-              relationStore={relationStore}
-              selection={currentEntity.regionStore.selection}
-              regionStore={currentEntity.regionStore}
-              store={store}
-            />
-          </div>
-        </div>
+        )}
         {store.hasInterface("annotations:comments") && store.commentStore.isCommentable && (
           <div className={cn("details").elem("section").toClassName()}>
             <div className={cn("details").elem("section-head").toClassName()}>Comments</div>
@@ -219,26 +240,30 @@ const RegionsPanel: FC<{ regions: any; currentEntity: any }> = observer(function
   regions: any;
   currentEntity: any;
 }): JSX.Element {
+  const showPairGroups = Boolean(currentEntity?.store) && shouldShowPairGroups(currentEntity.store);
+
   return (
     <div>
       {regions.list.map((reg: any) => {
         return <SelectedRegion key={reg.id} region={reg} />;
       })}
-      <div className={cn("details").elem("section").toClassName()}>
-        <div className={cn("details").elem("view-control").toClassName()}>
-          <div className={cn("details").elem("section-head").toClassName()}>
-            组 ({currentEntity.relationStore.pairRelations.length})
+      {showPairGroups && (
+        <div className={cn("details").elem("section").toClassName()}>
+          <div className={cn("details").elem("view-control").toClassName()}>
+            <div className={cn("details").elem("section-head").toClassName()}>
+              组 ({currentEntity.relationStore.pairRelations.length})
+            </div>
+          </div>
+          <div className={cn("details").elem("section-content").toClassName()}>
+            <GroupsComponent
+              relationStore={currentEntity.relationStore}
+              selection={regions}
+              regionStore={currentEntity.regionStore}
+              store={currentEntity.store}
+            />
           </div>
         </div>
-        <div className={cn("details").elem("section-content").toClassName()}>
-          <GroupsComponent
-            relationStore={currentEntity.relationStore}
-            selection={regions}
-            regionStore={currentEntity.regionStore}
-            store={currentEntity.store}
-          />
-        </div>
-      </div>
+      )}
     </div>
   );
 });

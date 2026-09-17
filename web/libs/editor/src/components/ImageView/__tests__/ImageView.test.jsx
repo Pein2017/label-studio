@@ -41,7 +41,8 @@ jest.mock("react-konva", () => {
   });
   return {
     Stage: StageWithRef,
-    Layer: ({ children, ...p }) => React.createElement("div", { "data-testid": "konva-layer", ...p }, children),
+    Layer: ({ children, listening, ...p }) =>
+      React.createElement("div", { "data-testid": "konva-layer", "data-listening": listening, ...p }, children),
     Group: ({ children, ...p }) => React.createElement("div", { "data-testid": "konva-group", ...p }, children),
     Line: (p) => React.createElement("div", { "data-testid": "konva-line", ...p }),
     Rect: (p) => React.createElement("div", { "data-testid": "konva-rect", ...p }),
@@ -830,6 +831,23 @@ describe("ImageView", () => {
     expect(container.querySelector('[data-testid="image-transformer"]')).toBeInTheDocument();
   });
 
+  it("disables selected-region transformer hit testing in draw-over mode", () => {
+    const store = createStore();
+    const item = createItem({
+      drawover: true,
+      selectedRegions: [{ id: "r1", supportsTransform: true, canRotate: false }],
+      getToolsManager: () => ({
+        findSelectedTool: () => ({ isDrawingTool: true, isDrawing: false }),
+        allTools: () => [],
+      }),
+    });
+    item.store = store;
+    const { container } = render(<ImageView item={item} store={store} />);
+    const transformer = container.querySelector('[data-testid="image-transformer"]');
+
+    expect(transformer.parentElement).toHaveAttribute("data-listening", "false");
+  });
+
   it("renders DrawingRegion when item has drawingRegion", () => {
     const store = createStore();
     const drawingRegion = { id: "dr1", type: "brushregion", item_index: 0, annotation: {} };
@@ -930,6 +948,30 @@ describe("ImageView", () => {
     Object.defineProperty(mousedownEvt, "offsetY", { value: 35 });
     stage.dispatchEvent(mousedownEvt);
     expect(item.event).toHaveBeenCalledWith("mousedown", expect.anything(), 25, 35);
+  });
+
+  it("draw-over mode routes a drag on an existing region to the drawing tool", () => {
+    const store = createStore();
+    const item = createItem({
+      drawover: true,
+      getToolsManager: () => ({
+        findSelectedTool: () => ({ isDrawingTool: true, isDrawing: false, fullName: "RectangleTool" }),
+        allTools: () => [],
+      }),
+    });
+    item.store = store;
+    let viewRef;
+    render(<ImageView ref={(ref) => (viewRef = ref)} item={item} store={store} />);
+    const regionTarget = { getParent: () => null };
+    const fakeEvent = {
+      evt: { button: 0, offsetX: 25, offsetY: 35, ctrlKey: false, metaKey: false },
+      target: regionTarget,
+    };
+
+    viewRef.handleMouseDown(fakeEvent);
+
+    expect(item.setSkipInteractions).toHaveBeenCalledWith(true);
+    expect(item.event).toHaveBeenCalledWith("mousedown", fakeEvent, 25, 35);
   });
 
   it("handleMouseDown with button 1 (middle click) runs path and calls item.event mousedown", () => {

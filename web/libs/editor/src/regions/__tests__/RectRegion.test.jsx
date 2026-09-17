@@ -47,6 +47,7 @@ jest.mock("../../components/ImageView/LabelOnRegion", () => ({
       "data-badge": props.numericBadge,
       "data-opacity": props.opacity,
       "data-force-identity": props.forceIdentity,
+      "data-listening": props.listening,
     }),
 }));
 
@@ -74,6 +75,8 @@ jest.mock("../../tags/object/Image", () => {
         zoomedPixelSize: { x: 1, y: 1 },
         stageRef: { container: () => ({ style: {} }) },
         getSkipInteractions: () => false,
+        _drawOver: false,
+        _selectedTool: null,
         regionPresentationMode: "show_all",
         focusedRegionKeys: [],
         inferenceRegionPresentations: {},
@@ -87,6 +90,12 @@ jest.mock("../../tags/object/Image", () => {
         },
         getRegionPresentation(regionKey) {
           return self.inferenceRegionPresentations[regionKey] ?? null;
+        },
+        get drawover() {
+          return self._drawOver;
+        },
+        getToolsManager() {
+          return { findSelectedTool: () => self._selectedTool };
         },
       }))
       .actions((self) => ({
@@ -113,6 +122,12 @@ jest.mock("../../tags/object/Image", () => {
         setPresentation(mode, focusedRegionKeys = []) {
           self.regionPresentationMode = mode;
           self.focusedRegionKeys = focusedRegionKeys;
+        },
+        setDrawOver(value) {
+          self._drawOver = value;
+        },
+        setSelectedTool(tool) {
+          self._selectedTool = tool;
         },
         setInferencePresentation(regionKey, presentation) {
           self.inferenceRegionPresentations = { [regionKey]: presentation };
@@ -558,6 +573,26 @@ describe("RectRegion", () => {
         </ImageViewContext.Provider>,
       );
       expect(getByTestId("konva-rect")).toBeInTheDocument();
+    });
+
+    it("turns off region and label hit testing while the drawing tool is active", () => {
+      root.setAnnotation({
+        regionStore: { isSelected: () => false },
+        history: { freeze: jest.fn(), unfreeze: jest.fn() },
+        isReadOnly: () => false,
+        isDrawing: false,
+      });
+      root.image.setDrawOver(true);
+      root.image.setSelectedTool({ isDrawingTool: true, isDrawing: false });
+
+      const { getByTestId } = render(
+        <ImageViewContext.Provider value={{ suggestion: null }}>
+          <HtxRectangle item={region} />
+        </ImageViewContext.Provider>,
+      );
+
+      expect(rectPropsRef.current.listening).toBe(false);
+      expect(getByTestId("label-on-rect")).toHaveAttribute("data-listening", "false");
     });
 
     it("dims non-focused regions while leaving focused regions at normal opacity", () => {

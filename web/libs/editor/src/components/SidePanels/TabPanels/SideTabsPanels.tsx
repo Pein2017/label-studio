@@ -50,6 +50,31 @@ import {
   stateRemovePanelEmptyViews,
 } from "./utils";
 
+const RELATION_HIDDEN_PROJECT_ID = 3;
+const RELATION_HIDDEN_PROJECT_TITLE = "CoordExp COCO refinement - 4-image subproject";
+
+const hidesLegacyRelations = (currentEntity: any): boolean => {
+  const project = currentEntity?.store?.project;
+  return (
+    Number(project?.id) === RELATION_HIDDEN_PROJECT_ID ||
+    project?.title === RELATION_HIDDEN_PROJECT_TITLE
+  );
+};
+
+const withoutLegacyRelations = (panelData: Record<string, PanelBBox>): Record<string, PanelBBox> => {
+  const filtered = Object.fromEntries(
+    Object.entries(panelData).map(([key, panel]) => [
+      key,
+      {
+        ...panel,
+        panelViews: panel.panelViews.filter((view) => view.name !== "relations"),
+      },
+    ]),
+  );
+
+  return renameKeys(stateRemovePanelEmptyViews(filtered));
+};
+
 const maxWindowWidth = 980;
 const SideTabsPanelsComponent: FC<SidePanelsProps> = ({
   currentEntity,
@@ -70,7 +95,13 @@ const SideTabsPanelsComponent: FC<SidePanelsProps> = ({
   const [initialized, setInitialized] = useState(false);
   const rootRef = useRef<HTMLDivElement>();
   const [snap, setSnap] = useState<DropSide | Side | undefined>();
-  const initialState = useMemo(() => restorePanel(showComments, showCustomTab), [showComments, showCustomTab]);
+  const relationPanelHidden = hidesLegacyRelations(currentEntity);
+  const initialState = useMemo(() => {
+    const restored = restorePanel(showComments, showCustomTab);
+    return relationPanelHidden
+      ? { ...restored, panelData: withoutLegacyRelations(restored.panelData) }
+      : restored;
+  }, [showComments, showCustomTab, relationPanelHidden]);
   const [panelData, setPanelData] = useState<Record<string, PanelBBox>>(initialState.panelData);
   const [collapsedSide, setCollapsedSide] = useState(initialState.collapsedSide);
   const [breakPointActiveTab, setBreakPointActiveTab] = useState(0);
@@ -531,11 +562,13 @@ const SideTabsPanelsComponent: FC<SidePanelsProps> = ({
     const updatedProps = { ...partialEmptyBaseProps };
 
     updatedProps.panelViews = partialEmptyBaseProps.panelViews.filter(
-      (view) => view.name !== "comments" || showComments,
+      (view) =>
+        (view.name !== "comments" || showComments) &&
+        (!relationPanelHidden || view.name !== "relations"),
     );
 
     return updatedProps;
-  }, [partialEmptyBaseProps, showComments]);
+  }, [partialEmptyBaseProps, relationPanelHidden, showComments]);
 
   const emptyBaseProps = { ...getPartialEmptyBaseProps, ...commonProps, breakPointActiveTab, setBreakPointActiveTab };
 

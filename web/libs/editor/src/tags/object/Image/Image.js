@@ -111,6 +111,7 @@ const getInferencePresentationAliasKeys = (regions, regionKey) => {
  * @param {boolean} [contrastControl=false]   - Show contrast control in toolbar
  * @param {boolean} [rotateControl=false]     - Show rotate control in toolbar
  * @param {boolean} [crosshair=false]         - Show crosshair cursor
+ * @param {boolean} [drawOver=false]          - Let the active drawing tool start over existing regions
  * @param {left|center|right} [horizontalAlignment=left]      - Where to align image horizontally. Can be one of "left", "center", or "right"
  * @param {top|center|bottom} [verticalAlignment=top]         - Where to align image vertically. Can be one of "top", "center", or "bottom"
  * @param {auto|original|fit} [defaultZoom=fit]               - Specify the initial zoom of the image within the viewport while preserving its ratio. Can be one of "auto", "original", or "fit"
@@ -142,6 +143,9 @@ const TagAttrs = types.model({
   contrastcontrol: types.optional(types.boolean, false),
   rotatecontrol: types.optional(types.boolean, false),
   crosshair: types.optional(types.boolean, false),
+  // In refinement projects, keep the active drawing tool above existing
+  // rectangles so a drag always starts a new box instead of selecting one.
+  drawover: types.optional(types.boolean, false),
   selectioncontrol: types.optional(types.boolean, true),
 
   // this property is just to turn lazyload off to e2e tests

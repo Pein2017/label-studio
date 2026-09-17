@@ -425,6 +425,11 @@ const HtxRectangleView = ({ item, setShapeRef }) => {
     presentationColor && !item.inSelection && !item.highlighted ? presentationColor : regionStyles.strokeColor;
   const labelColor = presentationColor ?? regionStyles.strokeColor;
   const stage = item.parent?.stageRef;
+  const drawOverExisting = (() => {
+    if (item.parent?.drawover !== true) return false;
+    const selectedTool = item.parent.getToolsManager?.()?.findSelectedTool?.();
+    return selectedTool?.isDrawingTool === true && selectedTool?.isDrawing !== true;
+  })();
 
   const eventHandlers = {};
 
@@ -602,7 +607,7 @@ const HtxRectangleView = ({ item, setShapeRef }) => {
           item.setHighlight(false);
           item.onClickRegion(selectionEvent);
         }}
-        listening={!item.presentationHidden && !suggestion && !item.annotation?.isDrawing}
+        listening={!item.presentationHidden && !suggestion && !item.annotation?.isDrawing && !drawOverExisting}
       />
       <LabelOnRect
         item={item}
@@ -611,6 +616,7 @@ const HtxRectangleView = ({ item, setShapeRef }) => {
         numericBadge={item.inferencePresentation?.numericBadge}
         opacity={item.presentationOpacity}
         forceIdentity={!!presentationColor}
+        listening={!drawOverExisting}
       />
     </RegionWrapper>
   );

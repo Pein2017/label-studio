@@ -32,6 +32,7 @@ const LabelOnBbox = ({
   numericBadge = null,
   opacity = 1,
   forceIdentity = false,
+  listening = true,
 }) => {
   const fontSize = 13;
   const height = 20;
@@ -100,7 +101,14 @@ const LabelOnBbox = ({
   if (!identityVisible) return null;
 
   return (
-    <Group strokeScaleEnabled={false} x={x} y={y} rotation={rotation} opacity={opacity}>
+    <Group
+      strokeScaleEnabled={false}
+      x={x}
+      y={y}
+      rotation={rotation}
+      opacity={opacity}
+      listening={listening}
+    >
       {!!score && (
         <Label
           y={-height * scale}
@@ -193,7 +201,7 @@ const LabelOnEllipse = observer(({ item, color, strokewidth }) => {
 });
 
 const LabelOnRect = observer(
-  ({ item, color, strokewidth, numericBadge = null, opacity = 1, forceIdentity = false }) => {
+  ({ item, color, strokewidth, numericBadge = null, opacity = 1, forceIdentity = false, listening = true }) => {
     if (!item.parent) return null;
     const isTexting = !!item.texting;
     const labelText = item.getLabelText(",");
@@ -217,6 +225,7 @@ const LabelOnRect = observer(
         numericBadge={numericBadge}
         opacity={opacity}
         forceIdentity={forceIdentity}
+        listening={listening}
       />
     );
   },
