@@ -58,6 +58,7 @@ import "../../tags/object/RichText";
 import Tree from "../../core/Tree";
 import Registry from "../../core/Registry";
 import ToolsManager from "../../tools/Manager";
+import { FF_REVIEWER_FLOW } from "../../utils/feature-flags";
 import AppStore from "../AppStore";
 
 const MINIMAL_CONFIG = `<View><Text name="t1" value="$text" /></View>`;
@@ -193,6 +194,25 @@ describe("AppStore", () => {
       editHandler();
 
       expect(image.setInteractionMode).not.toHaveBeenCalled();
+    });
+
+    it("keeps the update hotkey enabled while a persisted draft exists", () => {
+      window.APP_SETTINGS = {
+        feature_flags: { [FF_REVIEWER_FLOW]: true },
+        feature_flags_default_value: false,
+      };
+      const store = createStore({ interfaces: ["update"] });
+      store.initializeStore({ annotations: [{ id: "annotation-1", pk: "1", result: [] }] });
+      const entity = store.annotationStore.selected;
+      entity.addVersions({ draft: [{ id: "draft-1" }] });
+      store.updateAnnotation = jest.fn();
+
+      store.attachHotkeys();
+      const submitHandler = getMockHotkey().addNamed.mock.calls.find(([name]) => name === "annotation:submit")?.[1];
+
+      submitHandler();
+
+      expect(store.updateAnnotation).toHaveBeenCalled();
     });
   });
 

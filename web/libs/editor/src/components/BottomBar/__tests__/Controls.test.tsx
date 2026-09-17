@@ -1,6 +1,7 @@
 import { render, fireEvent } from "@testing-library/react";
 import { Provider } from "mobx-react";
 import { Controls } from "../Controls";
+import { FF_REVIEWER_FLOW } from "../../../utils/feature-flags";
 
 jest.mock("@humansignal/ui", () => {
   const { forwardRef } = jest.requireActual("react");
@@ -12,6 +13,8 @@ jest.mock("@humansignal/ui", () => {
         </button>
       );
     }),
+    ButtonGroup: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+    Dropdown: { Trigger: ({ children }: { children: React.ReactNode }) => <div>{children}</div> },
     Tooltip: ({ children }: { children: React.ReactNode }) => {
       return <div data-testid="tooltip">{children}</div>;
     },
@@ -204,5 +207,27 @@ describe("Controls", () => {
     fireEvent.click(skipTask);
 
     expect(mockStore.skipTask).not.toHaveBeenCalled();
+  });
+
+  test("keeps Update enabled when a persisted draft exists", () => {
+    (window as any).APP_SETTINGS = {
+      feature_flags: { [FF_REVIEWER_FLOW]: true },
+      feature_flags_default_value: false,
+    };
+    mockStore.hasInterface = (a: string) => a === "update";
+
+    const annotation = {
+      ...mockAnnotation,
+      draftId: 0,
+      versions: { draft: [{ id: "draft-1" }], result: [{ id: "submitted-1" }] },
+    };
+
+    const { getByText } = render(
+      <Provider store={mockStore}>
+        <Controls history={mockHistory} annotation={annotation} />
+      </Provider>,
+    );
+
+    expect(getByText("Update").closest("button")).not.toBeDisabled();
   });
 });

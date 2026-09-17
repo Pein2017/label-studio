@@ -428,8 +428,8 @@ export default types
           const areResultsEmpty = entity.results.length === 0;
           const isReview = self.hasInterface("review") || entity.canBeReviewed;
           const isUpdate = !isReview && isDefined(entity.pk);
-          // no changes were made over previously submitted version — no drafts, no pending changes
-          const noChanges = !entity.history.canUndo && !entity.draftId;
+          // Keep Update enabled while a persisted draft exists, even before draftId is assigned.
+          const noChanges = !entity.history?.canUndo && !entity.draftId && !entity.versions?.draft;
           const isUpdateDisabled = isFF(FF_REVIEWER_FLOW) && isUpdate && noChanges;
 
           if (shouldDenyEmptyAnnotation && areResultsEmpty) return;
