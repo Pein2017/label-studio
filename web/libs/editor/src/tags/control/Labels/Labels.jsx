@@ -1,6 +1,6 @@
 import { observer } from "mobx-react";
 import { cast, getRoot, types } from "mobx-state-tree";
-import { useId, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { defaultStyle } from "../../../core/Constants";
 import { customTypes } from "../../../core/CustomTypes";
@@ -14,6 +14,11 @@ import LabelMixin from "../../../mixins/LabelMixin";
 import SelectedModelMixin from "../../../mixins/SelectedModel";
 import ToolsManager from "../../../tools/Manager";
 import { cn } from "../../../utils/bem";
+import {
+  getRefinementLabelHotkeys,
+  isRefinementProject,
+  sortRefinementLabelsByUsage,
+} from "../../../utils/refinementInteraction";
 import ControlBase from "../Base";
 import "../Label";
 import "./Labels.prefix.css";
@@ -136,18 +141,10 @@ const MANAGED_RECTANGLE_LABELS_ATTRIBUTES = Object.freeze({
 
 /**
  * Return a presentation-only copy. The model children stay in configuration
- * order so hotkeys, exports, and serialization keep their existing identity.
+ * order so exports and serialization keep their existing identity; refinement
+ * runtime hotkeys are assigned separately from this stable source order.
  */
-const sortLabelsByUsage = (labels, usageCounts = []) => {
-  return labels
-    .map((label, index) => ({
-      label,
-      index,
-      count: Number.isFinite(Number(usageCounts[index])) ? Number(usageCounts[index]) : 0,
-    }))
-    .sort((left, right) => right.count - left.count || left.index - right.index)
-    .map(({ label }) => label);
-};
+const sortLabelsByUsage = sortRefinementLabelsByUsage;
 
 let lastManagedConfigXml = null;
 let lastManagedConfigResult = false;
@@ -684,19 +681,28 @@ const HtxLabels = observer(({ item }) => {
   const showCocoSearch = taskIdentity && isManagedCoco80Control(item, taskData);
   const image = ToolsManager.getInstance({ name: item.toname })?.obj;
   const sortableRefinementLabels =
-    image?.drawover === true && Array.isArray(item.children) && item.children.every((child) => child?.type === "label");
+    image?.drawover === true &&
+    isRefinementProject(image) &&
+    Array.isArray(item.children) &&
+    item.children.every((child) => child?.type === "label");
+  const usageCounts = sortableRefinementLabels
+    ? item.children.map((label) => {
+        try {
+          return label.usedAlready?.() ?? 0;
+        } catch {
+          return 0;
+        }
+      })
+    : [];
   const children = sortableRefinementLabels
-    ? sortLabelsByUsage(
-        item.children,
-        item.children.map((label) => {
-          try {
-            return label.usedAlready?.() ?? 0;
-          } catch {
-            return 0;
-          }
-        }),
-      )
+    ? sortLabelsByUsage(item.children, usageCounts)
     : null;
+
+  const usageSignature = usageCounts.join(",");
+
+  useEffect(() => {
+    if (sortableRefinementLabels) item.annotation?.setupHotKeys?.();
+  }, [item.annotation, sortableRefinementLabels, usageSignature]);
 
   return (
     <div className={cn("labels").mod({ hidden: !item.visible, inline: item.showinline }).toClassName()}>
@@ -719,6 +725,7 @@ export {
   isManagedCoco80StaticConfig,
   managedTaskIdentity,
   normalizeClassSearchText,
+  getRefinementLabelHotkeys,
   sortLabelsByUsage,
   searchCanonicalCoco80,
 };

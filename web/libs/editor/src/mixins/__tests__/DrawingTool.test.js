@@ -28,7 +28,7 @@ function createMockAnnotation(overrides = {}) {
     isDrawing: false,
     setIsDrawing: jest.fn(),
     createResult: jest.fn(() => mockCreatedResult),
-    history: { freeze: jest.fn(), unfreeze: jest.fn() },
+    history: { freeze: jest.fn(), unfreeze: jest.fn(), abortFreeze: jest.fn() },
     unselectAll: jest.fn(),
     regionStore: {
       selection: {
@@ -349,6 +349,17 @@ describe("DrawingTool mixin", () => {
     });
   });
 
+  it("aborts an active drawing without recording a history entry", () => {
+    const { tool, annotation } = createStore();
+
+    tool.startDrawing(0, 0);
+    expect(tool.abortDrawing()).toBe(true);
+    expect(tool.currentArea).toBeNull();
+    expect(tool.mode).toBe("viewing");
+    expect(annotation.setIsDrawing).toHaveBeenCalledWith(false);
+    expect(annotation.history.abortFreeze).toHaveBeenCalledWith(undefined, true);
+  });
+
   describe("applyActiveStates", () => {
     it("calls area.setValue for each active state", () => {
       const { tool, obj } = createStore();
@@ -576,6 +587,24 @@ describe("TwoPointsDrawingTool", () => {
     tool.clickEv({ button: 0 }, [0.02, 0.02]);
     tool.clickEv({ button: 0 }, [0.15, 0.15]);
     expect(tool.mode).toBe("viewing");
+  });
+
+  it("aborts a first-click closure and ignores delayed mouse events", () => {
+    const store = createTwoPointsStore({ group: "default" });
+    const { tool } = store;
+    const annotation = tool.annotation;
+
+    tool.mousedownEv({ button: 0, offsetX: 50, offsetY: 50 }, [0.01, 0.01]);
+    expect(tool.hasPendingDrawing()).toBe(true);
+
+    tool.abortDrawing();
+    tool.mousemoveEv({}, [0.5, 0.5]);
+    tool.mouseupEv({}, [0.6, 0.6]);
+
+    expect(tool.hasPendingDrawing()).toBe(false);
+    expect(tool.mode).toBe("viewing");
+    expect(annotation.createResult).not.toHaveBeenCalled();
+    expect(annotation.history.abortFreeze).not.toHaveBeenCalled();
   });
 
   it("dblclickEv creates default dimensions shape", () => {

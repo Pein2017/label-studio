@@ -153,47 +153,14 @@ describe("AppStore", () => {
     });
   });
 
-  describe("refinement mode shortcuts", () => {
-    it("registers named mode shortcuts and routes them to the active draw-over image", () => {
+  describe("annotation submission hotkeys", () => {
+    it("does not register superseded refinement mode shortcuts", () => {
       const store = createStore();
-      store.initializeStore({ annotations: [{ result: [] }] });
-      const annotation = store.annotationStore.selected;
-      const image = {
-        annotation,
-        drawover: true,
-        setInteractionMode: jest.fn(),
-      };
-      ToolsManager.allInstances.mockReturnValue([{ obj: image }]);
-
       store.attachHotkeys();
 
-      const editHandler = getMockHotkey().addNamed.mock.calls.find(([name]) => name === "image:mode-edit")?.[1];
-      const annotateHandler = getMockHotkey().addNamed.mock.calls.find(([name]) => name === "image:mode-annotate")?.[1];
-      expect(editHandler).toEqual(expect.any(Function));
-      expect(annotateHandler).toEqual(expect.any(Function));
-
-      editHandler();
-      annotateHandler();
-
-      expect(image.setInteractionMode).toHaveBeenNthCalledWith(1, "edit");
-      expect(image.setInteractionMode).toHaveBeenNthCalledWith(2, "annotate");
-    });
-
-    it("does nothing for a non-refinement image", () => {
-      const store = createStore();
-      store.initializeStore({ annotations: [{ result: [] }] });
-      const image = {
-        annotation: store.annotationStore.selected,
-        drawover: false,
-        setInteractionMode: jest.fn(),
-      };
-      ToolsManager.allInstances.mockReturnValue([{ obj: image }]);
-      store.attachHotkeys();
-
-      const editHandler = getMockHotkey().addNamed.mock.calls.find(([name]) => name === "image:mode-edit")?.[1];
-      editHandler();
-
-      expect(image.setInteractionMode).not.toHaveBeenCalled();
+      const registeredNames = getMockHotkey().addNamed.mock.calls.map(([name]) => name);
+      expect(registeredNames).not.toContain("image:mode-edit");
+      expect(registeredNames).not.toContain("image:mode-annotate");
     });
 
     it("keeps the update hotkey enabled while a persisted draft exists", () => {

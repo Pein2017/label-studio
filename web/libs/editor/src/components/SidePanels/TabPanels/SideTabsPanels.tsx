@@ -49,16 +49,10 @@ import {
   stateRemovedTab,
   stateRemovePanelEmptyViews,
 } from "./utils";
-
-const RELATION_HIDDEN_PROJECT_ID = 3;
-const RELATION_HIDDEN_PROJECT_TITLE = "CoordExp COCO refinement - 4-image subproject";
+import { isRefinementProject } from "../../../utils/refinementInteraction";
 
 const hidesLegacyRelations = (currentEntity: any): boolean => {
-  const project = currentEntity?.store?.project;
-  return (
-    Number(project?.id) === RELATION_HIDDEN_PROJECT_ID ||
-    project?.title === RELATION_HIDDEN_PROJECT_TITLE
-  );
+  return isRefinementProject(currentEntity?.store);
 };
 
 const withoutLegacyRelations = (panelData: Record<string, PanelBBox>): Record<string, PanelBBox> => {
@@ -98,9 +92,7 @@ const SideTabsPanelsComponent: FC<SidePanelsProps> = ({
   const relationPanelHidden = hidesLegacyRelations(currentEntity);
   const initialState = useMemo(() => {
     const restored = restorePanel(showComments, showCustomTab);
-    return relationPanelHidden
-      ? { ...restored, panelData: withoutLegacyRelations(restored.panelData) }
-      : restored;
+    return relationPanelHidden ? { ...restored, panelData: withoutLegacyRelations(restored.panelData) } : restored;
   }, [showComments, showCustomTab, relationPanelHidden]);
   const [panelData, setPanelData] = useState<Record<string, PanelBBox>>(initialState.panelData);
   const [collapsedSide, setCollapsedSide] = useState(initialState.collapsedSide);
@@ -562,9 +554,7 @@ const SideTabsPanelsComponent: FC<SidePanelsProps> = ({
     const updatedProps = { ...partialEmptyBaseProps };
 
     updatedProps.panelViews = partialEmptyBaseProps.panelViews.filter(
-      (view) =>
-        (view.name !== "comments" || showComments) &&
-        (!relationPanelHidden || view.name !== "relations"),
+      (view) => (view.name !== "comments" || showComments) && (!relationPanelHidden || view.name !== "relations"),
     );
 
     return updatedProps;

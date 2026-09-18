@@ -1,6 +1,7 @@
 import { inject, observer } from "mobx-react";
 import type { FC } from "react";
 import { cn } from "../../../utils/bem";
+import { isRefinementProject } from "../../../utils/refinementInteraction";
 import { Comments as CommentsComponent } from "../../Comments/Comments";
 import { AnnotationHistory } from "../../CurrentEntity/AnnotationHistory";
 import { PanelBase, type PanelProps } from "../PanelBase";
@@ -16,18 +17,11 @@ interface DetailsPanelProps extends PanelProps {
   selection: any;
 }
 
-// Project 3 is the four-image COCO refinement subproject.  It intentionally
-// keeps the historical single-image annotation workflow, without the legacy
-// pair-relation/group UI used by older projects.
-const RELATION_HIDDEN_PROJECT_ID = 3;
-const RELATION_HIDDEN_PROJECT_TITLE = "CoordExp COCO refinement - 4-image subproject";
-
+// Project 3 uses the single-image annotation workflow and does not expose the
+// legacy pair-relation/group UI. Relation data remains available to upstream
+// serialization and other projects.
 const shouldShowPairGroups = (store: any): boolean => {
-  const project = store?.project;
-  return (
-    Number(project?.id) !== RELATION_HIDDEN_PROJECT_ID &&
-    project?.title !== RELATION_HIDDEN_PROJECT_TITLE
-  );
+  return !isRefinementProject(store);
 };
 
 const DetailsPanelComponent: FC<DetailsPanelProps> = ({ currentEntity, regions, ...props }) => {

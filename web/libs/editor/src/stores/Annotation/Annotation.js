@@ -24,6 +24,7 @@ import Result from "../../regions/Result";
 import Utils from "../../utils";
 import { FF_DEV_1284, FF_DEV_3391, FF_LSDV_4583, FF_REVIEWER_FLOW, isFF } from "../../utils/feature-flags";
 import { delay, isDefined } from "../../utils/utilities";
+import { getRefinementLabelHotkeys, isRefinementProject } from "../../utils/refinementInteraction";
 import { CommentStore } from "../Comment/CommentStore";
 import RegionStore from "../RegionStore";
 import RelationStore from "../RelationStore";
@@ -701,9 +702,12 @@ const _Annotation = types
 
     /**
      * @param {boolean} tryToKeepStates don't unselect labels if such setting is enabled
+     * @param {?boolean} keepStatesOverride optional project-scoped override
      */
-    unselectAll(tryToKeepStates = false) {
-      const keepStates = tryToKeepStates && self.store.settings.continuousLabeling;
+    unselectAll(tryToKeepStates = false, keepStatesOverride) {
+      const keepStates =
+        tryToKeepStates &&
+        (keepStatesOverride === undefined ? self.store.settings.continuousLabeling : keepStatesOverride);
 
       self.unselectAreas();
       if (!keepStates) self.unselectStates();
@@ -1091,6 +1095,36 @@ const _Annotation = types
     setupHotKeys() {
       hotkeys.unbindAll();
 
+      // Refinement labels are presented by current-image usage, so their
+      // digits must follow that same order. This changes only runtime model
+      // state; config/result serialization keeps the original label identity.
+      self.traverseTree((node) => {
+        const object = node?.toNameTag;
+        const labels = node?.children;
+
+        if (
+          object?.drawover !== true ||
+          !isRefinementProject(object) ||
+          !Array.isArray(labels) ||
+          !labels.every((label) => label?.type === "label")
+        ) {
+          return;
+        }
+
+        const usageCounts = labels.map((label) => {
+          try {
+            return label.usedAlready?.() ?? 0;
+          } catch {
+            return 0;
+          }
+        });
+        const refinementHotkeys = getRefinementLabelHotkeys(labels, usageCounts);
+
+        labels.forEach((label) => {
+          label.hotkey = refinementHotkeys.get(label) ?? null;
+        });
+      });
+
       let audiosNum = 0;
       let audioNode = null;
       const mod = "shift+space";
@@ -1206,6 +1240,17 @@ const _Annotation = types
     },
 
     afterCreateResult(area, control) {
+      // Refinement drawing is always continuous: clear the just-created
+      // region selection while retaining the active label, even when the
+      // user's global "select after create" setting is enabled.
+      const isRefinement =
+        control.isLabeling && area.object?.drawover === true && isRefinementProject(area.object);
+
+      if (isRefinement) {
+        self.unselectAll(true, true);
+        return;
+      }
+
       if (self.store.settings.selectAfterCreate) {
         if (!area.classification) {
           // some regions might need some actions right after creation (i.e. text)
@@ -1213,8 +1258,9 @@ const _Annotation = types
           setTimeout(() => isAlive(area) && self.selectArea(area));
         }
       } else {
-        // unselect labeling tools after use, but consider "keep labels selected" settings
-        if (control.isLabeling) self.unselectAll(true);
+        if (control.isLabeling) {
+          self.unselectAll(true);
+        }
       }
     },
 

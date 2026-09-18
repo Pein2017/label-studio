@@ -186,7 +186,7 @@ describe("DetailsPanel", () => {
       });
     });
 
-    it("hides the legacy group panel for the four-image refinement project", () => {
+    it("hides the legacy group panel for project 3", () => {
       render(
         <Relations
           currentEntity={{
@@ -194,7 +194,6 @@ describe("DetailsPanel", () => {
             store: {
               project: {
                 id: 3,
-                title: "CoordExp COCO refinement - 4-image subproject",
               },
             },
           }}

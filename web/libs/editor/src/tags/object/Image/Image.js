@@ -19,6 +19,7 @@ import { parseValue } from "../../../utils/data";
 import { FF_DEV_3377, FF_DEV_3391, FF_LSDV_4583, FF_ZOOM_OPTIM, isFF } from "../../../utils/feature-flags";
 import { guidGenerator } from "../../../utils/unique";
 import { clamp, isDefined } from "../../../utils/utilities";
+import { isRefinementProject } from "../../../utils/refinementInteraction";
 import ObjectBase from "../Base";
 import { DrawingRegion } from "./DrawingRegion";
 import { ImageEntityMixin } from "./ImageEntityMixin";
@@ -219,7 +220,10 @@ const Model = types
   })
   .volatile(() => ({
     currentImage: undefined,
-    interactionMode: "annotate",
+    // These values describe only the current refinement gesture. They must
+    // never be serialized with the image tag or annotation payload.
+    refinementLabelSessionKey: null,
+    refinementLastCreatedMarker: null,
     supportSuggestions: true,
     aiRegion: null,
     aiRegionRunning: false,
@@ -467,6 +471,14 @@ const Model = types
       const states = self.states();
 
       return states && states.filter((s) => s.isSelected && s.type.includes("labels"));
+    },
+
+    get refinementLabelKey() {
+      return (self.activeStates() || [])
+        .map((state) => state.name)
+        .filter(Boolean)
+        .sort()
+        .join("\u001f");
     },
 
     controlButton() {
@@ -1057,10 +1069,81 @@ const Model = types
       self.setCurrentImage(index);
     },
 
+    syncRefinementLabelSession() {
+      if (self.drawover !== true || !isRefinementProject(self)) return null;
+
+      const key = self.refinementLabelKey;
+
+      if (self.refinementLabelSessionKey !== key) {
+        self.refinementLabelSessionKey = key;
+        self.refinementLastCreatedMarker = null;
+      }
+
+      return key;
+    },
+
+    clearRefinementActionMarker() {
+      self.refinementLastCreatedMarker = null;
+    },
+
+    clearRefinementSession() {
+      self.refinementLabelSessionKey = null;
+      self.refinementLastCreatedMarker = null;
+    },
+
+    markRefinementRegionCreated(region) {
+      if (self.drawover !== true || !isRefinementProject(self) || !region || region.type !== "rectangleregion") {
+        return;
+      }
+
+      self.refinementLastCreatedMarker = {
+        id: region.id,
+        itemIndex: region.item_index ?? self.currentImage,
+        labelKey: self.syncRefinementLabelSession(),
+      };
+    },
+
+    getRefinementLastCreatedRegion() {
+      const marker = self.refinementLastCreatedMarker;
+
+      if (
+        self.drawover !== true ||
+        !isRefinementProject(self) ||
+        !marker ||
+        marker.labelKey !== self.syncRefinementLabelSession()
+      ) {
+        return null;
+      }
+      if (marker.itemIndex !== self.currentImage) return null;
+
+      const region = self.regs.find((candidate) => candidate.id === marker.id);
+
+      if (
+        !region ||
+        region.object !== self ||
+        region.annotation !== self.annotation ||
+        region.type !== "rectangleregion" ||
+        region.isRealRegion === false ||
+        (typeof region.isReadOnly === "function" ? region.isReadOnly() : region.isReadOnly === true)
+      ) {
+        return null;
+      }
+
+      return region;
+    },
+
+    consumeRefinementLastCreatedRegion() {
+      const region = self.getRefinementLastCreatedRegion();
+
+      self.clearRefinementActionMarker();
+      return region;
+    },
+
     setCurrentImage(index = 0) {
       index = index ?? 0;
       if (index === self.currentImage) return;
 
+      self.clearRefinementSession();
       self.currentImage = index;
       self.currentImageEntity = self.findImageEntity(index);
       self.preloadImages();
@@ -1297,23 +1380,6 @@ const Model = types
      */
     setMode(mode) {
       self.mode = mode;
-    },
-
-    setInteractionMode(mode) {
-      if (mode !== "annotate" && mode !== "edit") return;
-
-      self.interactionMode = mode;
-      self.annotation?.unselectAll?.();
-      self.activeStates()?.forEach((state) => state.unselectAll?.());
-
-      const manager = self.getToolsManager();
-      if (mode === "edit") {
-        const moveTool = manager.allTools().find((tool) => tool.fullName === "MoveTool");
-
-        if (moveTool) manager.selectTool(moveTool, true);
-      } else if (manager.findSelectedTool()?.fullName === "MoveTool") {
-        manager.unselectAll?.();
-      }
     },
 
     setImageRef(ref) {

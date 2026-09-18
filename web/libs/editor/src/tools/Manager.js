@@ -125,16 +125,6 @@ class ToolsManager {
   }
 
   selectTool(tool, selected, isInitial = false) {
-    const managedObject = this.obj;
-    const editOnly = managedObject?.drawover === true && managedObject?.interactionMode === "edit";
-
-    if (editOnly && tool?.isDrawingTool) {
-      const moveTool = this.allTools().find((candidate) => candidate.fullName === "MoveTool");
-
-      if (moveTool && moveTool !== tool) return this.selectTool(moveTool, true, isInitial);
-      return;
-    }
-
     const currentTool = this.findSelectedTool();
     const newSelection = tool?.group;
 
@@ -206,11 +196,11 @@ class ToolsManager {
    * correctly.
    */
   resetActiveDrawing() {
-    const drawingTool = this.findDrawingTool();
+    const drawingTool = this.allTools().find(
+      (tool) => tool.hasPendingDrawing?.() || (tool.isDrawing && tool.currentArea),
+    );
 
-    if (drawingTool?.currentArea) {
-      drawingTool.resetBeforeAnnotationSwitch();
-    }
+    drawingTool?.resetBeforeAnnotationSwitch?.();
   }
 
   event(name, ev, ...args) {

@@ -26,6 +26,7 @@ import {
 } from "../utils/feature-flags";
 import { CommentStore } from "./Comment/CommentStore";
 import { CustomButton } from "./CustomButton";
+import { isRefinementProject } from "../utils/refinementInteraction";
 
 const hotkeys = Hotkey("AppStore", "Global Hotkeys");
 
@@ -212,10 +213,6 @@ export default types
     suggestionsRequest: null,
     // @todo should be removed along with the FF; it's used to detect FF in other parts
     simpleInit: isFF(FF_SIMPLE_INIT),
-    pairingDebug: {
-      seq: 0,
-      events: [],
-    },
     recentCanvasModifiers: {
       timestamp: 0,
       ctrlKey: false,
@@ -283,48 +280,6 @@ export default types
 
     function renderApp() {
       appControls?.render();
-    }
-
-    function getCurrentPairingSelection() {
-      const currentAnnotation = self.annotationStore?.selected;
-      const selectedRegions = currentAnnotation?.selectedRegions ?? [];
-
-      return {
-        selectionCount: selectedRegions.length,
-        selectionIds: selectedRegions.map((region) => region.id),
-        selectionIndexes: selectedRegions.map((region) => region.region_index ?? null),
-      };
-    }
-
-    function pushPairingDebugEvent(kind, payload = {}) {
-      const nextSeq = (self.pairingDebug?.seq ?? 0) + 1;
-      const nextEvent = {
-        id: nextSeq,
-        kind,
-        timestamp: Date.now(),
-        ...getCurrentPairingSelection(),
-        ...payload,
-      };
-
-      self.pairingDebug = {
-        seq: nextSeq,
-        events: [nextEvent, ...(self.pairingDebug?.events ?? [])].slice(0, 10),
-      };
-    }
-
-    function recordPairingDebugCanvasClick(payload = {}) {
-      pushPairingDebugEvent("canvas-click", payload);
-    }
-
-    function recordPairingDebugSelection(payload = {}) {
-      pushPairingDebugEvent("selection", payload);
-    }
-
-    function clearPairingDebug() {
-      self.pairingDebug = {
-        seq: self.pairingDebug?.seq ?? 0,
-        events: [],
-      };
     }
 
     function recordCanvasModifierState(payload = {}) {
@@ -475,25 +430,6 @@ export default types
         });
       }
 
-      const setActiveRefinementMode = (mode) => {
-        const annotation = self.annotationStore.selected;
-        if (!annotation) return;
-
-        const image = ToolsManager.allInstances()
-          .map((manager) => manager.obj)
-          .find(
-            (object) =>
-              object?.annotation === annotation &&
-              object?.drawover === true &&
-              typeof object.setInteractionMode === "function",
-          );
-
-        image?.setInteractionMode(mode);
-      };
-
-      hotkeys.addNamed("image:mode-edit", () => setActiveRefinementMode("edit"));
-      hotkeys.addNamed("image:mode-annotate", () => setActiveRefinementMode("annotate"));
-
       /**
        * Hotkey for delete
        */
@@ -583,6 +519,23 @@ export default types
 
         const c = self.annotationStore.selected;
         const managers = ToolsManager.allInstances();
+        const refinementObjects = managers
+          .map((manager) => manager.obj)
+          .filter((object) => object?.annotation === c && object?.drawover === true && isRefinementProject(object));
+        const refinementRectangleTools = managers
+          .map((manager) => manager.findSelectedTool())
+          .filter(
+            (tool) =>
+              ["RectangleTool", "RectangleTool-dynamic"].includes(tool?.fullName) && tool?.hasPendingDrawing?.(),
+          );
+
+        if (refinementObjects.length > 0) {
+          refinementRectangleTools.forEach((tool) => tool.abortDrawing?.());
+          refinementObjects.forEach((object) => object.clearRefinementActionMarker?.());
+          c?.unselectAll?.();
+          return;
+        }
+
         const tools = managers
           .map((m) => m.findSelectedTool())
           .filter(Boolean)
@@ -763,6 +716,10 @@ export default types
           if (allowedToSave && allowedToSave.some((x) => x === false)) return;
         }
         await getEnv(self).events.invoke("updateAnnotation", self, entity, extraData);
+        ToolsManager.allInstances()
+          .map((manager) => manager.obj)
+          .filter((object) => object?.annotation === entity && object?.drawover === true && isRefinementProject(object))
+          .forEach((object) => object.clearRefinementActionMarker?.());
         self.incrementQueuePosition();
         if (isFF(FF_CUSTOM_SCRIPT)) {
           entity.dropDraft();
@@ -887,6 +844,10 @@ export default types
     function resetState() {
       // Tools are attached to the control and object tags
       // and need to be recreated when we st a new task
+      ToolsManager.allInstances()
+        .map((manager) => manager.obj)
+        .filter((object) => object?.drawover === true && isRefinementProject(object))
+        .forEach((object) => object.clearRefinementSession?.());
       ToolsManager.removeAllTools();
 
       // Same with hotkeys
@@ -1210,9 +1171,6 @@ export default types
       clearApp,
       renderApp,
       recordCanvasModifierState,
-      recordPairingDebugCanvasClick,
-      recordPairingDebugSelection,
-      clearPairingDebug,
       selfDestroy() {
         const children = [];
 

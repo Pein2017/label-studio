@@ -2,25 +2,25 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
-import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
 from projects.models import Project
-from src.label_studio_coco_refinement.draft_adapter import (
+from tasks.models import Task
+
+from .draft_adapter import (
     DraftContractError,
     canonicalize_label_studio_draft,
+    strip_legacy_relation_results,
 )
-from tasks.models import Task
 
 EXPORT_ROOT = (
     REPO_ROOT
@@ -33,26 +33,40 @@ class GTExportError(RuntimeError):
     """The live annotation state could not be published as a GT snapshot."""
 
 
+def sanitize_refinement_annotation_result(
+    project_id: int | None,
+    result: Any,
+) -> tuple[Any, int]:
+    """Remove legacy relation records before an opt-in annotation is saved.
+
+    The API calls this after serializer validation and before the database
+    write.  Projects without the exact refinement manifest are returned
+    unchanged.  JSONL export repeats the filter defensively because database
+    state may have been written by an older server or another code path.
+    """
+
+    if result is None or project_id is None or _manifest_for_project(project_id) is None:
+        return result, 0
+    try:
+        return strip_legacy_relation_results(result)
+    except DraftContractError as exc:
+        raise GTExportError(
+            f"refinement annotation result for project {project_id} is invalid"
+        ) from exc
+
+
 def export_project_gt(project_id: int) -> dict[str, Any] | None:
     """Atomically publish the current annotations for the configured project.
 
     Projects without the five-image manifest are ignored so this local adapter
-    does not change ordinary Label Studio projects.
+    does not change ordinary Label Studio projects.  The caller's database
+    update is not rolled back if filesystem publication fails.
     """
 
-    manifest_path = EXPORT_ROOT / "project_manifest.json"
-    if not manifest_path.is_file():
+    manifest = _manifest_for_project(project_id)
+    if manifest is None:
         return None
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise GTExportError(f"cannot read refinement manifest: {manifest_path}") from exc
-    if manifest.get("project_id") != int(project_id):
-        return None
-
     image_ids = {int(value) for value in manifest.get("image_ids", [])}
-    if image_ids != EXPECTED_IMAGE_IDS:
-        raise GTExportError("refinement manifest image scope drifted")
 
     source_by_image = _load_source_rows(EXPORT_ROOT / "source.norm.jsonl", image_ids)
     try:
@@ -71,6 +85,7 @@ def export_project_gt(project_id: int) -> dict[str, Any] | None:
     output_rows: list[dict[str, Any]] = []
     changed_images: list[int] = []
     annotation_counts: dict[str, int] = {}
+    stripped_relation_counts: dict[str, int] = {}
     used_ids: set[int] = set()
     for task in tasks:
         image_id = task.data.get("image_id")
@@ -81,8 +96,11 @@ def export_project_gt(project_id: int) -> dict[str, Any] | None:
         if len(annotations) != 1:
             raise GTExportError(f"image {image_id} must have exactly one annotation")
         try:
+            filtered_results, stripped_relations = strip_legacy_relation_results(
+                annotations[0].result or []
+            )
             canonical = canonicalize_label_studio_draft(
-                annotations[0].result or [],
+                filtered_results,
                 split="train",
                 image_id=image_id,
                 image_width=source_row["width"],
@@ -117,10 +135,11 @@ def export_project_gt(project_id: int) -> dict[str, Any] | None:
                 }
             )
 
-        edited_row = dict(source_row)
+        edited_row = copy.deepcopy(source_row)
         edited_row["objects"] = objects
         output_rows.append(edited_row)
         annotation_counts[str(image_id)] = len(objects)
+        stripped_relation_counts[str(image_id)] = stripped_relations
         if objects != source_row["objects"]:
             changed_images.append(image_id)
 
@@ -148,6 +167,8 @@ def export_project_gt(project_id: int) -> dict[str, Any] | None:
         "project_id": int(project_id),
         "image_ids": sorted(image_ids),
         "annotation_counts": annotation_counts,
+        "stripped_relation_counts": stripped_relation_counts,
+        "stripped_relation_total": sum(stripped_relation_counts.values()),
         "output_path": str(output_path),
         "output_sha256": _sha256(output_path),
         "changed_images": sorted(changed_images),
@@ -158,6 +179,27 @@ def export_project_gt(project_id: int) -> dict[str, Any] | None:
         encoding="utf-8",
     )
     return receipt
+
+
+def _manifest_for_project(project_id: int) -> dict[str, Any] | None:
+    manifest_path = EXPORT_ROOT / "project_manifest.json"
+    if not manifest_path.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise GTExportError(f"cannot read refinement manifest: {manifest_path}") from exc
+    if not isinstance(manifest, dict):
+        raise GTExportError("refinement manifest must be a JSON object")
+    if manifest.get("project_id") != int(project_id):
+        return None
+    try:
+        image_ids = {int(value) for value in manifest.get("image_ids", [])}
+    except (TypeError, ValueError) as exc:
+        raise GTExportError("refinement manifest image_ids are invalid") from exc
+    if image_ids != EXPECTED_IMAGE_IDS:
+        raise GTExportError("refinement manifest image scope drifted")
+    return manifest
 
 
 def _load_source_rows(path: Path, image_ids: set[int]) -> dict[int, dict[str, Any]]:
@@ -207,4 +249,8 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-__all__ = ["GTExportError", "export_project_gt"]
+__all__ = [
+    "GTExportError",
+    "export_project_gt",
+    "sanitize_refinement_annotation_result",
+]

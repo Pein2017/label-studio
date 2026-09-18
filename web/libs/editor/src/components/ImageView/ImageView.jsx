@@ -9,12 +9,10 @@ import ObjectTag from "../../components/Tags/Object";
 import Tree from "../../core/Tree";
 import styles from "./ImageView.module.css";
 import { errorBuilder } from "../../core/DataValidator/ConfigValidator";
-import { chunks, findClosestParent, isMacOS } from "../../utils/utilities";
+import { chunks, findClosestParent } from "../../utils/utilities";
 import Konva from "konva";
 import { LoadingOutlined } from "@ant-design/icons";
 import { Toolbar } from "../Toolbar/Toolbar";
-import { Tool } from "../Toolbar/Tool";
-import { ToolbarProvider } from "../Toolbar/ToolbarContext";
 import { ImageViewProvider } from "./ImageViewContext";
 import { Hotkey } from "../../core/Hotkey";
 import { useObserver } from "mobx-react";
@@ -27,8 +25,11 @@ import { Pagination } from "../../common/Pagination/Pagination";
 import { Image } from "./Image";
 import { CoordExpAIRegionMount } from "../CoordExpAIRegion";
 import { roiFromDrag } from "../CoordExpAIRegion/controller";
-import { IconBoundingBox, IconMoveTool } from "@humansignal/icons";
-import { cn } from "../../utils/bem";
+import {
+  isRefinementDrawingSession,
+  isRefinementProject,
+  isRefinementRectangleTool,
+} from "../../utils/refinementInteraction";
 
 Konva.showWarnings = false;
 
@@ -246,48 +247,72 @@ const SelectionRect = observer(({ item }) => {
 
 const TRANSFORMER_BACK_ID = "transformer_back";
 
-const isDrawOverExisting = (item) => {
-  if (item.drawover !== true) return false;
-  const selectedTool = item.getToolsManager().findSelectedTool();
+export { isRefinementDrawingSession };
 
-  return item.interactionMode !== "edit" && selectedTool?.isDrawingTool === true && selectedTool?.isDrawing !== true;
+const isDrawOverExisting = (item) =>
+  isRefinementDrawingSession(item) && !item.getToolsManager().findSelectedTool()?.isDrawing;
+
+const isRefinementAnnotationMode = (item) => isRefinementDrawingSession(item);
+
+const bboxFromRegion = (region) => {
+  const bbox = region?.bboxCoords;
+
+  if (!bbox) return null;
+  const left = bbox.left ?? bbox.x;
+  const top = bbox.top ?? bbox.y;
+  const right = bbox.right ?? (left !== undefined && bbox.width !== undefined ? left + bbox.width : undefined);
+  const bottom = bbox.bottom ?? (top !== undefined && bbox.height !== undefined ? top + bbox.height : undefined);
+
+  if (![left, top, right, bottom].every(Number.isFinite) || right <= left || bottom <= top) return null;
+
+  return { left, top, right, bottom, area: (right - left) * (bottom - top) };
 };
 
-const isRefinementAnnotationMode = (item) => item.drawover === true && item.interactionMode !== "edit";
+const pointToBboxDistance = (point, bbox) => {
+  const dx = Math.max(bbox.left - point.x, 0, point.x - bbox.right);
+  const dy = Math.max(bbox.top - point.y, 0, point.y - bbox.bottom);
 
-const refinementModeShortcut = (key) => (isMacOS() ? `⌘${key}` : `Ctrl+${key}`);
+  return Math.hypot(dx, dy);
+};
 
-const InteractionModeToolbar = observer(({ item }) => {
-  if (item.drawover !== true) return null;
+/**
+ * Return the smallest visible axis-aligned rectangle containing a point.
+ * Empty-space clicks may use a bounded edge-distance fallback; callers can
+ * omit tolerance to disable that fallback entirely.
+ */
+export const selectSmallestContainingRegion = (regions, point, { tolerance = 0, recentEditOrder = {} } = {}) => {
+  const candidates = (regions || [])
+    .map((region, index) => ({ region, bbox: bboxFromRegion(region), index }))
+    .filter(
+      ({ region, bbox }) =>
+        region?.type === "rectangleregion" &&
+        region.hidden !== true &&
+        region.presentationHidden !== true &&
+        region.isRealRegion !== false &&
+        !(typeof region.isReadOnly === "function" ? region.isReadOnly() : region.isReadOnly === true) &&
+        (region.rotation ?? 0) === 0 &&
+        bbox,
+    );
+
+  const containing = candidates.filter(({ bbox }) => {
+    return point.x >= bbox.left && point.x <= bbox.right && point.y >= bbox.top && point.y <= bbox.bottom;
+  });
+  const pool = containing.length
+    ? containing.map((candidate) => ({ ...candidate, distance: 0 }))
+    : candidates
+        .map((candidate) => ({ ...candidate, distance: pointToBboxDistance(point, candidate.bbox) }))
+        .filter(({ distance }) => distance <= Math.max(0, tolerance));
 
   return (
-    <ToolbarProvider value={{ expanded: false, alignment: "right" }}>
-      <div
-        className={cn("toolbar").mod({ alignment: "right" }).toClassName()}
-        role="group"
-        aria-label="Interaction mode"
-        data-testid="interaction-mode-toolbar"
-      >
-        <div className={cn("toolbar").elem("group").toClassName()}>
-          <Tool
-            ariaLabel="annotation-mode"
-            active={item.interactionMode !== "edit"}
-            icon={<IconBoundingBox />}
-            label={`标注 (${refinementModeShortcut(2)})`}
-            onClick={() => item.setInteractionMode("annotate")}
-          />
-          <Tool
-            ariaLabel="edit-mode"
-            active={item.interactionMode === "edit"}
-            icon={<IconMoveTool />}
-            label={`修改 (${refinementModeShortcut(1)})`}
-            onClick={() => item.setInteractionMode("edit")}
-          />
-        </div>
-      </div>
-    </ToolbarProvider>
+    pool.sort((a, b) => {
+      if (a.distance !== b.distance) return a.distance - b.distance;
+      if (a.bbox.area !== b.bbox.area) return a.bbox.area - b.bbox.area;
+      const recent = (recentEditOrder[b.region.id] ?? 0) - (recentEditOrder[a.region.id] ?? 0);
+
+      return recent || a.index - b.index;
+    })[0]?.region ?? null
   );
-});
+};
 
 const TransformerBack = observer(({ item }) => {
   const { selectedRegionsBBox } = item;
@@ -614,6 +639,7 @@ export default observer(
     mouseDownPoint = null;
     mouseDown = false;
     aiRegionDragStart = null;
+    refinementSelectionRegionId = null;
 
     constructor(props) {
       super(props);
@@ -621,6 +647,20 @@ export default observer(
       if (typeof props.item.smoothingEnabled === "boolean")
         props.store.settings.setSmoothing(props.item.smoothingEnabled);
     }
+
+    findRefinementRegionAtPoint = (item, x, y) => {
+      const [canvasX, canvasY] = item.fixZoomedCoords?.([x, y]) ?? [x, y];
+      const point = {
+        x: item.canvasToInternalX?.(canvasX) ?? canvasX,
+        y: item.canvasToInternalY?.(canvasY) ?? canvasY,
+      };
+      const tolerance = Math.max(item.canvasToInternalX?.(8) ?? 0, item.canvasToInternalY?.(8) ?? 0);
+
+      return selectSmallestContainingRegion(item.regs, point, {
+        tolerance,
+        recentEditOrder: item.annotation?.regionStore?.recentEditOrder ?? {},
+      });
+    };
 
     handleOnClick = (e) => {
       const { item } = this.props;
@@ -637,6 +677,26 @@ export default observer(
 
       const evt = e.evt || e;
       const { offsetX: x, offsetY: y } = evt;
+
+      if (item.drawover === true && isRefinementProject(item) && !isRefinementDrawingSession(item)) {
+        const candidate = this.findRefinementRegionAtPoint(item, x, y);
+        const additiveMode = !!evt.ctrlKey || !!evt.metaKey;
+
+        if (candidate && this.refinementSelectionRegionId === candidate.id) {
+          if (!additiveMode) item.annotation.selectAreas([candidate]);
+          item.setSkipInteractions(false);
+          this.refinementSelectionRegionId = null;
+          return true;
+        }
+
+        if (candidate && !evt.defaultPrevented) {
+          if (!additiveMode) item.annotation.unselectAreas();
+          candidate.onClickRegion(e);
+          item.setSkipInteractions(false);
+          this.refinementSelectionRegionId = null;
+          return true;
+        }
+      }
 
       if (isFF(FF_LSDV_4930)) {
         // Konva can trigger click even on simple mouseup
@@ -677,6 +737,41 @@ export default observer(
         return;
       }
       return item.event("click", evt, x, y);
+    };
+
+    handleContextMenu = (e) => {
+      const { item } = this.props;
+      const evt = e.evt || e;
+
+      item.syncRefinementLabelSession?.();
+      if (item.drawover !== true || !isRefinementProject(item) || (evt.button !== undefined && evt.button !== 2)) {
+        return;
+      }
+
+      const drawingTool = item
+        .getToolsManager()
+        .allTools()
+        .find((tool) => isRefinementRectangleTool(tool) && tool.hasPendingDrawing?.());
+      const hasActiveLabel = (item.activeStates?.()?.length ?? 0) > 0;
+
+      if (!drawingTool && !hasActiveLabel) return;
+
+      evt.preventDefault?.();
+      evt.stopPropagation?.();
+      e.cancelBubble = true;
+
+      if (drawingTool) {
+        drawingTool.abortDrawing?.();
+        item.clearRefinementActionMarker?.();
+        return true;
+      }
+
+      if (!hasActiveLabel) return true;
+
+      const region = item.consumeRefinementLastCreatedRegion?.();
+
+      if (region) region.deleteRegion?.();
+      return true;
     };
 
     resetDeferredClickTimeout = () => {
@@ -728,6 +823,7 @@ export default observer(
       const drawOverExisting = isDrawOverExisting(item);
 
       this.skipNextMouseDown = this.skipNextMouseUp = this.skipNextClick = false;
+      this.refinementSelectionRegionId = null;
       if (isFF(FF_LSDV_4930)) {
         this.mouseDownPoint = { x: e.evt.offsetX, y: e.evt.offsetY };
       }
@@ -739,6 +835,28 @@ export default observer(
       if (item.annotation.isReadOnly() && !isPanTool) return;
       if (annotationMode && !selectedTool?.isDrawingTool && !isPanTool) return true;
       if (p && p.className === "Transformer") return;
+
+      if (
+        e.evt.button === 0 &&
+        item.drawover === true &&
+        isRefinementProject(item) &&
+        !isRefinementDrawingSession(item)
+      ) {
+        const candidate = this.findRefinementRegionAtPoint(item, e.evt.offsetX, e.evt.offsetY);
+        const additiveMode = !!e.evt.ctrlKey || !!e.evt.metaKey;
+
+        if (candidate) {
+          if (!additiveMode) {
+            item.annotation.selectAreas([candidate]);
+            this.refinementSelectionRegionId = candidate.id;
+          } else {
+            // Let the stage click route the explicit additive gesture once;
+            // the region shape must not toggle it a second time.
+            this.refinementSelectionRegionId = null;
+          }
+          item.setSkipInteractions(true);
+        }
+      }
 
       const handleMouseDown = () => {
         if (e.evt.button === 1) {
@@ -1170,7 +1288,6 @@ export default observer(
       return (
         <>
           <Toolbar tools={tools} />
-          <InteractionModeToolbar item={item} />
         </>
       );
     }
@@ -1281,6 +1398,7 @@ export default observer(
                 item={item}
                 crosshairRef={this.crosshairRef}
                 onClick={this.handleOnClick}
+                onContextMenu={this.handleContextMenu}
                 imagePositionClassnames={imagePositionClassnames}
                 state={this.state}
                 onMouseEnter={() => {
@@ -1346,6 +1464,7 @@ const EntireStage = observer(
     imagePositionClassnames,
     state,
     onClick,
+    onContextMenu,
     onMouseEnter,
     onMouseLeave,
     onDragMove,
@@ -1392,6 +1511,7 @@ const EntireStage = observer(
         offsetY={item.stageTranslate.y}
         rotation={item.rotation}
         onClick={onClick}
+        onContextMenu={onContextMenu}
         onMouseEnter={onMouseEnter}
         onMouseLeave={onMouseLeave}
         onDragMove={onDragMove}

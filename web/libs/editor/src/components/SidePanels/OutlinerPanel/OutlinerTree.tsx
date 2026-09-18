@@ -22,6 +22,7 @@ import { cn } from "../../../utils/bem";
 import { FF_DEV_2755, isFF } from "../../../utils/feature-flags";
 import { getPairRegionColor } from "../../../utils/pairGroups";
 import { flatten, isDefined, isMacOS } from "../../../utils/utilities";
+import { isRefinementDrawingSession } from "../../../utils/refinementInteraction";
 import { NodeIcon } from "../../Node/Node";
 import { LockButton } from "../Components/LockButton";
 import { RegionContextMenu } from "../Components/RegionContextMenu";
@@ -256,9 +257,7 @@ const useEventHandlers = () => {
     if (!self?.annotation) return;
 
     const annotation = self.annotation;
-    const annotationMode = self.object?.drawover === true && self.object?.interactionMode !== "edit";
-
-    if (annotationMode) return;
+    if (isRefinementDrawingSession(self.object)) return;
 
     if (multi) {
       annotation.toggleRegionSelection(self);

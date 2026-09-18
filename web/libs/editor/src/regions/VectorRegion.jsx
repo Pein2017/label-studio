@@ -796,25 +796,6 @@ const HtxVectorView = observer(({ item, suggestion }) => {
               blockedReason = e.evt.altKey ? "altKey" : "shiftKey";
             }
 
-            store.recordPairingDebugCanvasClick?.({
-              source: "VectorRegion",
-              regionId: item.id,
-              regionIndex: item.region_index ?? null,
-              regionType: item.type,
-              ctrlKey: !!e.evt.ctrlKey,
-              metaKey: !!e.evt.metaKey,
-              fallbackCtrlKey: !!recentModifiers?.ctrlKey,
-              fallbackMetaKey: !!recentModifiers?.metaKey,
-              fallbackUsed: recentModifiersActive && !(e.evt.ctrlKey || e.evt.metaKey),
-              shiftKey: !!e.evt.shiftKey,
-              altKey: !!e.evt.altKey,
-              defaultPrevented: !!e.evt.defaultPrevented,
-              skipInteractions,
-              isDrawing: item.isDrawing,
-              annotationIsDrawing: item.annotation?.isDrawing ?? false,
-              blockedReason,
-            });
-
             if (blockedReason) return;
 
             e.cancelBubble = true;

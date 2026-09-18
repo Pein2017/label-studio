@@ -34,6 +34,7 @@ import {
   isManagedCoco80StaticConfig,
   managedTaskIdentity,
   normalizeClassSearchText,
+  getRefinementLabelHotkeys,
   sortLabelsByUsage,
   searchCanonicalCoco80,
 } from "./Labels";
@@ -208,6 +209,24 @@ describe("managed COCO-80 class search policy", () => {
     expect(labels).toEqual(sourceOrder);
   });
 
+  it("assigns digits to the nine highest-frequency labels with source-order ties", () => {
+    const labels = Array.from({ length: 10 }, (_, index) => ({ value: `label-${index}`, index }));
+    const hotkeys = getRefinementLabelHotkeys(labels, [1, 9, 9, 0, 8, 7, 6, 5, 4, 3]);
+
+    expect([...hotkeys.entries()].map(([label, hotkey]) => [label.value, hotkey])).toEqual([
+      ["label-1", "1"],
+      ["label-2", "2"],
+      ["label-4", "3"],
+      ["label-5", "4"],
+      ["label-6", "5"],
+      ["label-7", "6"],
+      ["label-8", "7"],
+      ["label-9", "8"],
+      ["label-0", "9"],
+    ]);
+    expect(hotkeys.has(labels[3])).toBe(false);
+  });
+
   it("renders draw-over labels in usage order without changing the model children", () => {
     const labels = [
       { type: "label", value: "person", usedAlready: () => 1 },
@@ -216,12 +235,35 @@ describe("managed COCO-80 class search policy", () => {
     ];
     const item = managedItem({ item: { children: labels } });
     const renderItemSpy = jest.spyOn(Tree, "renderItem").mockImplementation((label) => label.value);
-    const managerSpy = jest.spyOn(ToolsManager, "getInstance").mockReturnValue({ obj: { drawover: true } });
+    const managerSpy = jest
+      .spyOn(ToolsManager, "getInstance")
+      .mockReturnValue({ obj: { drawover: true, store: { project: { id: 3 } } } });
 
     render(<HtxLabels item={item} />);
 
     expect(renderItemSpy.mock.calls.map(([label]) => label.value)).toEqual(["car", "person", "dog"]);
     expect(item.children).toEqual(labels);
+
+    renderItemSpy.mockRestore();
+    managerSpy.mockRestore();
+  });
+
+  it("keeps ordinary draw-over labels on the native source order", () => {
+    const labels = [
+      { type: "label", value: "person", usedAlready: () => 1 },
+      { type: "label", value: "car", usedAlready: () => 3 },
+      { type: "label", value: "dog", usedAlready: () => 0 },
+    ];
+    const item = managedItem({ item: { children: labels } });
+    const renderItemSpy = jest.spyOn(Tree, "renderItem").mockImplementation((label) => label.value);
+    const managerSpy = jest
+      .spyOn(ToolsManager, "getInstance")
+      .mockReturnValue({ obj: { drawover: true, store: { project: { id: 4 } } } });
+
+    render(<HtxLabels item={item} />);
+
+    expect(renderItemSpy).not.toHaveBeenCalled();
+    expect(screen.getByText("native label buttons")).toBeInTheDocument();
 
     renderItemSpy.mockRestore();
     managerSpy.mockRestore();

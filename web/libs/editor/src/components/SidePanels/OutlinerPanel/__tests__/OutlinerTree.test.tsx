@@ -367,13 +367,20 @@ describe("OutlinerTree", () => {
     expect(selectArea).toHaveBeenCalledWith(items[0]);
   });
 
-  it("onSelect ignores region rows in refinement annotation mode", async () => {
+  it("onSelect ignores region rows while native drawing is active", async () => {
     const selectArea = jest.fn();
     const items = [
       {
         ...defaultItem,
         annotation: { selectArea, regionStore: {} },
-        object: { drawover: true, interactionMode: "annotate" },
+        object: {
+          drawover: true,
+          activeStates: () => [{}],
+          selectedRegions: [],
+          getToolsManager: () => ({
+            findSelectedTool: () => ({ fullName: "RectangleTool", isDrawingTool: true }),
+          }),
+        },
       },
     ];
     const regions = createMockRegions({}, items);

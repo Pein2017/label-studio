@@ -175,25 +175,6 @@ describe("Image model", () => {
   });
 
   describe("CoordExp volatile editor state", () => {
-    it("starts draw-over images in annotation mode and switches modes without snapshot data", () => {
-      const image = createStore({
-        annotation: {
-          toNames: new Map(),
-          regionStore: { regions: [], suggestions: [] },
-          history: defaultHistory,
-          names: new Map(),
-          image: { name: "img", value: "$url", type: "image", drawover: true },
-        },
-      }).annotation.image;
-
-      expect(image.interactionMode).toBe("annotate");
-      image.setInteractionMode("edit");
-      expect(image.interactionMode).toBe("edit");
-      image.setInteractionMode("annotate");
-      expect(image.interactionMode).toBe("annotate");
-      expect(getSnapshot(image)).not.toHaveProperty("interactionMode");
-    });
-
     it("replaces, clips, and clears the temporary AI Region", () => {
       const image = createStore().annotation.image;
 

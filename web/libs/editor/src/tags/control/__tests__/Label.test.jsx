@@ -252,15 +252,15 @@ describe("Label model", () => {
     mockAnnotation.selectedDrawingRegions = [];
   });
 
-  it("does not activate a new label in edit mode without a selected region", () => {
-    mockManagedImage = { drawover: true, interactionMode: "edit" };
+  it("activates a refinement label without a selected region", () => {
+    mockManagedImage = { drawover: true };
     mockAnnotation.selectedRegions = [];
     mockAnnotation.selectedDrawingRegions = [];
     const label = createLabelNode();
 
     label.toggleSelected();
 
-    expect(label.selected).toBe(false);
+    expect(label.selected).toBe(true);
     mockManagedImage = null;
   });
 

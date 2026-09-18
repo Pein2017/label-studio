@@ -3,7 +3,13 @@
  */
 import React from "react";
 import { render, screen, fireEvent } from "@testing-library/react";
-import ImageView, { AIRegionOverlay, aiRegionPointFromCanvas, splitRegions } from "../ImageView";
+import ImageView, {
+  AIRegionOverlay,
+  aiRegionPointFromCanvas,
+  isRefinementDrawingSession,
+  selectSmallestContainingRegion,
+  splitRegions,
+} from "../ImageView";
 
 jest.mock("../../../utils/feature-flags", () => ({
   isFF: jest.fn(() => false),
@@ -37,6 +43,7 @@ jest.mock("react-konva", () => {
     if (props.onMouseDown) wrappedProps.onMouseDown = wrapEvt(props.onMouseDown);
     if (props.onMouseMove) wrappedProps.onMouseMove = wrapEvt(props.onMouseMove);
     if (props.onMouseLeave) wrappedProps.onMouseLeave = wrapEvt(props.onMouseLeave);
+    if (props.onContextMenu) wrappedProps.onContextMenu = wrapEvt(props.onContextMenu);
     return React.createElement("div", { "data-testid": "konva-stage", ...wrappedProps });
   });
   return {
@@ -198,6 +205,7 @@ function createItem(overrides = {}) {
       selectedRegions: [],
       unselectAll: jest.fn(),
       unselectAreas: jest.fn(),
+      selectAreas: jest.fn(),
       isDrawing: false,
       isLinkingMode: false,
     },
@@ -274,6 +282,215 @@ describe("splitRegions", () => {
   });
 });
 
+describe("selectSmallestContainingRegion", () => {
+  const region = (id, left, top, right, bottom, overrides = {}) => ({
+    id,
+    type: "rectangleregion",
+    bboxCoords: { left, top, right, bottom },
+    ...overrides,
+  });
+
+  it("prefers the smallest visible containing rectangle", () => {
+    const large = region("large", 0, 0, 100, 100);
+    const small = region("small", 25, 25, 50, 50);
+
+    expect(selectSmallestContainingRegion([large, small], { x: 30, y: 30 })).toBe(small);
+  });
+
+  it("excludes hidden/read-only rectangles and breaks equal-area ties by recent edit", () => {
+    const hidden = region("hidden", 0, 0, 100, 100, { hidden: true });
+    const old = region("old", 0, 0, 20, 20);
+    const recent = region("recent", 0, 0, 20, 20);
+
+    expect(
+      selectSmallestContainingRegion(
+        [hidden, old, recent],
+        { x: 10, y: 10 },
+        {
+          recentEditOrder: { old: 1, recent: 2 },
+        },
+      ),
+    ).toBe(recent);
+  });
+
+  it("uses only the bounded edge-distance fallback", () => {
+    const box = region("box", 10, 10, 20, 20);
+
+    expect(selectSmallestContainingRegion([box], { x: 21, y: 15 }, { tolerance: 1 })).toBe(box);
+    expect(selectSmallestContainingRegion([box], { x: 25, y: 15 }, { tolerance: 1 })).toBeNull();
+  });
+});
+
+describe("isRefinementDrawingSession", () => {
+  const item = (overrides = {}) => ({
+    drawover: true,
+    activeStates: () => [{}],
+    selectedRegions: [],
+    getToolsManager: () => ({
+      findSelectedTool: () => ({ fullName: "RectangleTool", isDrawingTool: true }),
+    }),
+    ...overrides,
+  });
+
+  it("requires the rectangle tool, an active label, and no selected region", () => {
+    expect(isRefinementDrawingSession(item())).toBe(true);
+    expect(isRefinementDrawingSession(item({ selectedRegions: [{}] }))).toBe(false);
+    expect(isRefinementDrawingSession(item({ activeStates: () => [] }))).toBe(false);
+    expect(
+      isRefinementDrawingSession(
+        item({
+          getToolsManager: () => ({ findSelectedTool: () => ({ fullName: "MoveTool", isDrawingTool: false }) }),
+        }),
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("ImageView refinement hit testing", () => {
+  it("routes an overlapping edit click to the smallest bbox", () => {
+    const large = {
+      id: "large",
+      type: "rectangleregion",
+      bboxCoords: { left: 0, top: 0, right: 100, bottom: 100 },
+      inSelection: false,
+      onClickRegion: jest.fn(),
+      isReadOnly: () => false,
+    };
+    const small = {
+      id: "small",
+      type: "rectangleregion",
+      bboxCoords: { left: 25, top: 25, right: 50, bottom: 50 },
+      inSelection: false,
+      onClickRegion: jest.fn(),
+      isReadOnly: () => false,
+    };
+    const item = createItem({
+      drawover: true,
+      activeStates: () => [],
+      regs: [large, small],
+      canvasToInternalX: (value) => value,
+      canvasToInternalY: (value) => value,
+      getToolsManager: () => ({
+        findSelectedTool: () => ({ fullName: "MoveTool" }),
+        allTools: () => [],
+      }),
+    });
+    const store = createStore();
+    item.store = store;
+    let viewRef;
+    render(<ImageView ref={(ref) => (viewRef = ref)} item={item} store={store} />);
+
+    viewRef.handleOnClick({ evt: { offsetX: 30, offsetY: 30 } });
+
+    expect(small.onClickRegion).toHaveBeenCalled();
+    expect(large.onClickRegion).not.toHaveBeenCalled();
+  });
+
+  it("forces one smallest selection for an unmodified nested click", () => {
+    const large = {
+      id: "large",
+      type: "rectangleregion",
+      bboxCoords: { left: 0, top: 0, right: 100, bottom: 100 },
+      inSelection: false,
+      onClickRegion: jest.fn(),
+      isReadOnly: () => false,
+    };
+    const small = {
+      id: "small",
+      type: "rectangleregion",
+      bboxCoords: { left: 25, top: 25, right: 50, bottom: 50 },
+      inSelection: false,
+      onClickRegion: jest.fn(),
+      isReadOnly: () => false,
+    };
+    const selectAreas = jest.fn();
+    const item = createItem({
+      drawover: true,
+      activeStates: () => [],
+      regs: [large, small],
+      annotation: {
+        isReadOnly: () => false,
+        selectedRegions: [],
+        selectAreas,
+        unselectAreas: jest.fn(),
+        unselectAll: jest.fn(),
+      },
+      canvasToInternalX: (value) => value,
+      canvasToInternalY: (value) => value,
+      getToolsManager: () => ({
+        findSelectedTool: () => ({ fullName: "MoveTool" }),
+        allTools: () => [],
+      }),
+    });
+    const store = createStore();
+    item.store = store;
+    let viewRef;
+    render(<ImageView ref={(ref) => (viewRef = ref)} item={item} store={store} />);
+
+    viewRef.handleMouseDown({
+      evt: { button: 0, offsetX: 30, offsetY: 30, ctrlKey: false, metaKey: false },
+      target: { getParent: () => null },
+    });
+    viewRef.handleOnClick({ evt: { offsetX: 30, offsetY: 30, ctrlKey: false, metaKey: false } });
+
+    expect(selectAreas).toHaveBeenCalledWith([small]);
+    expect(small.onClickRegion).not.toHaveBeenCalled();
+    expect(large.onClickRegion).not.toHaveBeenCalled();
+  });
+
+  it("routes Command/Ctrl nested clicks additively without selecting the foreground box", () => {
+    const large = {
+      id: "large",
+      type: "rectangleregion",
+      bboxCoords: { left: 0, top: 0, right: 100, bottom: 100 },
+      inSelection: false,
+      onClickRegion: jest.fn(),
+      isReadOnly: () => false,
+    };
+    const small = {
+      id: "small",
+      type: "rectangleregion",
+      bboxCoords: { left: 25, top: 25, right: 50, bottom: 50 },
+      inSelection: false,
+      onClickRegion: jest.fn(),
+      isReadOnly: () => false,
+    };
+    const selectAreas = jest.fn();
+    const item = createItem({
+      drawover: true,
+      activeStates: () => [],
+      regs: [large, small],
+      annotation: {
+        isReadOnly: () => false,
+        selectedRegions: [],
+        selectAreas,
+        unselectAreas: jest.fn(),
+        unselectAll: jest.fn(),
+      },
+      canvasToInternalX: (value) => value,
+      canvasToInternalY: (value) => value,
+      getToolsManager: () => ({
+        findSelectedTool: () => ({ fullName: "MoveTool" }),
+        allTools: () => [],
+      }),
+    });
+    const store = createStore();
+    item.store = store;
+    let viewRef;
+    render(<ImageView ref={(ref) => (viewRef = ref)} item={item} store={store} />);
+
+    viewRef.handleMouseDown({
+      evt: { button: 0, offsetX: 30, offsetY: 30, ctrlKey: false, metaKey: true },
+      target: { getParent: () => null },
+    });
+    viewRef.handleOnClick({ evt: { offsetX: 30, offsetY: 30, ctrlKey: false, metaKey: true } });
+
+    expect(selectAreas).not.toHaveBeenCalled();
+    expect(small.onClickRegion).toHaveBeenCalledTimes(1);
+    expect(large.onClickRegion).not.toHaveBeenCalled();
+  });
+});
+
 describe("AIRegionOverlay", () => {
   it("maps stage coordinates into clipped percentage points", () => {
     const item = createItem();
@@ -307,23 +524,15 @@ describe("AIRegionOverlay", () => {
 });
 
 describe("ImageView", () => {
-  it("shows explicit refinement modes only for draw-over images", () => {
-    const setInteractionMode = jest.fn();
-    const refinementItem = createItem({ drawover: true, interactionMode: "annotate", setInteractionMode });
+  it("does not render a custom refinement mode toolbar", () => {
+    const refinementItem = createItem({ drawover: true });
     const refinementStore = createStore();
     refinementItem.store = refinementStore;
-    const { rerender } = render(<ImageView item={refinementItem} store={refinementStore} />);
+    render(<ImageView item={refinementItem} store={refinementStore} />);
 
-    expect(screen.getByTestId("interaction-mode-toolbar")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "annotation-mode" })).toHaveAttribute("data-active", "true");
-    fireEvent.click(screen.getByRole("button", { name: "edit-mode" }));
-    expect(setInteractionMode).toHaveBeenCalledWith("edit");
-
-    const regularItem = createItem();
-    const regularStore = createStore();
-    regularItem.store = regularStore;
-    rerender(<ImageView item={regularItem} store={regularStore} />);
     expect(screen.queryByTestId("interaction-mode-toolbar")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "annotation-mode" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "edit-mode" })).not.toBeInTheDocument();
   });
 
   beforeEach(() => {
@@ -862,10 +1071,11 @@ describe("ImageView", () => {
     expect(container.querySelector('[data-testid="image-transformer"]')).toBeInTheDocument();
   });
 
-  it("disables selected-region transformer hit testing in draw-over mode", () => {
+  it("keeps the selected-region transformer interactive outside drawing state", () => {
     const store = createStore();
     const item = createItem({
       drawover: true,
+      activeStates: () => [{}],
       selectedRegions: [{ id: "r1", supportsTransform: true, canRotate: false }],
       getToolsManager: () => ({
         findSelectedTool: () => ({ isDrawingTool: true, isDrawing: false }),
@@ -876,7 +1086,7 @@ describe("ImageView", () => {
     const { container } = render(<ImageView item={item} store={store} />);
     const transformer = container.querySelector('[data-testid="image-transformer"]');
 
-    expect(transformer.parentElement).toHaveAttribute("data-listening", "false");
+    expect(transformer.parentElement).toHaveAttribute("data-listening", "true");
   });
 
   it("renders DrawingRegion when item has drawingRegion", () => {
@@ -985,6 +1195,7 @@ describe("ImageView", () => {
     const store = createStore();
     const item = createItem({
       drawover: true,
+      activeStates: () => [{}],
       getToolsManager: () => ({
         findSelectedTool: () => ({ isDrawingTool: true, isDrawing: false, fullName: "RectangleTool" }),
         allTools: () => [],
@@ -1003,6 +1214,33 @@ describe("ImageView", () => {
 
     expect(item.setSkipInteractions).toHaveBeenCalledWith(true);
     expect(item.event).toHaveBeenCalledWith("mousedown", fakeEvent, 25, 35);
+  });
+
+  it("right-click aborts an incomplete refinement rectangle before any deletion", () => {
+    const abortDrawing = jest.fn();
+    const item = createItem({
+      drawover: true,
+      activeStates: () => [{}],
+      syncRefinementLabelSession: jest.fn(),
+      clearRefinementActionMarker: jest.fn(),
+      getToolsManager: () => ({
+        findSelectedTool: () => ({ fullName: "RectangleTool", isDrawingTool: true }),
+        allTools: () => [
+          { fullName: "RectangleTool", isDrawingTool: true, hasPendingDrawing: () => true, abortDrawing },
+        ],
+      }),
+    });
+    const store = createStore();
+    item.store = store;
+    let viewRef;
+    render(<ImageView ref={(ref) => (viewRef = ref)} item={item} store={store} />);
+    const preventDefault = jest.fn();
+
+    viewRef.handleContextMenu({ evt: { button: 2, preventDefault, stopPropagation: jest.fn() } });
+
+    expect(preventDefault).toHaveBeenCalled();
+    expect(abortDrawing).toHaveBeenCalled();
+    expect(item.clearRefinementActionMarker).toHaveBeenCalled();
   });
 
   it("handleMouseDown with button 1 (middle click) runs path and calls item.event mousedown", () => {

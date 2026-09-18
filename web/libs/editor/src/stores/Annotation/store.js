@@ -11,6 +11,7 @@ import { ViewModel } from "../../tags/visual";
 import Utils from "../../utils";
 import { FF_DEV_3034, FF_DEV_3391, FF_SIMPLE_INIT, isFF } from "../../utils/feature-flags";
 import { emailFromCreatedBy } from "../../utils/utilities";
+import { isRefinementProject } from "../../utils/refinementInteraction";
 import ToolsManager from "../../tools/Manager";
 import { Annotation } from "./Annotation";
 import { HistoryItem } from "./HistoryItem";
@@ -124,6 +125,9 @@ const AnnotationStoreModel = types
 
     function _unselectAll() {
       if (self.selected) {
+        ToolsManager.allInstances().forEach(({ obj }) => {
+          if (obj?.annotation === self.selected && isRefinementProject(obj)) obj.clearRefinementSession?.();
+        });
         // Release any in-progress multi-click drawing (Polygon, Vector) so that
         // the tool doesn't keep a stale currentArea pointing at the outgoing
         // annotation's region. This is the annotation-switch counterpart of the

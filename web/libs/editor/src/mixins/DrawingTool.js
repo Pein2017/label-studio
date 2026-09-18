@@ -49,6 +49,9 @@ const DrawingTool = types
       current() {
         return self.currentArea;
       },
+      hasPendingDrawing() {
+        return Boolean(self.currentArea || self.isDrawing);
+      },
       canStart() {
         return !self.isDrawing && !self.annotation.isReadOnly();
       },
@@ -157,6 +160,8 @@ const DrawingTool = types
         //when user is using two different labels tag to draw a region, the other labels will be added to the region
         rest.forEach((r) => newArea.addResult(r.toJSON()));
 
+        obj.markRefinementRegionCreated?.(newArea);
+
         currentArea.setDrawing(false);
         self.deleteRegion();
         newArea.notifyDrawingFinished();
@@ -234,14 +239,35 @@ const DrawingTool = types
         self.mode = "viewing";
       },
       /**
+       * Abandon the active drawing without creating a history entry.
+       *
+       * Unlike finishDrawing(), this is also safe after the first click of a
+       * two-point tool, before a temporary region exists.  Concrete tools can
+       * override this to clear their gesture-specific closure state first.
+       */
+      abortDrawing() {
+        const hasTransientState = self.hasPendingDrawing();
+
+        self.deleteRegion();
+        if (hasTransientState) {
+          self.annotation.setIsDrawing(false);
+          if (self.annotation.history.abortFreeze) {
+            self.annotation.history.abortFreeze(undefined, true);
+          } else {
+            self.annotation.history.unfreeze();
+          }
+        }
+        self.mode = "viewing";
+        return hasTransientState;
+      },
+      /**
        * Release the tool's in-progress drawing state without touching the
        * region itself (it belongs to the outgoing annotation). Called by
        * ToolsManager during annotation switches.
        */
       resetBeforeAnnotationSwitch() {
         self.stopListening?.();
-        self.currentArea = null;
-        self.mode = "viewing";
+        self.abortDrawing();
       },
     };
   });
@@ -265,13 +291,21 @@ const TwoPointsDrawingTool = DrawingTool.named("TwoPointsDrawingTool")
     let endPoint = { x: 0, y: 0 };
     const Super = {
       finishDrawing: self.finishDrawing,
+      abortDrawing: self.abortDrawing,
     };
+    const updateDraw = throttle((x, y) => {
+      if (currentMode === DEFAULT_MODE) return;
+      self.draw(x, y);
+    }, 48); // 3 frames, optimized enough and not laggy yet
 
     return {
-      updateDraw: throttle((x, y) => {
-        if (currentMode === DEFAULT_MODE) return;
-        self.draw(x, y);
-      }, 48), // 3 frames, optimized enough and not laggy yet
+      updateDraw(x, y) {
+        updateDraw(x, y);
+      },
+
+      hasPendingDrawing() {
+        return Boolean(startPoint || self.currentArea || self.isDrawing);
+      },
 
       draw(x, y) {
         const shape = self.getCurrentArea();
@@ -306,10 +340,21 @@ const TwoPointsDrawingTool = DrawingTool.named("TwoPointsDrawingTool")
       },
 
       finishDrawing(x, y) {
+        updateDraw.cancel?.();
         startPoint = null;
         Super.finishDrawing(x, y);
         currentMode = DEFAULT_MODE;
         modeAfterMouseMove = DEFAULT_MODE;
+        endPoint = { x: 0, y: 0 };
+      },
+
+      abortDrawing() {
+        updateDraw.cancel?.();
+        startPoint = null;
+        endPoint = { x: 0, y: 0 };
+        currentMode = DEFAULT_MODE;
+        modeAfterMouseMove = DEFAULT_MODE;
+        return Super.abortDrawing();
       },
 
       mousedownEv(ev, [x, y]) {

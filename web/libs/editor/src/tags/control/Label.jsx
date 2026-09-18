@@ -146,10 +146,6 @@ const Model = types
         });
       }
 
-      const editOnly = image?.drawover === true && image?.interactionMode === "edit";
-
-      if (editOnly && sameObjectSelectedRegions.length === 0) return;
-
       const affectedRegions = sameObjectSelectedRegions.filter((region) => {
         return !region.isReadOnly();
       });
@@ -200,7 +196,7 @@ const Model = types
       if (sameObjectSelectedRegions.length > 0 && applicableRegions.length === 0) return;
 
       // if we are going to select label and it would be the first in this labels group
-      if (!editOnly && !labels.selectedLabels.length && !self.selected) {
+      if (!labels.selectedLabels.length && !self.selected) {
         // unselect other tools if they exist and selected
         const tool = Object.values(self.parent?.tools || {})[0];
 
@@ -261,6 +257,8 @@ const Model = types
           region.updateSpans?.();
         }
       });
+
+      image?.syncRefinementLabelSession?.();
     },
 
     setVisible(val) {

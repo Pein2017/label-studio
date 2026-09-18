@@ -30,6 +30,7 @@ const IMAGE_CONFIG = `<View>
     <Label value="dog" />
   </RectangleLabels>
 </View>`;
+const REFINEMENT_IMAGE_CONFIG = IMAGE_CONFIG.replace('<Image name="image"', '<Image name="image" drawOver="true"');
 
 const createTestEnv = () => ({
   events: {
@@ -62,11 +63,11 @@ function createStoreWithAnnotation(annotationSnapshot = {}) {
   return { store, annotation: ann, env };
 }
 
-function createImageStoreWithAnnotation(annotationSnapshot = {}) {
+function createImageStoreWithAnnotation(annotationSnapshot = {}, config = IMAGE_CONFIG) {
   const env = createTestEnv();
   const store = AppStore.create(
     {
-      config: IMAGE_CONFIG,
+      config,
       task: { id: 1, data: JSON.stringify({ image: "https://example.test/image.jpg" }) },
       interfaces: ["basic"],
     },
@@ -391,6 +392,27 @@ describe("Annotation model", () => {
   });
 
   describe("actions", () => {
+    it("keeps the active refinement label when select-after-create is enabled", () => {
+      const { store, annotation } = createImageStoreWithAnnotation(
+        { result: [rectangleResult("created-for-refinement")] },
+        REFINEMENT_IMAGE_CONFIG,
+      );
+      const image = annotation.names.get("image");
+      const label = annotation.names.get("bbox").children[0];
+      const area = annotation.regions[0];
+
+      store.annotationStore.selectAnnotation(annotation.id);
+      label.setSelected(true);
+      annotation.selectArea(area);
+      store.settings.toggleSelectAfterCreate();
+
+      annotation.afterCreateResult(area, { isLabeling: true });
+
+      expect(annotation.selectedRegions).toHaveLength(0);
+      expect(label.selected).toBe(true);
+      expect(image.drawover).toBe(true);
+    });
+
     it("setEditable updates editable", () => {
       const { annotation } = createStoreWithAnnotation();
       annotation.setEditable(false);

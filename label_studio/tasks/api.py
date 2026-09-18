@@ -2,7 +2,11 @@
 
 import logging
 
-from coordexp_refinement.gt_export import GTExportError, export_project_gt
+from coordexp_refinement.gt_export import (
+    GTExportError,
+    export_project_gt,
+    sanitize_refinement_annotation_result,
+)
 from coordexp_refinement.guards import (
     ManagedAnnotationWriteGuardMixin,
     reject_managed_annotation_entity_write,
@@ -10,8 +14,6 @@ from coordexp_refinement.guards import (
     reject_managed_prediction_entity_write,
     reject_managed_project_write,
 )
-from coordexp_refinement.roi_finalization import DjangoRoiFinalizationError
-from coordexp_refinement.roi_targets import parse_canonical_revision
 from coordexp_refinement.transition_fence import project_mutation_bindings
 from core.feature_flags import flag_set
 from core.mixins import GetParentObjectMixin
@@ -60,6 +62,23 @@ from webhooks.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# The optional managed-Draft runtime historically lived beside CoordExp's
+# source tree.  Native Label Studio annotation updates must remain importable
+# when that optional tree is absent; Project 3 uses the local GT adapter below.
+try:
+    from coordexp_refinement.roi_finalization import DjangoRoiFinalizationError
+    from coordexp_refinement.roi_targets import parse_canonical_revision
+except ModuleNotFoundError as exc:
+    if exc.name != 'src' and not (exc.name or '').startswith('src.label_studio_coco_refinement'):
+        raise
+
+    class DjangoRoiFinalizationError(RuntimeError):
+        """Unavailable optional managed-Draft finalizer."""
+
+    def parse_canonical_revision(value, *, field):
+        raise DjangoRoiFinalizationError(f'{field} requires the optional managed-Draft runtime')
 
 
 class _ManagedDraftTransitionConflict(APIException):
@@ -725,14 +744,31 @@ class AnnotationAPI(
             reject_managed_project_write(task.project)
 
     def perform_update(self, serializer):
-        reject_managed_annotation_entity_write(self.get_object())
+        annotation = self.get_object()
+        reject_managed_annotation_entity_write(annotation)
         task = serializer.validated_data.get('task')
         if task is not None:
             reject_managed_project_write(task.project)
         project = serializer.validated_data.get('project')
         if project is not None:
             reject_managed_project_write(project)
-        serializer.save()
+        has_result = 'result' in serializer.validated_data
+        result, stripped_relations = sanitize_refinement_annotation_result(
+            annotation.project_id,
+            serializer.validated_data.get('result', annotation.result),
+        )
+        if stripped_relations:
+            logger.info(
+                'Removed %s legacy relation/group result(s) before saving '
+                'refinement annotation id=%s project_id=%s',
+                stripped_relations,
+                annotation.pk,
+                annotation.project_id,
+            )
+        if has_result or stripped_relations:
+            serializer.save(result=result)
+        else:
+            serializer.save()
 
     def update(self, request, *args, **kwargs):
         # save user history with annotator_id, time & annotation result
@@ -751,9 +787,16 @@ class AnnotationAPI(
         task.update_is_labeled()
         task.save(update_fields=['updated_at'])  # refresh task metrics
         try:
+            # The annotation database update above is intentionally not part
+            # of the filesystem publication transaction.  A failed export
+            # must not be reported as a database rollback.
             export_project_gt(task.project_id)
         except GTExportError as exc:
-            logger.exception('CoordExp GT export failed for project_id=%s', task.project_id)
+            logger.exception(
+                'CoordExp GT export failed after the annotation database update '
+                'for project_id=%s; database and JSONL status are separate',
+                task.project_id,
+            )
             raise _CoordExpGTExportUnavailable() from exc
         return result
 

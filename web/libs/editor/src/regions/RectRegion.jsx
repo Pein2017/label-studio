@@ -20,6 +20,7 @@ import { AliveRegion } from "./AliveRegion";
 import { EditableRegion } from "./EditableRegion";
 import { RegionWrapper } from "./RegionWrapper";
 import { RELATIVE_STAGE_HEIGHT, RELATIVE_STAGE_WIDTH } from "../components/ImageView/Image";
+import { isRefinementDrawingSession, isRefinementProject } from "../utils/refinementInteraction";
 
 const applyPresentationColorToFill = (fillColor, presentationColor) => {
   if (!fillColor || !presentationColor) return fillColor;
@@ -425,7 +426,7 @@ const HtxRectangleView = ({ item, setShapeRef }) => {
     presentationColor && !item.inSelection && !item.highlighted ? presentationColor : regionStyles.strokeColor;
   const labelColor = presentationColor ?? regionStyles.strokeColor;
   const stage = item.parent?.stageRef;
-  const annotationMode = item.parent?.drawover === true && item.parent?.interactionMode !== "edit";
+  const annotationMode = isRefinementDrawingSession(item.parent);
 
   const eventHandlers = {};
 
@@ -559,7 +560,12 @@ const HtxRectangleView = ({ item, setShapeRef }) => {
         }}
         onClick={(e) => {
           const recentModifiers = store.recentCanvasModifiers;
+          const refinementEditSelection =
+            item.parent?.drawover === true &&
+            isRefinementProject(item.parent) &&
+            !isRefinementDrawingSession(item.parent);
           const recentModifiersActive =
+            !refinementEditSelection &&
             Date.now() - (recentModifiers?.timestamp ?? 0) < 1000 &&
             (recentModifiers?.ctrlKey || recentModifiers?.metaKey);
           const additiveSelectionShortcut = e.evt.ctrlKey || e.evt.metaKey || recentModifiersActive;
@@ -576,26 +582,11 @@ const HtxRectangleView = ({ item, setShapeRef }) => {
                 }
               : e;
 
-          store.recordPairingDebugCanvasClick?.({
-            source: "RectRegion",
-            regionId: item.id,
-            regionIndex: item.region_index ?? null,
-            regionType: item.type,
-            ctrlKey: !!e.evt.ctrlKey,
-            metaKey: !!e.evt.metaKey,
-            fallbackCtrlKey: !!recentModifiers?.ctrlKey,
-            fallbackMetaKey: !!recentModifiers?.metaKey,
-            fallbackUsed: recentModifiersActive && !(e.evt.ctrlKey || e.evt.metaKey),
-            shiftKey: !!e.evt.shiftKey,
-            altKey: !!e.evt.altKey,
-            defaultPrevented: !!e.evt.defaultPrevented,
-            skipInteractions,
-            blockedReason: skipInteractions && !additiveSelectionShortcut ? "skipInteractions" : null,
-          });
-
           // Keep Cmd/Ctrl multi-select available directly on the canvas even when
           // the current drawing tool would normally skip region interactions.
-          if (skipInteractions && !additiveSelectionShortcut) return;
+          // ImageView owns refinement hit-testing so a foreground rectangle
+          // cannot add itself before the smallest candidate is selected.
+          if (skipInteractions && (refinementEditSelection || !additiveSelectionShortcut)) return;
           if (store.annotationStore.selected.isLinkingMode) {
             stage.container().style.cursor = Constants.DEFAULT_CURSOR;
           }

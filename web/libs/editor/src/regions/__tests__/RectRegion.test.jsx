@@ -77,9 +77,11 @@ jest.mock("../../tags/object/Image", () => {
         getSkipInteractions: () => false,
         _drawOver: false,
         _selectedTool: null,
+        _activeStates: [],
         regionPresentationMode: "show_all",
         focusedRegionKeys: [],
         inferenceRegionPresentations: {},
+        selectedRegions: [],
       }))
       .views((self) => ({
         get naturalWidth() {
@@ -96,6 +98,9 @@ jest.mock("../../tags/object/Image", () => {
         },
         getToolsManager() {
           return { findSelectedTool: () => self._selectedTool };
+        },
+        activeStates() {
+          return self._activeStates;
         },
       }))
       .actions((self) => ({
@@ -128,6 +133,9 @@ jest.mock("../../tags/object/Image", () => {
         },
         setSelectedTool(tool) {
           self._selectedTool = tool;
+        },
+        setActiveStates(states) {
+          self._activeStates = states;
         },
         setInferencePresentation(regionKey, presentation) {
           self.inferenceRegionPresentations = { [regionKey]: presentation };
@@ -583,7 +591,8 @@ describe("RectRegion", () => {
         isDrawing: false,
       });
       root.image.setDrawOver(true);
-      root.image.setSelectedTool({ isDrawingTool: true, isDrawing: false });
+      root.image.setSelectedTool({ fullName: "RectangleTool", isDrawingTool: true, isDrawing: false });
+      root.image.setActiveStates([{}]);
 
       const { getByTestId } = render(
         <ImageViewContext.Provider value={{ suggestion: null }}>
