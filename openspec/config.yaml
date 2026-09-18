@@ -1,0 +1,24 @@
+schema: spec-driven
+
+context: |
+  This repository is the maintained Pein2017/label-studio fork. OpenSpec here
+  owns durable Label Studio behavior, frontend/backend integration contracts,
+  local refinement adapters, and their verification evidence.
+
+  Keep ordinary upstream behavior as the default. Scope customization to the
+  explicit refinement project boundary, preserve annotation/result identity,
+  and keep source images and annotations immutable unless a change explicitly
+  authorizes an update.
+
+rules:
+  proposal:
+    - State the user-visible problem, scope, non-goals, protected annotation semantics, and compatibility impact.
+    - Separate observed implementation behavior from proposed behavior and deferred work.
+  specs:
+    - Encode only verifiable stable Label Studio behavior with concrete scenarios.
+    - Preserve image dimensions, coordinates, object IDs, result serialization, and source provenance.
+  design:
+    - Name the owning frontend/backend seam, current callers, dependencies, failure modes, and verification evidence.
+    - Prefer upstream primitives and small adapters over new framework layers.
+  tasks:
+    - Use dependency-ordered slices with targeted tests, runtime checks, residue checks, and OpenSpec validation.

@@ -87,3 +87,9 @@ web/coverage-chunks
 .cache
 
 /research/
+
+# OpenSpec planning and archived change records
+!openspec/
+!openspec/**
+!openspec/changes/archive/
+!openspec/changes/archive/**
